@@ -1,0 +1,8 @@
+/target/
+/bin/*.exe
+/dist/
+/logs/*.log
+/config/secrets/
+/third_party/installers/
+*.pdb
+*.zip

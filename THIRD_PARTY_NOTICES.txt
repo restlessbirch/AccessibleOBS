@@ -1,0 +1,19 @@
+Remote Stream Control is copyright (c) 2026 restlessbirch and is licensed
+under the MIT License. See LICENSE.
+
+Bundled installers, when present in release zip files, are not part of the
+Remote Stream Control source license:
+
+- Tailscale installer
+  Source: https://tailscale.com/download/windows
+  Latest MSI URL used by the package script:
+  https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi
+  Tailscale is provided by Tailscale Inc. under its own license and terms.
+
+- OBS Studio installer
+  Source: https://obsproject.com/download
+  OBS Studio is provided by the OBS Project under its own license and terms.
+
+The release package includes these official installers only to make first-run
+setup easier for the actor. Users should review and accept each third-party
+installer's own license terms during installation.

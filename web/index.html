@@ -1,0 +1,136 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Remote Stream Control</title>
+  <link rel="stylesheet" href="app.css">
+</head>
+<body>
+  <a class="skip" href="#main">Перейти к управлению</a>
+  <header>
+    <h1>Remote Stream Control</h1>
+    <p>Доступная web-панель управления OBS, записью, эфиром, Twitch и DonationAlerts.</p>
+  </header>
+  <div id="live" class="sr-only" aria-live="polite" aria-atomic="true"></div>
+  <main id="main">
+    <section id="login" class="card" hidden>
+      <h2>Pairing</h2>
+      <p>Введите pairing-код, который показан на компьютере актёра после START_FRIEND.bat.</p>
+      <form id="loginForm">
+        <label for="pairingSecret">Pairing-код</label>
+        <input id="pairingSecret" name="secret" autocomplete="one-time-code" required>
+        <button type="submit">Подключиться</button>
+      </form>
+    </section>
+
+    <section class="card">
+      <h2>Связь</h2>
+      <button id="refreshAll" type="button">Обновить состояние</button>
+      <dl id="health"></dl>
+    </section>
+
+    <section class="card">
+      <h2>OBS status</h2>
+      <button id="refreshObs" type="button">Проверить OBS</button>
+      <pre id="obsStatus" tabindex="0"></pre>
+    </section>
+
+    <section class="card">
+      <h2>Сцены</h2>
+      <button id="refreshScenes" type="button">Обновить сцены</button>
+      <fieldset>
+        <legend>Переключить текущую сцену</legend>
+        <label for="sceneSelect">Сцена</label>
+        <select id="sceneSelect"></select>
+        <button id="setScene" type="button">Переключить</button>
+      </fieldset>
+      <ul id="sceneList"></ul>
+    </section>
+
+    <section class="card">
+      <h2>Источники текущей сцены</h2>
+      <button id="refreshSources" type="button">Обновить источники</button>
+      <div id="sources"></div>
+    </section>
+
+    <section class="card">
+      <h2>Аудио</h2>
+      <button id="refreshAudio" type="button">Обновить аудио</button>
+      <div id="audio"></div>
+    </section>
+
+    <section class="card two">
+      <h2>Эфир OBS</h2>
+      <button id="startStream" type="button">Старт стрим</button>
+      <button id="stopStream" type="button">Стоп стрим</button>
+    </section>
+
+    <section class="card two">
+      <h2>Запись</h2>
+      <button id="startRecord" type="button">Старт запись</button>
+      <button id="stopRecord" type="button">Стоп запись</button>
+      <button id="pauseRecord" type="button">Пауза записи</button>
+      <button id="resumeRecord" type="button">Продолжить запись</button>
+    </section>
+
+    <section class="card">
+      <h2>OBS statistics</h2>
+      <button id="refreshStats" type="button">Получить статистику</button>
+      <pre id="stats" tabindex="0"></pre>
+    </section>
+
+    <section class="card">
+      <h2>DonationAlerts</h2>
+      <dl id="daStatus"></dl>
+      <form id="daUrlForm">
+        <label for="daUrl">URL Alerts Widget</label>
+        <input id="daUrl" type="url" placeholder="https://www.donationalerts.com/widget/...">
+        <button type="submit">Сохранить и настроить OBS</button>
+      </form>
+      <p><a href="https://www.donationalerts.com/dashboard/alerts" target="_blank" rel="noopener">Открыть страницу DonationAlerts Alerts</a></p>
+      <button id="daReconcile" type="button">Проверить и восстановить конфигурацию</button>
+      <button id="daRefreshWidget" type="button">Refresh widget</button>
+      <fieldset>
+        <legend>Аудио DonationAlerts</legend>
+        <button id="daMute" type="button">Mute</button>
+        <button id="daUnmute" type="button">Unmute</button>
+        <label for="daVolume">Громкость dB</label>
+        <input id="daVolume" type="number" step="0.5" value="-8">
+        <button id="daSetVolume" type="button">Установить громкость</button>
+      </fieldset>
+      <fieldset>
+        <legend>DonationAlerts OAuth</legend>
+        <button id="daOauth" type="button">Подключить DonationAlerts OAuth</button>
+        <p>OAuth нужен для истории и realtime-статуса донатов. Официальный Alerts Widget работает отдельно.</p>
+      </fieldset>
+      <label><input id="announceDonations" type="checkbox"> Озвучивать новые донаты через NVDA</label>
+      <h3>Последние донаты</h3>
+      <ul id="donations"></ul>
+    </section>
+
+    <section class="card">
+      <h2>Twitch channel</h2>
+      <dl id="twitchStatus"></dl>
+      <button id="twitchStart" type="button">Подключить Twitch</button>
+      <button id="twitchCheck" type="button">Проверить Twitch авторизацию</button>
+      <div id="twitchDevice"></div>
+      <form id="twitchChannelForm">
+        <label for="streamTitle">Название стрима</label>
+        <input id="streamTitle" name="title">
+        <label for="streamGame">Game/category ID</label>
+        <input id="streamGame" name="game_id">
+        <label for="streamLang">Язык</label>
+        <input id="streamLang" name="broadcaster_language" placeholder="ru">
+        <button type="submit">Изменить параметры канала</button>
+      </form>
+      <form id="markerForm">
+        <label for="markerDescription">Описание маркера</label>
+        <input id="markerDescription">
+        <button type="submit">Создать marker</button>
+      </form>
+    </section>
+  </main>
+  <script src="app.js"></script>
+</body>
+</html>

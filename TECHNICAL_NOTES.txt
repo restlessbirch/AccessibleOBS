@@ -1,0 +1,84 @@
+Remote Stream Control — technical notes
+======================================
+
+Implemented binaries
+--------------------
+- bin\bootstrap.exe
+  - --host: Tailscale check/install/login, OBS check/install/start, OBS WebSocket config, host-agent start, pairing code display.
+  - --controller: Tailscale check/login, host panel discovery by MagicDNS/IP, browser open.
+- bin\host-agent.exe
+  - HTTP API + static web panel.
+  - OBS WebSocket 5.x client with authentication handshake.
+  - DPAPI protected local secret storage.
+  - Pairing-code web panel auth, separate from OBS password.
+
+Security model
+--------------
+- No Tailscale auth keys.
+- No port forwarding.
+- host-agent tries to bind to Tailscale IPv4 when listen_mode=tailscale_only. If Tailscale IP cannot be detected, it binds localhost as fail-closed behavior.
+- Web panel requires pairing cookie.
+- OBS password, pairing secrets, OAuth tokens, DonationAlerts widget URL are stored in config\secrets\*.dpapi and never intentionally logged or returned to frontend.
+
+OBS functions
+-------------
+- Get version/status.
+- Dynamic scene list.
+- Switch scene.
+- List sources in selected scene.
+- Show/hide source.
+- Audio list, mute/unmute, dB volume.
+- Start/stop stream.
+- Start/stop/pause/resume record.
+- OBS statistics.
+
+DonationAlerts
+--------------
+- Official Alerts Widget is the production alert path.
+- Owner enters Alerts Widget URL in web panel.
+- URL stored with DPAPI.
+- Reconcile creates/checks:
+  - scene RSC_OVERLAYS;
+  - browser_source RSC_DonationAlerts;
+  - url, width/height from OBS canvas, reroute_audio=true, shutdown=false, restart_when_active=false;
+  - initial volume -8 dB on first creation;
+  - monitoring off where OBS accepts SetInputAudioMonitorType;
+  - nested RSC_OVERLAYS item in every user scene, not in itself.
+- Reconcile is idempotent and returns conflict if RSC_DonationAlerts exists with wrong input kind.
+
+Twitch
+------
+- Device Code OAuth endpoints.
+- Protected token storage.
+- Token validation endpoint usage.
+- Channel info get/modify.
+- Stream marker creation.
+- Requires config\host.json twitch.client_id from an official Twitch application.
+
+Known external-validation requirements
+--------------------------------------
+These need real accounts/hardware and cannot be fully proven offline:
+- actual Twitch OAuth/client_id acceptance;
+- actual DonationAlerts OAuth app/client_secret exchange;
+- DonationAlerts Centrifugo realtime channel details for the specific account/app;
+- OBS browser_source availability on the actor PC's OBS build;
+- Tailscale tailnet/MagicDNS naming and Windows firewall policy.
+
+Acceptance testing checklist on actor PC
+----------------------------------------
+1. Start START_FRIEND.bat.
+2. Login Tailscale if asked.
+3. Let OBS install/start.
+4. Confirm web panel URL reachable from owner PC.
+5. Enter pairing code.
+6. Switch scene.
+7. Show/hide a source.
+8. Mute/unmute microphone.
+9. Start/stop recording.
+10. Start/stop streaming with test Twitch/OBS profile.
+11. Paste DonationAlerts widget URL.
+12. Run DonationAlerts reconcile.
+13. Confirm RSC_OVERLAYS and RSC_DonationAlerts exist in OBS.
+14. Confirm RSC_DonationAlerts is a separate audio source and not Desktop Audio.
+15. Trigger DonationAlerts test alert from DonationAlerts dashboard.
+

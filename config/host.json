@@ -1,0 +1,32 @@
+{
+  "obs_path": "",
+  "obs_websocket_host": "127.0.0.1",
+  "obs_websocket_port": 4455,
+  "obs_websocket_password": "",
+  "listen_mode": "tailscale_only",
+  "web_port": 8787,
+  "auto_start_obs": true,
+  "enable_tailscale_unattended_after_login": true,
+  "twitch": {
+    "enabled": true,
+    "client_id": "",
+    "scopes": ["channel:manage:broadcast"]
+  },
+  "donationalerts": {
+    "enabled": true,
+    "client_id": "",
+    "client_secret": "",
+    "redirect_uri": "http://127.0.0.1:8787/api/donationalerts/oauth/callback",
+    "overlay_scene_name": "RSC_OVERLAYS",
+    "input_name": "RSC_DonationAlerts",
+    "enforce_overlays": true,
+    "browser_width": "obs_canvas",
+    "browser_height": "obs_canvas",
+    "reroute_audio": true,
+    "initial_volume_db": -8.0,
+    "monitoring": "off",
+    "oauth_enabled": true,
+    "oauth_scopes": ["oauth-user-show", "oauth-donation-subscribe", "oauth-donation-index"],
+    "announce_new_donations_to_nvda": false
+  }
+}

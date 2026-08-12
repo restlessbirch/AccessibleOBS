@@ -1,0 +1,6 @@
+{
+  "friend_machine_name": "friend-pc",
+  "friend_tailscale_ip_fallback": "",
+  "web_port": 8787,
+  "auto_open_browser": true
+}
