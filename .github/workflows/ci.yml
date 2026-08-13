@@ -16,6 +16,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Secret scan
+        run: .\scripts\scan_secrets.ps1
+        shell: pwsh
+
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:

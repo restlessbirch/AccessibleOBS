@@ -43,7 +43,6 @@ New-Item -ItemType Directory -Force -Path $Stage | Out-Null
 
 $items = @(
   "bin",
-  "config",
   "web",
   "third_party",
   "START_FRIEND.bat",
@@ -62,9 +61,28 @@ foreach ($item in $items) {
   Copy-Item -LiteralPath (Join-Path $Root $item) -Destination $Stage -Recurse -Force
 }
 
+$StageConfig = Join-Path $Stage "config"
+New-Item -ItemType Directory -Force -Path $StageConfig | Out-Null
+Copy-Item -LiteralPath (Join-Path $Root "config\host.json") -Destination $StageConfig -Force
+Copy-Item -LiteralPath (Join-Path $Root "config\controller.json") -Destination $StageConfig -Force
+
 New-Item -ItemType Directory -Force -Path (Join-Path $Stage "third_party\installers") | Out-Null
 Copy-Item -LiteralPath $tailscale -Destination (Join-Path $Stage "third_party\installers") -Force
 Copy-Item -LiteralPath $obsPath -Destination (Join-Path $Stage "third_party\installers") -Force
+
+$forbiddenPackageFiles = Get-ChildItem -LiteralPath $Stage -Recurse -Force | Where-Object {
+  $_.FullName -match '\\config\\secrets\\' -or
+  $_.Name -like "*.dpapi" -or
+  $_.Name -like ".env" -or
+  $_.Name -like ".env.*" -or
+  $_.Name -like "*.key" -or
+  $_.Name -like "*.pem" -or
+  $_.Name -like "*.pfx" -or
+  $_.Name -like "*.p12"
+}
+if ($forbiddenPackageFiles) {
+  throw "Refusing to package secrets or private key material."
+}
 
 $zip = Join-Path $Dist "RemoteStreamControl_ready_$Version.zip"
 if (Test-Path -LiteralPath $zip) { Remove-Item -LiteralPath $zip -Force }
