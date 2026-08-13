@@ -133,6 +133,7 @@ $('logout').onclick = async () => {
 // ------------------------------------------------------- поток событий
 
 let source = null;
+let linkLost = false;
 /** Обновления после событий склеиваем, чтобы шквал не дёргал API. */
 const pending = new Map();
 
@@ -156,9 +157,23 @@ function openEvents() {
     }
     handleEvent(msg);
   };
+  source.onopen = () => {
+    setState($('linkState'), 'ok', 'Связь с агентом: есть');
+    if (linkLost) {
+      // За время обрыва у актёра могло измениться что угодно, а событий об
+      // этом мы не получили. Перечитываем всё, иначе панель показывала бы
+      // устаревшую картину, выглядя при этом исправной.
+      linkLost = false;
+      say('Связь с агентом восстановлена');
+      refreshAll();
+    }
+  };
   source.onerror = () => {
-    // EventSource переподключается сам; сообщаем только о факте разрыва.
-    setState($('obsState'), 'warn', 'Связь с агентом: восстанавливаю…');
+    // EventSource переподключается сам; наше дело — не врать о состоянии.
+    // Индикатор OBS трогать нельзя: OBS у актёра может прекрасно работать,
+    // это у нас пропал канал событий.
+    linkLost = true;
+    setState($('linkState'), 'bad', 'Связь с агентом: восстанавливаю…');
   };
 }
 
@@ -980,6 +995,85 @@ $('refreshAll').onclick = () => refreshAll().then(() => say('Состояние 
 $('refreshScenes').onclick = refreshScenes;
 $('refreshSources').onclick = refreshSources;
 $('refreshAudio').onclick = refreshAudio;
+
+// ---------------------------------------------------- горячие клавиши
+//
+// Панель длинная, а часть действий срочные: заглушить микрофон или
+// переключить сцену иногда надо за секунду. Искать кнопку табуляцией
+// в такой момент — непозволительная роскошь.
+
+/// Что считать микрофоном, если владелец не уточнил.
+const MIC_HINTS = ['микр', 'mic', 'вход'];
+
+function findMicName() {
+  const names = [...levelNodes.keys()];
+  return names.find((n) => MIC_HINTS.some((h) => n.toLowerCase().includes(h))) || names[0];
+}
+
+async function toggleMic() {
+  const name = findMicName();
+  if (!name) return say('Аудиоисточники не найдены');
+  try {
+    // Состояние читаем из OBS, а не из разметки: она могла устареть.
+    const data = await api('/api/obs/audio');
+    const row = (data.audio || []).find((a) => a.inputName === name);
+    if (!row) return say('Источник не найден: ' + name);
+    await post('/api/obs/audio/mute', { inputName: name, muted: !row.muted });
+    say(`${name}: звук ${row.muted ? 'включён' : 'выключен'}`);
+  } catch (e) {
+    fail(e);
+  }
+}
+
+async function switchSceneByIndex(index) {
+  const sceneName = sceneNames[index];
+  if (!sceneName) return say(`Сцены номер ${index + 1} нет`);
+  try {
+    await post('/api/obs/scenes/current', { sceneName });
+    say('Сцена: ' + sceneName);
+  } catch (e) {
+    fail(e);
+  }
+}
+
+const SHORTCUTS = [
+  ['1 … 9', 'переключить сцену с этим номером', (key) => switchSceneByIndex(Number(key) - 1)],
+  ['M', 'выключить или включить микрофон', toggleMic],
+  ['P', 'обновить кадр эфира', grabPreview],
+  ['R', 'обновить всё', () => refreshAll().then(() => say('Состояние обновлено'))],
+  ['T', 'вывести предпросмотр в эфир', () =>
+    command('/api/obs/studio/transition', 'Предпросмотр выведен в эфир')],
+];
+
+renderDl($('shortcuts'), Object.fromEntries(SHORTCUTS.map(([k, d]) => [k, d])));
+
+document.addEventListener('keydown', (event) => {
+  if (!$('shortcutsOn').checked) return;
+  // Не перехватываем ввод текста и служебные сочетания браузера.
+  const tag = event.target.tagName;
+  if (tag === 'INPUT' || tag === 'SELECT' || tag === 'TEXTAREA') return;
+  if (event.ctrlKey || event.altKey || event.metaKey) return;
+  if ($('panel').hidden) return;
+
+  const key = event.key.toUpperCase();
+  if (key >= '1' && key <= '9') {
+    event.preventDefault();
+    switchSceneByIndex(Number(key) - 1);
+    return;
+  }
+  const found = SHORTCUTS.find(([label]) => label === key);
+  if (found) {
+    event.preventDefault();
+    found[2](key);
+  }
+});
+
+// Выбор владельца переживает перезагрузку страницы.
+$('shortcutsOn').checked = localStorage.getItem('rsc_shortcuts') !== 'off';
+$('shortcutsOn').onchange = (event) => {
+  localStorage.setItem('rsc_shortcuts', event.target.checked ? 'on' : 'off');
+  say(event.target.checked ? 'Горячие клавиши включены' : 'Горячие клавиши выключены');
+};
 
 (async function start() {
   const status = await api('/api/auth/status').catch(() => ({ authenticated: false }));
