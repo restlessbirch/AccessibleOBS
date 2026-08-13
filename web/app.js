@@ -194,6 +194,9 @@ function handleEvent(msg) {
     case 'levels':
       handleLevels(msg.levels);
       break;
+    case 'alert':
+      handleAlert(msg);
+      break;
     case 'donation':
       addDonation(msg.donation, true);
       break;
@@ -208,6 +211,7 @@ function handleObsEvent(type, data) {
     case 'CurrentProgramSceneChanged':
       currentScene = data.sceneName || currentScene;
       say('Текущая сцена: ' + currentScene);
+      journal('Сцена: ' + currentScene);
       schedule('scenes', refreshScenes);
       break;
     case 'SceneListChanged':
@@ -222,6 +226,9 @@ function handleObsEvent(type, data) {
       schedule('sources', refreshSources);
       break;
     case 'InputMuteStateChanged':
+      journal(`${data.inputName}: звук ${data.inputMuted ? 'выключен' : 'включён'}`);
+      schedule('audio', refreshAudio);
+      break;
     case 'InputVolumeChanged':
     case 'InputCreated':
     case 'InputRemoved':
@@ -259,6 +266,7 @@ function handleObsEvent(type, data) {
       // OBS предупреждает о закрытии до того, как оборвётся сокет. Без этого
       // владелец увидел бы просто «нет связи» и не понял, что произошло.
       announce('Актёр закрывает OBS. Управление пропадёт.');
+      journal('Актёр закрывает OBS', 'bad');
       break;
   }
 }
@@ -601,6 +609,38 @@ async function setSource(sourceName, enabled) {
   }
 }
 
+// -------------------------------------------------------- тревоги эфира
+//
+// Агент сам следит за потерей кадров и местом на диске, потому что панель
+// может быть закрыта. Здесь мы только показываем и озвучиваем.
+
+const MAX_JOURNAL = 100;
+
+function timeLabel(date = new Date()) {
+  return date.toLocaleTimeString('ru-RU', { hour12: false });
+}
+
+/// Журнал ведём и для обычных событий тоже: разбирать стрим постфактум
+/// иначе не по чему, а логи агента для этого слишком подробны.
+function journal(text, kind = 'info') {
+  const list = $('journal');
+  const row = el('li', { class: 'journal-row', 'data-kind': kind }, [
+    el('span', { class: 'journal-time', text: timeLabel() }),
+    el('span', { text }),
+  ]);
+  list.prepend(row);
+  while (list.children.length > MAX_JOURNAL) list.lastChild.remove();
+}
+
+function handleAlert(msg) {
+  const text = msg.message || 'Событие эфира';
+  journal(text, msg.urgent ? 'bad' : 'ok');
+  // Срочное перебивает речь скринридера, отбой — нет: иначе сообщение
+  // «всё восстановилось» прерывало бы то, что владелец читает сейчас.
+  if (msg.urgent) announce(text);
+  else say(text);
+}
+
 // ------------------------------------------------------- уровни звука
 //
 // Владелец не слышит, что происходит у актёра. Пропавший микрофон — самая
@@ -613,6 +653,8 @@ const SILENCE_SAMPLES = 40;
 
 const levelNodes = new Map();
 const lastLevels = new Map();
+/// Имя микрофона по версии самого OBS. Используется горячей клавишей M.
+let micName = null;
 const silenceCount = new Map();
 const silenceWarned = new Set();
 
@@ -659,6 +701,7 @@ async function refreshAudio() {
     const data = await api('/api/obs/audio');
     const rows = data.audio || [];
     levelNodes.clear();
+    micName = (rows.find((a) => a.role === 'mic') || {}).inputName || null;
     replace($('audio'), rows.length
       ? rows.map((a) => {
           const name = a.inputName;
@@ -677,8 +720,11 @@ async function refreshAudio() {
           level.setAttribute('aria-hidden', 'true');
           levelNodes.set(name, level);
 
+          const role = a.role === 'mic' ? ' — микрофон'
+            : a.role === 'desktop' ? ' — звук системы' : '';
+
           return el('div', { class: 'audio-row' }, [
-            el('h3', { text: name }),
+            el('h3', { text: name + role }),
             el('p', {
               text: `Звук: ${a.muted ? 'выключен' : 'включён'}. Громкость: ${db.toFixed(1)} dB.`,
             }),
@@ -991,6 +1037,11 @@ $('launchObs').onclick = async () => {
   }
 };
 
+$('clearJournal').onclick = () => {
+  replace($('journal'), []);
+  say('Журнал очищен');
+};
+
 $('refreshAll').onclick = () => refreshAll().then(() => say('Состояние обновлено'));
 $('refreshScenes').onclick = refreshScenes;
 $('refreshSources').onclick = refreshSources;
@@ -1002,12 +1053,10 @@ $('refreshAudio').onclick = refreshAudio;
 // переключить сцену иногда надо за секунду. Искать кнопку табуляцией
 // в такой момент — непозволительная роскошь.
 
-/// Что считать микрофоном, если владелец не уточнил.
-const MIC_HINTS = ['микр', 'mic', 'вход'];
-
+/// Микрофон определяет сам OBS — по роли источника, а не по его названию.
+/// Угадывание по слову «микрофон» ломалось, стоило актёру переименовать вход.
 function findMicName() {
-  const names = [...levelNodes.keys()];
-  return names.find((n) => MIC_HINTS.some((h) => n.toLowerCase().includes(h))) || names[0];
+  return micName || [...levelNodes.keys()][0];
 }
 
 async function toggleMic() {

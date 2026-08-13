@@ -314,6 +314,35 @@ li {
   font-style: italic;
 }
 
+/* Журнал: время моноширинным, чтобы отметки выстраивались в столбик. */
+.journal {
+  list-style: none;
+  margin: var(--gap) 0 0;
+  padding: 0;
+  max-height: 22rem;
+  overflow-y: auto;
+}
+.journal-row {
+  display: flex;
+  gap: 0.6rem;
+  padding: 0.35rem 0.5rem;
+  border-left: 3px solid var(--border);
+  border-bottom: 1px solid var(--border);
+  font-size: 0.92rem;
+}
+.journal-row[data-kind="bad"] {
+  border-left-color: var(--danger);
+}
+.journal-row[data-kind="ok"] {
+  border-left-color: var(--ok);
+}
+.journal-time {
+  font-family: ui-monospace, "Cascadia Mono", Consolas, monospace;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-muted);
+  flex: none;
+}
+
 /* Пояснения под заголовками разделов: почему кнопка делает то, что делает. */
 .hint {
   margin: 0 0 0.6rem;

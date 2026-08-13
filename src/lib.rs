@@ -1,4 +1,5 @@
 pub mod donationalerts;
+pub mod health;
 pub mod obs;
 
 use anyhow::{Context, Result, anyhow, bail};

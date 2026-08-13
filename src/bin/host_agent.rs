@@ -15,6 +15,7 @@ use axum::{
 };
 use remote_stream_control::{
     donationalerts::{self, DonationFeed},
+    health::{self, HealthWatch},
     obs::{BatchItem, ObsHandle, ObsStatus, db_to_mul, mul_to_db, response_data},
     *,
 };
@@ -132,6 +133,7 @@ async fn main() -> Result<()> {
 
     forward_obs_events(obs.clone(), events.clone());
     watch_obs_status(obs.clone(), events.clone());
+    watch_stream_health(obs.clone(), events.clone());
     if cfg.donationalerts.enabled && cfg.donationalerts.oauth_enabled {
         donationalerts::spawn(cfg.donationalerts.clone(), state.http.clone(), feed.clone());
     }
@@ -329,6 +331,65 @@ fn watch_obs_status(obs: ObsHandle, events: broadcast::Sender<Value>) {
                 let _ = events.send(json!({"type": "obs_status", "status": status}));
             }
             tokio::time::sleep(STATUS_POLL).await;
+        }
+    });
+}
+
+/// Следит за потерей кадров и местом на диске.
+///
+/// Живёт в агенте, а не в панели, намеренно: панель может быть закрыта, а
+/// авария случиться. Здесь она хотя бы попадёт в лог, и владелец увидит её
+/// в журнале, когда откроет панель.
+fn watch_stream_health(obs: ObsHandle, events: broadcast::Sender<Value>) {
+    tokio::spawn(async move {
+        let mut watch = HealthWatch::new();
+        loop {
+            tokio::time::sleep(health::SAMPLE_INTERVAL).await;
+            if !obs.is_connected().await {
+                continue;
+            }
+            // Оба показателя за один round-trip.
+            let Ok(results) = obs
+                .batch(vec![
+                    BatchItem::new("GetStats", json!({})),
+                    BatchItem::new("GetStreamStatus", json!({})),
+                ])
+                .await
+            else {
+                continue;
+            };
+            let stats = results.first().and_then(response_data);
+            let stream = results.get(1).and_then(response_data);
+            let number = |v: Option<&Value>, key: &str| {
+                v.and_then(|d| d.get(key))
+                    .and_then(Value::as_f64)
+                    .unwrap_or(0.0)
+            };
+
+            let sample = health::Sample {
+                total_frames: number(stream, "outputTotalFrames"),
+                skipped_frames: number(stream, "outputSkippedFrames"),
+                free_disk_mb: number(stats, "availableDiskSpace"),
+                streaming: stream
+                    .and_then(|d| d.get("outputActive"))
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+            };
+
+            for alert in watch.observe(sample) {
+                let text = alert.message();
+                if alert.is_urgent() {
+                    warn!("{}", text);
+                } else {
+                    info!("{}", text);
+                }
+                let _ = events.send(json!({
+                    "type": "alert",
+                    "alert": alert,
+                    "message": text,
+                    "urgent": alert.is_urgent(),
+                }));
+            }
         }
     });
 }
@@ -640,14 +701,52 @@ async fn find_scene_item_id(obs: &ObsHandle, scene: &str, source: &str) -> Resul
         .ok_or_else(|| anyhow!("{source} отсутствует в {scene}"))
 }
 
+/// Помечает входы ролью, которую им назначил сам OBS.
+///
+/// Раньше микрофон угадывался по названию, что ломалось, стоило актёру
+/// переименовать источник. OBS знает роли точно: desktop1/2 — звук системы,
+/// mic1..4 — микрофоны.
+fn special_input_roles(special: &Value) -> HashMap<String, &'static str> {
+    let mut roles = HashMap::new();
+    for (key, role) in [
+        ("desktop1", "desktop"),
+        ("desktop2", "desktop"),
+        ("mic1", "mic"),
+        ("mic2", "mic"),
+        ("mic3", "mic"),
+        ("mic4", "mic"),
+    ] {
+        if let Some(name) = special.get(key).and_then(Value::as_str)
+            && !name.is_empty()
+        {
+            roles.insert(name.to_string(), role);
+        }
+    }
+    roles
+}
+
 /// Громкость и mute всех входов за два round-trip вместо 2N.
 async fn obs_audio(State(st): State<AppState>, headers: HeaderMap) -> ApiResult<Value> {
     require_auth(&st, &headers).await?;
-    let inputs = st
+    // Список входов и их роли — за один round-trip.
+    let head = st
         .obs
-        .request("GetInputList", json!({}))
+        .batch(vec![
+            BatchItem::new("GetInputList", json!({})),
+            BatchItem::new("GetSpecialInputs", json!({})),
+        ])
         .await
         .map_err(|e| err("Не удалось получить список источников", e))?;
+    let inputs = head
+        .first()
+        .and_then(response_data)
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    let roles = head
+        .get(1)
+        .and_then(response_data)
+        .map(special_input_roles)
+        .unwrap_or_default();
 
     let names: Vec<(String, Value)> = inputs
         .get("inputs")
@@ -698,6 +797,7 @@ async fn obs_audio(State(st): State<AppState>, headers: HeaderMap) -> ApiResult<
         rows.push(json!({
             "inputName": name,
             "inputKind": kind,
+            "role": roles.get(name.as_str()),
             "muted": mute.and_then(|m| m.get("inputMuted")).cloned().unwrap_or(Value::Null),
             "volumeDb": db,
             "volumeMul": volume.and_then(|v| v.get("inputVolumeMul")).cloned().unwrap_or(Value::Null),
@@ -1627,6 +1727,31 @@ mod tests {
         g.record_failure();
         let left = g.blocked_for().expect("блокировка включилась");
         assert!(left <= LOGIN_BLOCK);
+    }
+
+    #[test]
+    fn special_inputs_are_labelled_by_obs_not_by_name() {
+        // Актёр переименовал микрофон во что угодно — роль всё равно известна.
+        let roles = special_input_roles(&json!({
+            "desktop1": "Звук раб. стола",
+            "desktop2": "",
+            "mic1": "Петличка Васи",
+            "mic2": "Запасной",
+            "mic3": "",
+            "mic4": "",
+        }));
+        assert_eq!(roles.get("Петличка Васи"), Some(&"mic"));
+        assert_eq!(roles.get("Запасной"), Some(&"mic"));
+        assert_eq!(roles.get("Звук раб. стола"), Some(&"desktop"));
+        // Пустые слоты не должны попадать в таблицу под пустым именем.
+        assert_eq!(roles.len(), 3);
+        assert!(!roles.contains_key(""));
+    }
+
+    #[test]
+    fn special_inputs_tolerate_missing_slots() {
+        assert!(special_input_roles(&json!({})).is_empty());
+        assert!(special_input_roles(&Value::Null).is_empty());
     }
 
     #[test]

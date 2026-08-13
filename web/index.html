@@ -166,6 +166,17 @@
       </section>
 
       <section class="card">
+        <h2>Журнал эфира</h2>
+        <p class="hint">
+          Что и когда произошло за сеанс. Агент следит за потерей кадров и местом
+          на диске сам, даже когда панель закрыта — тогда события попадают в
+          <code>logs\host.log</code> у актёра.
+        </p>
+        <button id="clearJournal" type="button" data-variant="quiet">Очистить журнал</button>
+        <ul id="journal" class="journal"></ul>
+      </section>
+
+      <section class="card">
         <h2>Горячие клавиши</h2>
         <p class="hint">
           Работают, когда курсор не в поле ввода. Нужны, чтобы не искать кнопку
