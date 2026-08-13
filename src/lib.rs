@@ -24,8 +24,21 @@ pub const APP_NAME: &str = "Remote Stream Control";
 pub const OVERLAY_SCENE: &str = "RSC_OVERLAYS";
 pub const DA_INPUT: &str = "RSC_DonationAlerts";
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RuntimeMode {
+    Remote,
+    Local,
+}
+
+fn default_runtime_mode() -> RuntimeMode {
+    RuntimeMode::Remote
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HostConfig {
+    #[serde(default = "default_runtime_mode")]
+    pub runtime_mode: RuntimeMode,
     #[serde(default)]
     pub obs_path: String,
     #[serde(default = "default_obs_host")]
@@ -238,6 +251,7 @@ pub fn load_host_config() -> Result<HostConfig> {
 impl Default for HostConfig {
     fn default() -> Self {
         Self {
+            runtime_mode: default_runtime_mode(),
             obs_path: String::new(),
             obs_websocket_host: default_obs_host(),
             obs_websocket_port: 4455,
@@ -780,6 +794,7 @@ mod tests {
         assert_eq!(cfg.obs_websocket_host, "127.0.0.1");
         assert_eq!(cfg.obs_websocket_port, 4455);
         assert_eq!(cfg.web_port, 8787);
+        assert_eq!(cfg.runtime_mode, RuntimeMode::Remote);
         assert_eq!(cfg.listen_mode, "tailscale_only");
         assert_eq!(cfg.donationalerts.overlay_scene_name, OVERLAY_SCENE);
         assert_eq!(cfg.donationalerts.input_name, DA_INPUT);
@@ -807,6 +822,28 @@ mod tests {
         assert_eq!(desired["server_password"], "s3cret");
         // Без first_load=false OBS покажет мастер первого запуска плагина.
         assert_eq!(desired["first_load"], false);
+    }
+
+    #[test]
+    fn old_host_config_without_runtime_mode_stays_remote() {
+        let cfg: HostConfig = serde_json::from_value(json!({
+            "web_port": 8787,
+            "listen_mode": "tailscale_only"
+        }))
+        .unwrap();
+        assert_eq!(cfg.runtime_mode, RuntimeMode::Remote);
+        assert_eq!(cfg.listen_mode, "tailscale_only");
+    }
+
+    #[test]
+    fn host_config_accepts_local_runtime_mode() {
+        let cfg: HostConfig = serde_json::from_value(json!({
+            "runtime_mode": "local",
+            "listen_mode": "tailscale_only"
+        }))
+        .unwrap();
+        assert_eq!(cfg.runtime_mode, RuntimeMode::Local);
+        assert_eq!(cfg.listen_mode, "tailscale_only");
     }
 
     #[test]

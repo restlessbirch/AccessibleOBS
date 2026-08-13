@@ -162,3 +162,21 @@ logs\host.log
 --------------------------
   bin\bootstrap.exe --remove-autostart
 или удалить ярлык «Remote Stream Control» из папки shell:startup.
+
+
+Локальный режим v1.1
+-------------------
+Если Remote Stream Control нужен на этом же компьютере, без второго ПК и без
+Tailscale, запустите:
+
+  START_LOCAL.bat
+
+В этом режиме host-agent:
+- слушает только http://127.0.0.1:8787;
+- не требует Tailscale;
+- не показывает форму pairing-кода;
+- открывает локальную web-панель сам;
+- использует тот же интерфейс, те же сцены, звук, запись, Twitch и DonationAlerts.
+
+START_FRIEND.bat остаётся remote-режимом для компьютера актёра. Его поведение,
+pairing и Tailscale не менялись.

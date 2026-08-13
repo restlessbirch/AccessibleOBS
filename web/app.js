@@ -90,9 +90,37 @@ const post = (path, body) =>
 const obsRequest = (requestType, requestData) =>
   post('/api/obs/request', { requestType, requestData: requestData ?? {} });
 
+let runtime = {
+  mode: 'remote',
+  loopback_only: false,
+  tailscale_required: true,
+};
+
+const isLocalRuntime = () => runtime.mode === 'local';
+
+async function loadRuntime() {
+  try {
+    runtime = { ...runtime, ...(await api('/api/runtime')) };
+  } catch {
+    runtime = { mode: 'remote', loopback_only: false, tailscale_required: true };
+  }
+  applyRuntimeUi();
+}
+
+function applyRuntimeUi() {
+  document.body.dataset.runtimeMode = runtime.mode;
+  if (!isLocalRuntime()) return;
+
+  $('appSubtitle').textContent = 'Локальная панель управления OBS, эфиром, записью, Twitch и DonationAlerts на этом компьютере.';
+  $('loginIntro').textContent = 'Локальный режим уже авторизован на этом компьютере. Pairing-код не нужен.';
+  $('pairingSecret').required = false;
+  $('logout').hidden = true;
+}
+
 // ---------------------------------------------------------------- вход
 
 function showLogin(show) {
+  if (show && isLocalRuntime()) show = false;
   $('login').hidden = !show;
   $('panel').hidden = show;
   if (show) {
@@ -1142,8 +1170,9 @@ $('refreshAudio').onclick = refreshAudio;
 /// только зрители. Честно отказаться лучше, чем молча промахнуться.
 async function toggleMic() {
   if (!micName) {
+    const setupPlace = isLocalRuntime() ? 'В OBS: ' : 'У актёра в OBS: ';
     return announce(
-      'Микрофон не назначен, ничего не изменено. У актёра в OBS: '
+      'Микрофон не назначен, ничего не изменено. ' + setupPlace
       + 'Настройки, раздел Аудио, поле «Микрофон/дополнительное аудио».',
     );
   }
@@ -1210,6 +1239,7 @@ $('shortcutsOn').onchange = (event) => {
 };
 
 (async function start() {
+  await loadRuntime();
   const status = await api('/api/auth/status').catch(() => ({ authenticated: false }));
   if (!status.authenticated) {
     showLogin(true);

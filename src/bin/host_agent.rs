@@ -164,6 +164,18 @@ fn raw_obs_allowed(request_type: &str) -> bool {
     RAW_OBS_ALLOWLIST.contains(&request_type)
 }
 
+fn arg_present(name: &str) -> bool {
+    std::env::args().skip(1).any(|arg| arg == name)
+}
+
+fn local_mode_arg_present() -> bool {
+    arg_present("--local")
+}
+
+fn no_open_arg_present() -> bool {
+    arg_present("--no-open")
+}
+
 /// Два воркера вместо «по числу ядер».
 ///
 /// Агент почти всё время ждёт сокет: нагрузка на ввод-вывод, а не на счёт.
@@ -177,6 +189,9 @@ async fn main() -> Result<()> {
     let _log_guard = init_logging()?;
 
     let mut cfg = load_runtime_donationalerts_secret(load_host_config()?)?;
+    if local_mode_arg_present() {
+        cfg.runtime_mode = RuntimeMode::Local;
+    }
     let obs_password = load_secret("obs_websocket_password")?
         .unwrap_or_else(|| cfg.obs_websocket_password.clone());
     // Пароль не должен остаться в памяти конфига, который сериализуется в ответы.
@@ -230,6 +245,7 @@ async fn main() -> Result<()> {
 
     let app = Router::new()
         .route("/api/public/ping", get(public_ping))
+        .route("/api/runtime", get(runtime_info))
         .route("/api/auth/status", get(auth_status))
         .route("/api/auth/login", post(auth_login))
         .route("/api/auth/logout", post(auth_logout))
@@ -310,7 +326,7 @@ async fn serve(app: Router, cfg: &HostConfig) -> Result<()> {
         IpAddr::V4(Ipv4Addr::LOCALHOST),
         cfg.web_port,
     )];
-    if cfg.listen_mode == "tailscale_only" {
+    if cfg.runtime_mode == RuntimeMode::Remote && cfg.listen_mode == "tailscale_only" {
         match tailscale_ip() {
             Some(ip) => addrs.push(SocketAddr::new(ip, cfg.web_port)),
             None => warn!(
@@ -326,6 +342,15 @@ async fn serve(app: Router, cfg: &HostConfig) -> Result<()> {
             Ok(listener) => {
                 info!("Host Agent слушает http://{}", addr);
                 println!("Remote Stream Control Host Agent: http://{addr}");
+                if cfg.runtime_mode == RuntimeMode::Local
+                    && addr.ip().is_loopback()
+                    && !no_open_arg_present()
+                {
+                    let url = format!("http://127.0.0.1:{}", cfg.web_port);
+                    if let Err(e) = open::that(&url) {
+                        warn!("Не удалось открыть локальную панель {url}: {e:#}");
+                    }
+                }
                 let app = app.clone();
                 servers.push(tokio::spawn(async move {
                     let service = app.into_make_service_with_connect_info::<SocketAddr>();
@@ -487,6 +512,15 @@ async fn public_ping() -> Json<Value> {
     Json(json!({"ok": true, "app": APP_NAME}))
 }
 
+async fn runtime_info(State(st): State<AppState>) -> Json<Value> {
+    let local = st.cfg.runtime_mode == RuntimeMode::Local;
+    Json(json!({
+        "mode": if local { "local" } else { "remote" },
+        "loopback_only": local,
+        "tailscale_required": !local && st.cfg.listen_mode == "tailscale_only",
+    }))
+}
+
 fn cookie(headers: &HeaderMap, name: &str) -> Option<String> {
     headers
         .get("cookie")?
@@ -506,6 +540,9 @@ fn secret_eq(a: &str, b: &str) -> bool {
 }
 
 async fn is_auth(st: &AppState, headers: &HeaderMap) -> bool {
+    if st.cfg.runtime_mode == RuntimeMode::Local {
+        return true;
+    }
     let Some(presented) = cookie(headers, "rsc_session") else {
         return false;
     };
@@ -540,6 +577,13 @@ async fn require_auth(st: &AppState, headers: &HeaderMap) -> Result<(), Response
 }
 
 async fn auth_status(State(st): State<AppState>, headers: HeaderMap) -> Json<Value> {
+    if st.cfg.runtime_mode == RuntimeMode::Local {
+        return Json(json!({
+            "paired": true,
+            "authenticated": true,
+            "mode": "local",
+        }));
+    }
     Json(json!({
         "paired": load_secret("pairing_secret").ok().flatten().is_some(),
         "authenticated": is_auth(&st, &headers).await,
@@ -551,6 +595,9 @@ async fn auth_login(
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     Json(body): Json<Value>,
 ) -> Response {
+    if st.cfg.runtime_mode == RuntimeMode::Local {
+        return Json(json!({"ok": true, "mode": "local"})).into_response();
+    }
     let peer_ip = peer.ip();
     {
         let mut guards = st.login_guards.lock().await;
@@ -619,6 +666,9 @@ async fn auth_login(
 }
 
 async fn auth_logout(State(st): State<AppState>, headers: HeaderMap) -> Response {
+    if st.cfg.runtime_mode == RuntimeMode::Local {
+        return Json(json!({"ok": true, "mode": "local"})).into_response();
+    }
     if let Err(resp) = require_auth(&st, &headers).await {
         return resp;
     }

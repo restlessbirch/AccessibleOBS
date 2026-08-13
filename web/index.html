@@ -10,7 +10,7 @@
   <a class="skip" href="#main">Перейти к управлению</a>
   <header>
     <h1>Remote Stream Control</h1>
-    <p>Панель управления OBS, эфиром, записью, Twitch и DonationAlerts на компьютере актёра.</p>
+    <p id="appSubtitle">Панель управления OBS, эфиром, записью, Twitch и DonationAlerts на компьютере актёра.</p>
   </header>
 
   <!-- Одна вежливая область для обычных сообщений и одна настойчивая для
@@ -21,7 +21,7 @@
   <main id="main">
     <section id="login" class="card" hidden>
       <h2>Подключение</h2>
-      <p>Введите pairing-код, который показан на компьютере актёра после запуска START_FRIEND.bat.</p>
+      <p id="loginIntro">Введите pairing-код, который показан на компьютере актёра после запуска START_FRIEND.bat.</p>
       <form id="loginForm">
         <label for="pairingSecret">Pairing-код</label>
         <input id="pairingSecret" name="secret" autocomplete="one-time-code" required>

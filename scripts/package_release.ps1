@@ -1,5 +1,5 @@
 param(
-  [string]$Version = "v1",
+  [string]$Version = "v1.1",
   [switch]$SkipBuild
 )
 
@@ -29,7 +29,7 @@ if (-not (Test-Path -LiteralPath $tailscale)) {
 
 $obsInstaller = Get-ChildItem -LiteralPath $Installers -Filter "OBS-Studio-*-Windows-Installer.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
 if (-not $obsInstaller) {
-  $release = Invoke-RestMethod -Headers @{ "User-Agent" = "RemoteStreamControl/1.0" } "https://api.github.com/repos/obsproject/obs-studio/releases/latest"
+  $release = Invoke-RestMethod -Headers @{ "User-Agent" = "RemoteStreamControl/1.1" } "https://api.github.com/repos/obsproject/obs-studio/releases/latest"
   $asset = $release.assets | Where-Object { $_.name -like "*Windows*Installer.exe" } | Select-Object -First 1
   if (-not $asset) { throw "OBS Windows installer asset was not found in latest release." }
   $obsPath = Join-Path $Installers $asset.name
@@ -48,6 +48,7 @@ $items = @(
   "third_party",
   "START_FRIEND.bat",
   "START_ME.bat",
+  "START_LOCAL.bat",
   "README_FIRST.txt",
   "CHECKLIST_FOR_ACTOR.txt",
   "CHECKLIST_FOR_OWNER.txt",

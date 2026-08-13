@@ -1,4 +1,5 @@
 {
+  "runtime_mode": "remote",
   "obs_path": "",
   "obs_websocket_host": "127.0.0.1",
   "obs_websocket_port": 4455,

@@ -211,3 +211,32 @@ WScript.Shell. Выбран ярлык, а не ключ реестра Run: о�
 11. Убедиться, что RSC_DonationAlerts — отдельный источник звука,
     а не Desktop Audio.
 12. Отправить тестовый алерт и убедиться, что он виден и слышен в записи.
+
+
+Local Accessibility Mode v1.1
+-----------------------------
+Runtime mode задаётся полем config/host.json:
+  "runtime_mode": "remote" | "local"
+
+Для обратной совместимости поле имеет default "remote"; старые host.json без
+runtime_mode продолжают загружаться. CLI-флаг host-agent.exe --local временно
+переключает текущий запуск в Local Mode и не переписывает host.json.
+
+Remote Mode:
+- START_FRIEND.bat не менялся;
+- listen_mode=tailscale_only по-прежнему поднимает 127.0.0.1 и Tailscale IP;
+- pairing, session cookie и Tailscale остаются обязательной моделью доступа.
+
+Local Mode:
+- START_LOCAL.bat запускает bin\host-agent.exe --local;
+- HTTP listener поднимается только на 127.0.0.1:web_port;
+- Tailscale IP не запрашивается и не слушается;
+- /api/auth/status возвращает authenticated=true без pairing secret;
+- /api/runtime возвращает mode=local, loopback_only=true,
+  tailscale_required=false;
+- frontend скрывает pairing/login flow и использует локальные подписи для
+  первого экрана.
+
+Raw /api/obs/request остаётся ограниченным allowlist и в Local Mode тоже.
+Это важно: локальный беспарольный режим не должен превращаться в произвольный
+OBS RPC tunnel.
