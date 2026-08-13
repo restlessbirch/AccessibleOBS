@@ -1535,23 +1535,49 @@ async function refreshDonations() {
 
 // -------------------------------------------------------------- Twitch
 
+let savedTwitchClientId = '';
+
+function twitchRegistrationBody() {
+  return {
+    clientId: $('twitchClientId').value.trim(),
+    scopes: $('twitchScopes').value.trim(),
+  };
+}
+
+function updateTwitchConnectButton() {
+  const fieldClientId = $('twitchClientId').value.trim();
+  const hasClientId = Boolean(fieldClientId || savedTwitchClientId);
+  $('twitchStart').disabled = !hasClientId;
+  $('twitchStart').textContent = fieldClientId && fieldClientId !== savedTwitchClientId
+    ? 'Сохранить и подключить Twitch'
+    : hasClientId ? 'Подключить Twitch' : 'Заполните Client ID Twitch';
+}
+
 async function refreshTwitchConfig() {
   try {
     const c = await api('/api/twitch/config');
+    savedTwitchClientId = c.client_id || '';
     $('twitchClientId').value = c.client_id || '';
     $('twitchScopes').value = (c.scopes || []).join(' ');
+    updateTwitchConnectButton();
   } catch (e) {
     fail(e);
   }
 }
 
+async function saveTwitchConfigFromForm() {
+  const body = twitchRegistrationBody();
+  if (!body.clientId) throw new Error('Заполните Twitch Client ID');
+  const saved = await post('/api/twitch/config', body);
+  savedTwitchClientId = saved.client_id || body.clientId;
+  updateTwitchConnectButton();
+  return saved;
+}
+
 $('twitchConfigForm').onsubmit = async (e) => {
   e.preventDefault();
   try {
-    await post('/api/twitch/config', {
-      clientId: $('twitchClientId').value.trim(),
-      scopes: $('twitchScopes').value.trim(),
-    });
+    await saveTwitchConfigFromForm();
     replace($('twitchDevice'), el('p', { text: 'Регистрация сохранена. Теперь можно подключать Twitch.' }));
     say('Регистрация Twitch сохранена');
     await refreshTwitchConfig();
@@ -1560,6 +1586,9 @@ $('twitchConfigForm').onsubmit = async (e) => {
     fail(err);
   }
 };
+
+$('twitchClientId').addEventListener('input', updateTwitchConnectButton);
+$('twitchScopes').addEventListener('input', updateTwitchConnectButton);
 
 async function refreshTwitch() {
   try {
@@ -1576,6 +1605,14 @@ async function refreshTwitch() {
 
 $('twitchStart').onclick = async () => {
   try {
+    if (!$('twitchClientId').value.trim() && !savedTwitchClientId) {
+      replace($('twitchDevice'), el('p', { text: 'Сначала заполните Twitch Client ID.' }));
+      updateTwitchConnectButton();
+      return;
+    }
+    if ($('twitchClientId').value.trim() !== savedTwitchClientId) {
+      await saveTwitchConfigFromForm();
+    }
     const r = await post('/api/twitch/device/start');
     const link = el('a', {
       href: r.verification_uri_complete || r.verification_uri,
