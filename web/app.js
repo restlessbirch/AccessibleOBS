@@ -400,6 +400,9 @@ function renderOutputState(node, label, data) {
 
 let currentScene = '';
 let sceneNames = [];
+let inputKinds = [];
+let lastCreatedSceneName = '';
+let lastCreatedSourceName = '';
 /// Когда данные обновлялись в последний раз и что не ответило.
 let lastRefresh = null;
 let streaming = false;
@@ -504,6 +507,7 @@ async function refreshAll() {
   const rest = [
     ['Состояние', refreshHealth],
     ['Аудио', refreshAudio],
+    ['Типы источников', refreshInputKinds],
     ['Эфир и запись', refreshOutputs],
     ['Studio Mode', refreshStudio],
     ['Виртуальная камера', refreshVcam],
@@ -645,6 +649,7 @@ async function refreshScenes() {
 
     replace($('sceneList'), scenes.length
       ? scenes.map((s) => el('li', {
+          class: s.sceneName === lastCreatedSceneName ? 'just-added' : '',
           text: s.sceneName + (s.sceneName === currentScene ? ' — текущая' : ''),
         }))
       : el('li', { class: 'empty', text: 'сцен нет' }));
@@ -675,7 +680,8 @@ $('createSceneForm').onsubmit = async (event) => {
     await post('/api/obs/scenes/current', { sceneName });
     $('newSceneName').value = '';
     currentScene = sceneName;
-    say('Сцена добавлена: ' + sceneName);
+    lastCreatedSceneName = sceneName;
+    say('Сцена добавлена в OBS и выбрана: ' + sceneName);
     await refreshScenes();
   } catch (e) {
     fail(e);
@@ -813,6 +819,43 @@ $('autoPreview').onchange = (event) => {
   }
 };
 
+function inputKindLabel(kind) {
+  const labels = {
+    image_source: 'Изображение',
+    color_source_v3: 'Цвет',
+    slideshow_v2: 'Слайд-шоу',
+    browser_source: 'Браузер',
+    ffmpeg_source: 'Медиафайл',
+    text_gdiplus_v3: 'Текст',
+    text_ft2_source_v2: 'Текст FreeType',
+    monitor_capture: 'Захват экрана',
+    window_capture: 'Захват окна',
+    game_capture: 'Захват игры',
+    dshow_input: 'Устройство видео',
+    wasapi_input_capture: 'Захват входного аудио',
+    wasapi_output_capture: 'Захват выходного аудио',
+    wasapi_process_output_capture: 'Захват звука приложения',
+  };
+  return labels[kind] ? `${labels[kind]} (${kind})` : kind;
+}
+
+async function refreshInputKinds() {
+  try {
+    const data = await api('/api/obs/input-kinds');
+    inputKinds = data.inputKinds || [];
+    const selected = $('newSourceKind').value;
+    replace($('newSourceKind'), inputKinds.length
+      ? inputKinds.map((kind) => el('option', {
+          value: kind,
+          text: inputKindLabel(kind),
+          selected: kind === selected,
+        }))
+      : el('option', { value: '', text: 'OBS не вернул типы источников' }));
+  } catch (e) {
+    replace($('newSourceKind'), el('option', { value: '', text: e.message }));
+  }
+}
+
 async function refreshSources() {
   if (!currentScene) return;
   try {
@@ -822,10 +865,14 @@ async function refreshSources() {
       ? items.map((item) => {
           const name = item.sourceName;
           const sceneItemId = item.sceneItemId;
+          const kind = item.inputKind || 'неизвестный тип';
           const visible = !!item.sceneItemEnabled;
-          return el('div', { class: 'source' }, [
+          return el('div', {
+            class: 'source',
+            'data-highlight': name === lastCreatedSourceName ? 'true' : null,
+          }, [
             el('h3', { text: name }),
-            el('p', { text: 'Состояние: ' + (visible ? 'виден' : 'скрыт') }),
+            el('p', { text: `Тип OBS: ${inputKindLabel(kind)}. Состояние: ${visible ? 'виден' : 'скрыт'}.` }),
             stateActionButton(
               visible,
               'Сейчас виден — скрыть источник',
@@ -833,6 +880,10 @@ async function refreshSources() {
               () => setSource(sceneItemId, name, !visible),
               'quiet',
             ),
+            button('Открыть свойства OBS', () => openSourceProperties(name), 'quiet'),
+            name === lastCreatedSourceName
+              ? el('p', { class: 'notice', text: 'Только что добавлен в OBS.' })
+              : null,
           ]);
         })
       : el('p', { class: 'empty', text: 'в этой сцене нет источников' }));
@@ -854,16 +905,6 @@ async function setSource(sceneItemId, sourceName, enabled) {
   }
 }
 
-function updateSourceKindFields() {
-  const kind = $('newSourceKind').value;
-  document.querySelectorAll('.source-kind-field').forEach((node) => {
-    node.hidden = node.dataset.sourceKind !== kind;
-  });
-}
-
-$('newSourceKind').onchange = updateSourceKindFields;
-updateSourceKindFields();
-
 function sourceCreateBody() {
   const inputKind = $('newSourceKind').value;
   const body = {
@@ -872,21 +913,8 @@ function sourceCreateBody() {
     inputKind,
   };
   if (!body.sourceName) throw new Error('Введите название источника');
+  if (!body.inputKind) throw new Error('Выберите тип источника OBS');
   if (!currentScene) throw new Error('Сначала выберите или создайте сцену');
-
-  if (inputKind === 'browser_source') {
-    body.url = $('newSourceUrl').value.trim();
-    body.rerouteAudio = $('newSourceRerouteAudio').checked;
-    if (!body.url) throw new Error('Введите URL');
-  } else if (inputKind === 'text_gdiplus_v3') {
-    body.text = $('newSourceText').value.trim() || 'Новый текст';
-  } else if (inputKind === 'image_source') {
-    body.file = $('newSourceImageFile').value.trim();
-    if (!body.file) throw new Error('Введите путь к изображению');
-  } else if (inputKind === 'ffmpeg_source') {
-    body.file = $('newSourceMediaFile').value.trim();
-    if (!body.file) throw new Error('Введите путь к медиафайлу');
-  }
   return body;
 }
 
@@ -896,16 +924,22 @@ $('createSourceForm').onsubmit = async (event) => {
     const body = sourceCreateBody();
     await post('/api/obs/sources', body);
     $('newSourceName').value = '';
-    $('newSourceUrl').value = '';
-    $('newSourceText').value = '';
-    $('newSourceImageFile').value = '';
-    $('newSourceMediaFile').value = '';
-    say('Источник добавлен: ' + body.sourceName);
+    lastCreatedSourceName = body.sourceName;
+    say(`Источник добавлен в OBS: ${body.sourceName}. Теперь он появился в списке ниже.`);
     await refreshSources();
   } catch (e) {
     fail(e);
   }
 };
+
+async function openSourceProperties(sourceName) {
+  try {
+    await post('/api/obs/source/properties', { sourceName });
+    say('Открыто родное окно свойств OBS: ' + sourceName);
+  } catch (e) {
+    fail(e);
+  }
+}
 
 // -------------------------------------------------------- тревоги эфира
 //

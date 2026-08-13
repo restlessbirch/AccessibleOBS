@@ -272,7 +272,9 @@ async fn main() -> Result<()> {
         .route("/api/obs/request", post(obs_request))
         .route("/api/obs/scenes", get(obs_scenes).post(obs_scene_create))
         .route("/api/obs/scenes/current", post(obs_set_scene))
+        .route("/api/obs/input-kinds", get(obs_input_kinds))
         .route("/api/obs/sources", get(obs_sources).post(obs_source_create))
+        .route("/api/obs/source/properties", post(obs_source_properties))
         .route("/api/obs/source/visibility", post(obs_source_visibility))
         .route("/api/obs/audio", get(obs_audio))
         .route("/api/obs/audio/mute", post(obs_audio_mute))
@@ -865,6 +867,15 @@ async fn obs_sources(
         .map_err(|e| err("Не удалось получить источники сцены", e))
 }
 
+async fn obs_input_kinds(State(st): State<AppState>, headers: HeaderMap) -> ApiResult<Value> {
+    require_auth(&st, &headers).await?;
+    st.obs
+        .request("GetInputKindList", json!({"unversioned": false}))
+        .await
+        .map(Json)
+        .map_err(|e| err("Не удалось получить типы источников OBS", e))
+}
+
 fn required_trimmed<'a>(body: &'a Value, field: &str, message: &str) -> Result<&'a str, String> {
     body.get(field)
         .and_then(Value::as_str)
@@ -873,36 +884,31 @@ fn required_trimmed<'a>(body: &'a Value, field: &str, message: &str) -> Result<&
         .ok_or_else(|| message.to_owned())
 }
 
-fn source_settings(input_kind: &str, body: &Value) -> Result<Value, String> {
-    match input_kind {
-        "browser_source" => {
-            let url = required_trimmed(body, "url", "URL browser source обязателен")?;
-            if !(url.starts_with("https://") || url.starts_with("http://127.0.0.1")) {
-                return Err(
-                    "Browser source принимает только https URL или localhost URL.".to_owned(),
-                );
-            }
-            Ok(json!({
-                "url": url,
-                "width": body.get("width").and_then(Value::as_i64).unwrap_or(1920),
-                "height": body.get("height").and_then(Value::as_i64).unwrap_or(1080),
-                "shutdown": false,
-                "restart_when_active": false,
-                "reroute_audio": body.get("rerouteAudio").and_then(Value::as_bool).unwrap_or(false),
-            }))
-        }
-        "text_gdiplus_v3" => Ok(json!({
-            "text": body.get("text").and_then(Value::as_str).unwrap_or("Новый текст"),
-        })),
-        "image_source" => Ok(json!({
-            "file": required_trimmed(body, "file", "Путь к изображению обязателен")?,
-        })),
-        "ffmpeg_source" => Ok(json!({
-            "local_file": required_trimmed(body, "file", "Путь к медиафайлу обязателен")?,
-            "is_local_file": true,
-            "restart_on_activate": true,
-        })),
-        _ => Err("Этот тип источника не разрешён для создания из панели.".to_owned()),
+fn input_kind_exists(kinds: &Value, input_kind: &str) -> bool {
+    kinds
+        .get("inputKinds")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .any(|kind| kind == input_kind)
+}
+
+async fn get_input_kinds(st: &AppState) -> Result<Value, Response> {
+    st.obs
+        .request("GetInputKindList", json!({"unversioned": false}))
+        .await
+        .map_err(|e| err("Не удалось получить типы источников OBS", e))
+}
+
+async fn validate_input_kind(st: &AppState, input_kind: &str) -> Result<(), Response> {
+    let kinds = get_input_kinds(st).await?;
+    if input_kind_exists(&kinds, input_kind) {
+        Ok(())
+    } else {
+        Err(bad(&format!(
+            "OBS не вернул тип источника `{input_kind}`. Обновите список типов и выберите источник из него."
+        )))
     }
 }
 
@@ -918,7 +924,7 @@ async fn obs_source_create(
         .map_err(|e| bad(&e))?;
     let input_kind =
         required_trimmed(&body, "inputKind", "Тип источника обязателен").map_err(|e| bad(&e))?;
-    let settings = source_settings(input_kind, &body).map_err(|e| bad(&e))?;
+    validate_input_kind(&st, input_kind).await?;
     st.obs
         .request(
             "CreateInput",
@@ -926,13 +932,39 @@ async fn obs_source_create(
                 "sceneName": scene,
                 "inputName": source,
                 "inputKind": input_kind,
-                "inputSettings": settings,
+                "inputSettings": {},
                 "sceneItemEnabled": true,
             }),
         )
         .await
-        .map(Json)
+        .map(|response| {
+            Json(json!({
+                "inputKind": input_kind,
+                "inputName": source,
+                "obs": response,
+            }))
+        })
         .map_err(|e| err("Не удалось создать источник", e))
+}
+
+async fn obs_source_properties(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> ApiResult<Value> {
+    require_auth(&st, &headers).await?;
+    let source = required_trimmed(&body, "sourceName", "Название источника обязательно")
+        .map_err(|e| bad(&e))?;
+    st.obs
+        .request("OpenInputPropertiesDialog", json!({"inputName": source}))
+        .await
+        .map(|response| {
+            Json(json!({
+                "inputName": source,
+                "obs": response,
+            }))
+        })
+        .map_err(|e| err("OBS не смог открыть окно свойств источника", e))
 }
 
 async fn obs_source_visibility(
@@ -2241,18 +2273,11 @@ mod tests {
     }
 
     #[test]
-    fn source_settings_reject_unlisted_input_kind() {
-        assert!(source_settings("dshow_input", &json!({})).is_err());
-    }
-
-    #[test]
-    fn browser_source_settings_require_https_or_loopback() {
-        assert!(source_settings("browser_source", &json!({"url": "http://example.com"})).is_err());
-        let settings = source_settings("browser_source", &json!({"url": "https://example.com"}))
-            .expect("https browser source is accepted");
-        assert_eq!(settings["url"], "https://example.com");
-        assert_eq!(settings["width"], 1920);
-        assert_eq!(settings["height"], 1080);
+    fn input_kind_exists_matches_obs_list() {
+        let kinds = json!({"inputKinds": ["browser_source", "dshow_input"]});
+        assert!(input_kind_exists(&kinds, "browser_source"));
+        assert!(input_kind_exists(&kinds, "dshow_input"));
+        assert!(!input_kind_exists(&kinds, "not_from_obs"));
     }
 
     #[test]

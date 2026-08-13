@@ -287,6 +287,11 @@ li {
   border-radius: var(--radius);
   background: var(--bg);
 }
+.source[data-highlight="true"],
+.just-added {
+  border-color: var(--ok);
+  box-shadow: inset 0.25rem 0 0 var(--ok);
+}
 .source h3,
 .audio-row h3 {
   margin: 0 0 0.35rem;
