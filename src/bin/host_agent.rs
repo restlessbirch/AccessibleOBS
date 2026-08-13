@@ -29,7 +29,10 @@ use std::{
 };
 use subtle::ConstantTimeEq;
 use tokio::sync::{Mutex, RwLock, broadcast};
-use tokio_stream::{StreamExt as _, wrappers::BroadcastStream};
+use tokio_stream::{
+    StreamExt as _,
+    wrappers::{BroadcastStream, errors::BroadcastStreamRecvError},
+};
 use tower_http::{services::ServeDir, trace::TraceLayer};
 use tracing::{error, info, warn};
 
@@ -311,7 +314,14 @@ fn forward_obs_events(obs: ObsHandle, events: broadcast::Sender<Value>) {
                     let _ = events.send(json!({"type": "obs", "event": event}));
                 }
                 Err(broadcast::error::RecvError::Lagged(n)) => {
-                    warn!("Панель отстала на {n} событий OBS");
+                    // Потерянные события молчаливо пропускать нельзя: панель
+                    // продолжила бы показывать состояние, которое уже неверно,
+                    // и выглядела бы при этом исправной. Просим её перечитать всё.
+                    warn!("Панель отстала на {n} событий OBS, требуется полное обновление");
+                    let _ = events.send(json!({
+                        "type": "resync_required",
+                        "lost": n,
+                    }));
                 }
                 Err(broadcast::error::RecvError::Closed) => break,
             }
@@ -524,7 +534,16 @@ async fn sse_events(
 ) -> Result<Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>>>, Response> {
     require_auth(&st, &headers).await?;
     let stream = BroadcastStream::new(st.events.subscribe()).filter_map(|msg| {
-        let value = msg.ok()?;
+        let value = match msg {
+            Ok(value) => value,
+            // У каждого клиента своя очередь. Если браузер не успел её
+            // вычитать, события пропали именно для него — молчать об этом
+            // нельзя, иначе панель покажет устаревшее состояние как свежее.
+            Err(BroadcastStreamRecvError::Lagged(lost)) => {
+                warn!("Клиент панели отстал на {lost} событий");
+                json!({"type": "resync_required", "lost": lost})
+            }
+        };
         Event::default().json_data(&value).ok().map(Ok)
     });
     Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
@@ -1289,56 +1308,88 @@ async fn reconcile_donationalerts(st: &AppState) -> Result<Value> {
         .find(|i| i.get("inputName").and_then(Value::as_str) == Some(&cfg.input_name))
         .cloned();
 
-    if let Some(inp) = existing {
-        if inp.get("inputKind").and_then(Value::as_str) != Some("browser_source") {
-            return Err(anyhow!(
-                "Имя {} уже занято источником другого типа. Переименуйте его в OBS или измените input_name в config/host.json.",
-                cfg.input_name
-            ));
+    // Шаг 1: источник существует и его настройки верны.
+    let created = match existing {
+        Some(inp) => {
+            if inp.get("inputKind").and_then(Value::as_str) != Some("browser_source") {
+                return Err(anyhow!(
+                    "Имя {} уже занято источником другого типа. Переименуйте его в OBS или измените input_name в config/host.json.",
+                    cfg.input_name
+                ));
+            }
+            st.obs
+                .request(
+                    "SetInputSettings",
+                    json!({"inputName": cfg.input_name, "inputSettings": settings, "overlay": true}),
+                )
+                .await?;
+            false
         }
-        st.obs
-            .request(
-                "SetInputSettings",
-                json!({"inputName": cfg.input_name, "inputSettings": settings, "overlay": true}),
-            )
-            .await?;
-    } else {
-        st.obs
-            .request(
-                "CreateInput",
-                json!({
-                    "sceneName": cfg.overlay_scene_name,
-                    "inputName": cfg.input_name,
-                    "inputKind": "browser_source",
-                    "inputSettings": settings,
-                    "sceneItemEnabled": true,
-                }),
-            )
-            .await?;
-        st.obs
-            .batch(vec![
-                BatchItem::new(
-                    "SetInputVolume",
-                    json!({"inputName": cfg.input_name, "inputVolumeMul": db_to_mul(cfg.initial_volume_db)}),
-                ),
-                BatchItem::new(
-                    "SetInputMute",
-                    json!({"inputName": cfg.input_name, "inputMuted": false}),
-                ),
-            ])
-            .await
-            .ok();
-    }
+        None => {
+            st.obs
+                .request(
+                    "CreateInput",
+                    json!({
+                        "sceneName": cfg.overlay_scene_name,
+                        "inputName": cfg.input_name,
+                        "inputKind": "browser_source",
+                        "inputSettings": settings,
+                        "sceneItemEnabled": true,
+                    }),
+                )
+                .await?;
+            true
+        }
+    };
 
-    // Мониторинг выключаем: иначе актёр слышит алерт в наушниках дважды.
+    // Шаг 2: источник лежит именно в сцене-оверлее.
+    //
+    // Существование input проверяется глобально и ничего не говорит о том,
+    // есть ли он в RSC_OVERLAYS. Если элемент удалили из сцены руками, прежний
+    // код обновлял настройки и рапортовал об успехе, а оверлея в эфире не было.
+    let (overlay_item_id, item_restored) =
+        ensure_scene_item(&st.obs, &cfg.overlay_scene_name, &cfg.input_name).await?;
     st.obs
         .request(
-            "SetInputAudioMonitorType",
-            json!({"inputName": cfg.input_name, "monitorType": "OBS_MONITORING_TYPE_NONE"}),
+            "SetSceneItemEnabled",
+            json!({
+                "sceneName": cfg.overlay_scene_name,
+                "sceneItemId": overlay_item_id,
+                "sceneItemEnabled": true,
+            }),
         )
         .await
         .ok();
 
+    // Шаг 3: звук.
+    //
+    // Снятие mute выполняем всегда, а не только при создании. Иначе достаточно
+    // один раз заглушить источник — и reconcile будет успешно завершаться,
+    // оставляя донаты беззвучными. Именно ради слышимости всё и затевалось.
+    //
+    // Громкость, наоборот, ставим только при создании: initial_volume_db на то
+    // и «initial». Владелец мог осознанно сделать алерты тише, и затирать его
+    // выбор при каждой проверке было бы наглостью.
+    let mut audio = vec![
+        BatchItem::new(
+            "SetInputMute",
+            json!({"inputName": cfg.input_name, "inputMuted": false}),
+        ),
+        // Мониторинг выключаем: иначе актёр слышит алерт в наушниках дважды.
+        BatchItem::new(
+            "SetInputAudioMonitorType",
+            json!({"inputName": cfg.input_name, "monitorType": "OBS_MONITORING_TYPE_NONE"}),
+        ),
+    ];
+    if created {
+        audio.push(BatchItem::new(
+            "SetInputVolume",
+            json!({"inputName": cfg.input_name, "inputVolumeMul": db_to_mul(cfg.initial_volume_db)}),
+        ));
+    }
+    st.obs.batch(audio).await.ok();
+
+    // Шаг 4: оверлей поверх каждой пользовательской сцены.
     let mut added = 0;
     let mut present = 0;
     if cfg.enforce_overlays {
@@ -1357,51 +1408,14 @@ async fn reconcile_donationalerts(st: &AppState) -> Result<Value> {
             .collect();
 
         for scene in scenes {
-            let items = st
-                .obs
-                .request("GetSceneItemList", json!({"sceneName": scene}))
-                .await?;
-            let found = items
-                .get("sceneItems")
-                .and_then(Value::as_array)
-                .into_iter()
-                .flatten()
-                .find(|i| {
-                    i.get("sourceName").and_then(Value::as_str) == Some(&cfg.overlay_scene_name)
-                })
-                .and_then(|i| i.get("sceneItemId").and_then(Value::as_i64));
-
-            let id = match found {
-                Some(id) => {
-                    present += 1;
-                    Some(id)
-                }
-                None => {
-                    let r = st
-                        .obs
-                        .request(
-                            "CreateSceneItem",
-                            json!({
-                                "sceneName": scene,
-                                "sourceName": cfg.overlay_scene_name,
-                                "sceneItemEnabled": true,
-                            }),
-                        )
-                        .await?;
-                    added += 1;
-                    r.get("sceneItemId").and_then(Value::as_i64)
-                }
-            };
-            // Индекс 0 — верхний слой, иначе алерт окажется под игрой или камерой.
-            if let Some(id) = id {
-                st.obs
-                    .request(
-                        "SetSceneItemIndex",
-                        json!({"sceneName": scene, "sceneItemId": id, "sceneItemIndex": 0}),
-                    )
-                    .await
-                    .ok();
+            let (id, was_created) =
+                ensure_scene_item(&st.obs, &scene, &cfg.overlay_scene_name).await?;
+            if was_created {
+                added += 1;
+            } else {
+                present += 1;
             }
+            raise_scene_item_to_top(&st.obs, &scene, id).await.ok();
         }
     }
 
@@ -1411,9 +1425,72 @@ async fn reconcile_donationalerts(st: &AppState) -> Result<Value> {
         "input_name": cfg.input_name,
         "widget_url": "configured",
         "reroute_audio": cfg.reroute_audio,
+        "input_created": created,
+        "overlay_item_restored": item_restored,
         "scenes_already_had_overlay": present,
         "scenes_added_overlay": added,
     }))
+}
+
+/// Возвращает id элемента сцены, создавая его при отсутствии.
+/// Второе значение — признак того, что элемент пришлось создать.
+async fn ensure_scene_item(obs: &ObsHandle, scene: &str, source: &str) -> Result<(i64, bool)> {
+    let items = obs
+        .request("GetSceneItemList", json!({"sceneName": scene}))
+        .await?;
+    let found = items
+        .get("sceneItems")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .find(|i| i.get("sourceName").and_then(Value::as_str) == Some(source))
+        .and_then(|i| i.get("sceneItemId").and_then(Value::as_i64));
+
+    if let Some(id) = found {
+        return Ok((id, false));
+    }
+    let created = obs
+        .request(
+            "CreateSceneItem",
+            json!({"sceneName": scene, "sourceName": source, "sceneItemEnabled": true}),
+        )
+        .await?;
+    let id = created
+        .get("sceneItemId")
+        .and_then(Value::as_i64)
+        .ok_or_else(|| anyhow!("OBS не вернул id созданного элемента сцены"))?;
+    Ok((id, true))
+}
+
+/// Индекс верхнего слоя для сцены с указанным числом элементов.
+///
+/// В obs-websocket индекс 0 — это НИЗ списка источников, а не верх. Прежний код
+/// ставил оверлею индекс 0 с комментарием «верхний слой», из-за чего донаты
+/// уезжали под захват игры. Ошибка не ловилась ни компилятором, ни CI.
+fn top_scene_item_index(item_count: usize) -> i64 {
+    item_count.saturating_sub(1) as i64
+}
+
+/// Поднимает элемент сцены на самый верх.
+async fn raise_scene_item_to_top(obs: &ObsHandle, scene: &str, item_id: i64) -> Result<()> {
+    let items = obs
+        .request("GetSceneItemList", json!({"sceneName": scene}))
+        .await?;
+    let count = items
+        .get("sceneItems")
+        .and_then(Value::as_array)
+        .map(Vec::len)
+        .unwrap_or(0);
+    obs.request(
+        "SetSceneItemIndex",
+        json!({
+            "sceneName": scene,
+            "sceneItemId": item_id,
+            "sceneItemIndex": top_scene_item_index(count),
+        }),
+    )
+    .await?;
+    Ok(())
 }
 
 async fn da_oauth_start(State(st): State<AppState>, headers: HeaderMap) -> ApiResult<Value> {
@@ -1488,6 +1565,50 @@ async fn da_oauth_callback(
     }
 }
 
+/// Единая обработка ответа Twitch.
+///
+/// Twitch на 4xx возвращает валидный JSON вида
+/// `{"error":"Unauthorized","status":401,"message":"..."}`. Прежний код звал
+/// `.json()` сразу, не глядя на статус, и отдавал это тело как успешный ответ —
+/// панель радостно сообщала «Маркер создан», хотя не произошло ничего.
+/// Для удалённого оператора ложный успех хуже честной ошибки: он узнает правду
+/// от зрителей.
+async fn twitch_json(response: reqwest::Response, what: &str) -> Result<Value, Response> {
+    let status = response.status();
+    let body = response.text().await.unwrap_or_default();
+    let parsed = serde_json::from_str::<Value>(&body).unwrap_or(Value::Null);
+
+    if !status.is_success() {
+        let detail = parsed
+            .get("message")
+            .and_then(Value::as_str)
+            .filter(|m| !m.trim().is_empty())
+            .unwrap_or(body.trim());
+        let hint = match status.as_u16() {
+            401 => " Токен Twitch истёк — подключите Twitch заново.",
+            403 => " Не хватает прав. Проверьте scope приложения Twitch.",
+            429 => " Twitch временно ограничил частоту запросов, повторите позже.",
+            _ => "",
+        };
+        error!("Twitch {what}: {status} {detail}");
+        return Err((
+            StatusCode::BAD_GATEWAY,
+            Json(json!({"error": {
+                "message": format!("{what}: Twitch ответил {}.{hint}", status.as_u16()),
+                "detail": detail,
+            }})),
+        )
+            .into_response());
+    }
+
+    // Часть ручек Twitch отвечает 204 без тела — это законный успех.
+    Ok(if body.trim().is_empty() {
+        json!({"ok": true})
+    } else {
+        parsed
+    })
+}
+
 async fn twitch_status(State(st): State<AppState>, headers: HeaderMap) -> ApiResult<Value> {
     require_auth(&st, &headers).await?;
     Ok(Json(twitch_status_value(&st).await))
@@ -1538,16 +1659,14 @@ async fn twitch_device_start(State(st): State<AppState>, headers: HeaderMap) -> 
         ("client_id", st.cfg.twitch.client_id.as_str()),
         ("scopes", scopes.as_str()),
     ];
-    let v = st
+    let response = st
         .http
         .post("https://id.twitch.tv/oauth2/device")
         .form(&form)
         .send()
         .await
-        .map_err(|e| err("Twitch Device Code недоступен", e.into()))?
-        .json::<Value>()
-        .await
-        .map_err(|e| err("Twitch вернул непонятный ответ", e.into()))?;
+        .map_err(|e| err("Twitch недоступен", e.into()))?;
+    let v = twitch_json(response, "Запрос кода подключения").await?;
     if let Some(code) = v.get("device_code").and_then(Value::as_str) {
         save_secret("twitch_device_code", code).ok();
     }
@@ -1564,22 +1683,50 @@ async fn twitch_device_check(State(st): State<AppState>, headers: HeaderMap) -> 
         ("device_code", dc.as_str()),
         ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
     ];
-    let v = st
+    let response = st
         .http
         .post("https://id.twitch.tv/oauth2/token")
         .form(&form)
         .send()
         .await
-        .map_err(|e| err("Не удалось проверить авторизацию Twitch", e.into()))?
-        .json::<Value>()
-        .await
-        .map_err(|e| err("Twitch вернул непонятный token response", e.into()))?;
+        .map_err(|e| err("Не удалось проверить авторизацию Twitch", e.into()))?;
+
+    // Здесь twitch_json намеренно НЕ используется. Пока владелец не ввёл код на
+    // сайте Twitch, endpoint отвечает 400 с authorization_pending — это штатное
+    // ожидание, а не сбой, и превращать его в ошибку нельзя: кнопка «Проверить
+    // авторизацию» ругалась бы при каждом нажатии до подтверждения.
+    let status = response.status();
+    let body = response.text().await.unwrap_or_default();
+    let v = serde_json::from_str::<Value>(&body).unwrap_or(Value::Null);
+    let message = v.get("message").and_then(Value::as_str).unwrap_or("");
+
     if v.get("access_token").is_some() {
         save_secret("twitch_tokens", &v.to_string())
             .map_err(|e| err("Не удалось сохранить Twitch token", e))?;
         delete_secret("twitch_device_code").ok();
+        return Ok(Json(json!({"status": "connected"})));
     }
-    Ok(Json(v))
+    if message.contains("authorization_pending") {
+        return Ok(Json(json!({
+            "status": "pending",
+            "message": "Код ещё не подтверждён на сайте Twitch.",
+        })));
+    }
+    if message.contains("expired") {
+        return Ok(Json(json!({
+            "status": "expired",
+            "message": "Код устарел. Нажмите «Подключить Twitch» заново.",
+        })));
+    }
+    error!("Twitch device check: {status} {body}");
+    Err((
+        StatusCode::BAD_GATEWAY,
+        Json(json!({"error": {
+            "message": "Twitch отклонил проверку авторизации.",
+            "detail": if message.is_empty() { body.trim() } else { message },
+        }})),
+    )
+        .into_response())
 }
 
 async fn twitch_user(st: &AppState) -> Result<(String, String)> {
@@ -1610,7 +1757,7 @@ async fn twitch_channel_get(State(st): State<AppState>, headers: HeaderMap) -> A
     let (access, uid) = twitch_user(&st)
         .await
         .map_err(|e| err("Twitch не подключён", e))?;
-    let v = st
+    let response = st
         .http
         .get("https://api.twitch.tv/helix/channels")
         .query(&[("broadcaster_id", uid.as_str())])
@@ -1618,11 +1765,10 @@ async fn twitch_channel_get(State(st): State<AppState>, headers: HeaderMap) -> A
         .bearer_auth(access)
         .send()
         .await
-        .map_err(|e| err("Twitch channel недоступен", e.into()))?
-        .json::<Value>()
-        .await
-        .map_err(|e| err("Непонятный ответ Twitch channel", e.into()))?;
-    Ok(Json(v))
+        .map_err(|e| err("Twitch недоступен", e.into()))?;
+    Ok(Json(
+        twitch_json(response, "Чтение параметров канала").await?,
+    ))
 }
 
 async fn twitch_channel_modify(
@@ -1634,7 +1780,7 @@ async fn twitch_channel_modify(
     let (access, uid) = twitch_user(&st)
         .await
         .map_err(|e| err("Twitch не подключён", e))?;
-    let r = st
+    let response = st
         .http
         .patch("https://api.twitch.tv/helix/channels")
         .query(&[("broadcaster_id", uid.as_str())])
@@ -1644,18 +1790,9 @@ async fn twitch_channel_modify(
         .send()
         .await
         .map_err(|e| err("Не удалось изменить канал Twitch", e.into()))?;
-    let status = r.status();
-    // Twitch отвечает 204 без тела, поэтому текст читаем только при ошибке.
-    let detail = if status.is_success() {
-        Value::Null
-    } else {
-        Value::String(r.text().await.unwrap_or_default())
-    };
-    Ok(Json(json!({
-        "ok": status.is_success(),
-        "status": status.as_u16(),
-        "detail": detail,
-    })))
+    // Успех здесь — 204 без тела; twitch_json превратит его в {"ok": true},
+    // а любую ошибку — в настоящий код ошибки вместо «ok: false» внутри 200.
+    Ok(Json(twitch_json(response, "Изменение канала").await?))
 }
 
 async fn twitch_marker(
@@ -1671,7 +1808,7 @@ async fn twitch_marker(
         .get("description")
         .and_then(Value::as_str)
         .unwrap_or("");
-    let v = st
+    let response = st
         .http
         .post("https://api.twitch.tv/helix/streams/markers")
         .header("Client-Id", &st.cfg.twitch.client_id)
@@ -1679,11 +1816,8 @@ async fn twitch_marker(
         .json(&json!({"user_id": uid, "description": description}))
         .send()
         .await
-        .map_err(|e| err("Не удалось создать Twitch marker", e.into()))?
-        .json::<Value>()
-        .await
-        .map_err(|e| err("Непонятный ответ Twitch marker", e.into()))?;
-    Ok(Json(v))
+        .map_err(|e| err("Не удалось создать метку Twitch", e.into()))?;
+    Ok(Json(twitch_json(response, "Создание метки").await?))
 }
 
 #[cfg(test)]
@@ -1727,6 +1861,16 @@ mod tests {
         g.record_failure();
         let left = g.blocked_for().expect("блокировка включилась");
         assert!(left <= LOGIN_BLOCK);
+    }
+
+    #[test]
+    fn top_index_is_the_last_position_not_zero() {
+        // Главный вывод аудита: в obs-websocket индекс 0 — это НИЗ списка.
+        // Оверлей с донатами, поставленный на 0, уезжал под захват игры.
+        assert_eq!(top_scene_item_index(3), 2);
+        assert_eq!(top_scene_item_index(1), 0);
+        // Пустая сцена: индекса нет, но паниковать нельзя.
+        assert_eq!(top_scene_item_index(0), 0);
     }
 
     #[test]

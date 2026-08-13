@@ -197,6 +197,12 @@ function handleEvent(msg) {
     case 'alert':
       handleAlert(msg);
       break;
+    case 'resync_required':
+      // Агент сообщил, что события потерялись. Всё, что панель показывает
+      // сейчас, могло устареть, поэтому перечитываем состояние целиком.
+      journal(`Потеряно событий: ${msg.lost}. Обновляю состояние.`, 'bad');
+      schedule('all', refreshAll, 100);
+      break;
     case 'donation':
       addDonation(msg.donation, true);
       break;
@@ -308,26 +314,66 @@ function renderOutputState(node, label, data) {
 
 let currentScene = '';
 let sceneNames = [];
+/// Когда данные обновлялись в последний раз и что не ответило.
+let lastRefresh = null;
 let streaming = false;
 let streamTrouble = false;
 
+/// Обновляет всё и честно сообщает, что именно обновить не удалось.
+///
+/// Прежде здесь был Promise.allSettled без разбора результатов, и панель
+/// говорила «Состояние обновлено», даже когда половина разделов не ответила.
+/// Для оператора, который не видит экран, это худший вид неправды: он слышит
+/// подтверждение и считает, что данные перед ним свежие.
+///
+/// Возвращает список имён разделов, которые обновить не вышло.
 async function refreshAll() {
   // Сцены обновляем первыми и дожидаемся: от их списка зависит выбор сцены
   // предпросмотра в Studio Mode. Запуск всего скопом оставлял бы этот
   // список пустым при первой загрузке — кто успел, тот и прав.
-  await refreshScenes().catch(() => {});
-  await Promise.allSettled([
-    refreshHealth(),
-    refreshAudio(),
-    refreshOutputs(),
-    refreshStudio(),
-    refreshVcam(),
-    refreshReplay(),
-    refreshSetups(),
-    refreshDa(),
-    refreshTwitch(),
-    refreshDonations(),
-  ]);
+  const failed = [];
+  try {
+    await refreshScenes();
+  } catch {
+    failed.push('Сцены');
+  }
+
+  const rest = [
+    ['Состояние', refreshHealth],
+    ['Аудио', refreshAudio],
+    ['Эфир и запись', refreshOutputs],
+    ['Studio Mode', refreshStudio],
+    ['Виртуальная камера', refreshVcam],
+    ['Буфер повтора', refreshReplay],
+    ['Профили и переходы', refreshSetups],
+    ['DonationAlerts', refreshDa],
+    ['Twitch', refreshTwitch],
+    ['Донаты', refreshDonations],
+  ];
+  const results = await Promise.allSettled(rest.map(([, fn]) => fn()));
+  results.forEach((r, i) => {
+    if (r.status === 'rejected') failed.push(rest[i][0]);
+  });
+
+  lastRefresh = { at: new Date(), failed };
+  renderFreshness();
+  return failed;
+}
+
+/// Показывает, когда данные обновлялись и что именно устарело.
+function renderFreshness() {
+  const node = $('freshness');
+  if (!lastRefresh) return setState(node, 'warn', 'Данные ещё не загружены');
+  const { at, failed } = lastRefresh;
+  if (failed.length === 0) {
+    setState(node, 'ok', `Данные актуальны на ${timeLabel(at)}`);
+  } else {
+    setState(
+      node,
+      'bad',
+      `Обновлено частично на ${timeLabel(at)}. Не отвечают: ${failed.join(', ')}`,
+    );
+  }
 }
 
 function renderDl(node, obj) {
@@ -679,20 +725,36 @@ function handleLevels(levels) {
     lastLevels.set(name, db);
     const node = levelNodes.get(name);
     if (node) node.textContent = levelText(db);
+  }
 
-    // Предупреждаем один раз за период тишины и только во время эфира:
-    // вне эфира молчащий микрофон — нормальное положение дел.
-    if (db > SILENCE_DB) {
-      silenceCount.set(name, 0);
-      silenceWarned.delete(name);
-      continue;
+  // Тишину сторожим только у микрофона.
+  //
+  // Донаты, медиа-вставки и вспомогательные входы молчат почти всегда — это
+  // их нормальное состояние. Тревожась о каждом, панель выдавала бы поток
+  // ложных предупреждений, и настоящее, про пропавший микрофон, потерялось
+  // бы среди них. Оператор перестал бы их слушать, а это хуже, чем не иметь
+  // тревог вовсе.
+  if (!micName) return;
+  const db = levels?.[micName];
+  if (db === undefined) return;
+
+  if (db > SILENCE_DB) {
+    silenceCount.set(micName, 0);
+    if (silenceWarned.delete(micName)) {
+      say('Микрофон снова звучит');
+      journal('Микрофон снова звучит', 'ok');
     }
-    const count = (silenceCount.get(name) || 0) + 1;
-    silenceCount.set(name, count);
-    if (streaming && count >= SILENCE_SAMPLES && !silenceWarned.has(name)) {
-      silenceWarned.add(name);
-      announce(`Внимание: ${name} молчит уже десять секунд, а эфир идёт`);
-    }
+    return;
+  }
+  // Предупреждаем один раз за период тишины и только во время эфира:
+  // вне эфира молчащий микрофон — нормальное положение дел.
+  const count = (silenceCount.get(micName) || 0) + 1;
+  silenceCount.set(micName, count);
+  if (streaming && count >= SILENCE_SAMPLES && !silenceWarned.has(micName)) {
+    silenceWarned.add(micName);
+    const text = `Внимание: микрофон ${micName} молчит десять секунд, а эфир идёт`;
+    announce(text);
+    journal(text, 'bad');
   }
 }
 
@@ -983,14 +1045,17 @@ $('twitchStart').onclick = async () => {
 
 $('twitchCheck').onclick = async () => {
   try {
+    // Backend различает три исхода: подключено, ждём подтверждения, код
+    // устарел. Раньше панель смотрела на наличие access_token и любую неудачу
+    // показывала одинаково — владелец не понимал, ждать ему или начинать заново.
     const r = await post('/api/twitch/device/check');
-    const done = !!r.access_token;
-    replace($('twitchDevice'), el('p', {
-      text: done
-        ? 'Twitch подключён.'
-        : 'Пока не подтверждено. Завершите вход на странице Twitch и нажмите проверку ещё раз.',
-    }));
-    say(done ? 'Twitch подключён' : 'Авторизация Twitch не завершена');
+    const text = {
+      connected: 'Twitch подключён.',
+      pending: 'Пока не подтверждено. Завершите вход на странице Twitch и нажмите проверку ещё раз.',
+      expired: 'Код устарел. Нажмите «Подключить Twitch» заново.',
+    }[r.status] || r.message || 'Непонятный ответ Twitch.';
+    replace($('twitchDevice'), el('p', { text }));
+    say(text);
     await refreshTwitch();
   } catch (e) {
     fail(e);
@@ -1042,7 +1107,12 @@ $('clearJournal').onclick = () => {
   say('Журнал очищен');
 };
 
-$('refreshAll').onclick = () => refreshAll().then(() => say('Состояние обновлено'));
+$('refreshAll').onclick = async () => {
+  const failed = await refreshAll();
+  say(failed.length === 0
+    ? 'Состояние обновлено полностью'
+    : `Обновлено частично. Не отвечают: ${failed.join(', ')}`);
+};
 $('refreshScenes').onclick = refreshScenes;
 $('refreshSources').onclick = refreshSources;
 $('refreshAudio').onclick = refreshAudio;
@@ -1053,22 +1123,27 @@ $('refreshAudio').onclick = refreshAudio;
 // переключить сцену иногда надо за секунду. Искать кнопку табуляцией
 // в такой момент — непозволительная роскошь.
 
-/// Микрофон определяет сам OBS — по роли источника, а не по его названию.
-/// Угадывание по слову «микрофон» ломалось, стоило актёру переименовать вход.
-function findMicName() {
-  return micName || [...levelNodes.keys()][0];
-}
-
+/// Глушит только тот вход, который сам OBS назначил микрофоном.
+///
+/// Запасного варианта нет намеренно. Раньше при неопознанном микрофоне бралась
+/// первая попавшаяся дорожка — и клавиша, которую владелец жмёт как аварийное
+/// «заглушить себя», могла выключить звук игры или донатов. Незрячий оператор
+/// подмены не заметит: на экране подтверждения нет, а последствия услышат
+/// только зрители. Честно отказаться лучше, чем молча промахнуться.
 async function toggleMic() {
-  const name = findMicName();
-  if (!name) return say('Аудиоисточники не найдены');
+  if (!micName) {
+    return announce(
+      'Микрофон не назначен, ничего не изменено. У актёра в OBS: '
+      + 'Настройки, раздел Аудио, поле «Микрофон/дополнительное аудио».',
+    );
+  }
   try {
     // Состояние читаем из OBS, а не из разметки: она могла устареть.
     const data = await api('/api/obs/audio');
-    const row = (data.audio || []).find((a) => a.inputName === name);
-    if (!row) return say('Источник не найден: ' + name);
-    await post('/api/obs/audio/mute', { inputName: name, muted: !row.muted });
-    say(`${name}: звук ${row.muted ? 'включён' : 'выключен'}`);
+    const row = (data.audio || []).find((a) => a.inputName === micName);
+    if (!row) return announce(`Микрофон ${micName} исчез из OBS. Ничего не изменено.`);
+    await post('/api/obs/audio/mute', { inputName: micName, muted: !row.muted });
+    say(`${micName}: звук ${row.muted ? 'включён' : 'выключен'}`);
   } catch (e) {
     fail(e);
   }
@@ -1089,7 +1164,7 @@ const SHORTCUTS = [
   ['1 … 9', 'переключить сцену с этим номером', (key) => switchSceneByIndex(Number(key) - 1)],
   ['M', 'выключить или включить микрофон', toggleMic],
   ['P', 'обновить кадр эфира', grabPreview],
-  ['R', 'обновить всё', () => refreshAll().then(() => say('Состояние обновлено'))],
+  ['R', 'обновить всё', () => $('refreshAll').click()],
   ['T', 'вывести предпросмотр в эфир', () =>
     command('/api/obs/studio/transition', 'Предпросмотр выведен в эфир')],
 ];
