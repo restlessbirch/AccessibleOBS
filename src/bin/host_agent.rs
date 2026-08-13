@@ -160,6 +160,23 @@ fn load_runtime_donationalerts_secret(mut cfg: HostConfig) -> Result<HostConfig>
     Ok(cfg)
 }
 
+fn runtime_obs_password(cfg: &HostConfig) -> Result<String> {
+    if let Some(secret) = load_secret("obs_websocket_password")? {
+        return Ok(secret);
+    }
+    if !cfg.obs_websocket_password.trim().is_empty() {
+        let password = cfg.obs_websocket_password.clone();
+        save_secret("obs_websocket_password", &password)?;
+        return Ok(password);
+    }
+    if let Some(password) = existing_obs_websocket_password() {
+        save_secret("obs_websocket_password", &password)?;
+        info!("OBS WebSocket password imported from existing OBS configuration");
+        return Ok(password);
+    }
+    Ok(String::new())
+}
+
 fn raw_obs_allowed(request_type: &str) -> bool {
     RAW_OBS_ALLOWLIST.contains(&request_type)
 }
@@ -192,8 +209,7 @@ async fn main() -> Result<()> {
     if local_mode_arg_present() {
         cfg.runtime_mode = RuntimeMode::Local;
     }
-    let obs_password = load_secret("obs_websocket_password")?
-        .unwrap_or_else(|| cfg.obs_websocket_password.clone());
+    let obs_password = runtime_obs_password(&cfg)?;
     // Пароль не должен остаться в памяти конфига, который сериализуется в ответы.
     cfg.obs_websocket_password.clear();
     let cfg = Arc::new(cfg);
