@@ -53,6 +53,14 @@
       <section class="card">
         <h2>Сцены</h2>
         <button id="refreshScenes" type="button" data-variant="quiet">Обновить сцены</button>
+        <form id="createSceneForm">
+          <fieldset>
+            <legend>Добавить сцену</legend>
+            <label for="newSceneName">Название</label>
+            <input id="newSceneName" autocomplete="off">
+            <button type="submit">Добавить сцену</button>
+          </fieldset>
+        </form>
         <fieldset>
           <legend>Переключить текущую сцену</legend>
           <label for="sceneSelect">Сцена</label>
@@ -66,6 +74,41 @@
       <section class="card">
         <h2>Источники текущей сцены</h2>
         <button id="refreshSources" type="button" data-variant="quiet">Обновить источники</button>
+        <form id="createSourceForm">
+          <fieldset>
+            <legend>Добавить источник</legend>
+            <label for="newSourceName">Название</label>
+            <input id="newSourceName" autocomplete="off">
+            <label for="newSourceKind">Тип</label>
+            <select id="newSourceKind">
+              <option value="browser_source">Browser URL</option>
+              <option value="text_gdiplus_v3">Текст</option>
+              <option value="image_source">Изображение</option>
+              <option value="ffmpeg_source">Медиафайл</option>
+            </select>
+            <div class="source-kind-field" data-source-kind="browser_source">
+              <label for="newSourceUrl">URL</label>
+              <input id="newSourceUrl" type="url" inputmode="url" placeholder="https://...">
+              <label class="check">
+                <input id="newSourceRerouteAudio" type="checkbox">
+                Вести звук в OBS
+              </label>
+            </div>
+            <div class="source-kind-field" data-source-kind="text_gdiplus_v3" hidden>
+              <label for="newSourceText">Текст</label>
+              <input id="newSourceText" autocomplete="off">
+            </div>
+            <div class="source-kind-field" data-source-kind="image_source" hidden>
+              <label for="newSourceImageFile">Путь к изображению</label>
+              <input id="newSourceImageFile" autocomplete="off" placeholder="C:\path\image.png">
+            </div>
+            <div class="source-kind-field" data-source-kind="ffmpeg_source" hidden>
+              <label for="newSourceMediaFile">Путь к медиафайлу</label>
+              <input id="newSourceMediaFile" autocomplete="off" placeholder="C:\path\video.mp4">
+            </div>
+            <button type="submit">Добавить источник</button>
+          </fieldset>
+        </form>
         <div id="sources"></div>
       </section>
 

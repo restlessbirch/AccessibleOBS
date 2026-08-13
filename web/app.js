@@ -42,6 +42,32 @@ function replace(container, nodes) {
   container.replaceChildren(...[].concat(nodes).filter(Boolean));
 }
 
+function setupCollapsibleSections() {
+  document.querySelectorAll('#panel > section.card').forEach((section, index) => {
+    const heading = section.querySelector(':scope > h2');
+    if (!heading) return;
+    const body = el('div', {
+      class: 'section-body',
+      id: `section-body-${index}`,
+    });
+    while (heading.nextSibling) body.append(heading.nextSibling);
+    section.append(body);
+
+    const key = 'rsc_section_open_' + heading.textContent.trim();
+    const buttonNode = button(heading.textContent, () => {
+      const open = buttonNode.getAttribute('aria-expanded') !== 'true';
+      buttonNode.setAttribute('aria-expanded', String(open));
+      body.hidden = !open;
+      localStorage.setItem(key, open ? '1' : '0');
+    }, 'quiet');
+    buttonNode.className = 'section-toggle';
+    buttonNode.setAttribute('aria-expanded', localStorage.getItem(key) === '0' ? 'false' : 'true');
+    buttonNode.setAttribute('aria-controls', body.id);
+    body.hidden = buttonNode.getAttribute('aria-expanded') !== 'true';
+    heading.replaceChildren(buttonNode);
+  });
+}
+
 /** Вежливое сообщение: NVDA прочитает, не прерывая текущую фразу. */
 function say(text) {
   $('live').textContent = text;
@@ -531,6 +557,22 @@ $('setScene').onclick = async () => {
   }
 };
 
+$('createSceneForm').onsubmit = async (event) => {
+  event.preventDefault();
+  const sceneName = $('newSceneName').value.trim();
+  if (!sceneName) return fail(new Error('Введите название сцены'));
+  try {
+    await post('/api/obs/scenes', { sceneName });
+    await post('/api/obs/scenes/current', { sceneName });
+    $('newSceneName').value = '';
+    currentScene = sceneName;
+    say('Сцена добавлена: ' + sceneName);
+    await refreshScenes();
+  } catch (e) {
+    fail(e);
+  }
+};
+
 // -------------------------------------------------- Studio Mode и прочее
 
 /// Заполняет выпадающий список, сохраняя выбранное значение.
@@ -692,6 +734,59 @@ async function setSource(sceneItemId, sourceName, enabled) {
     fail(e);
   }
 }
+
+function updateSourceKindFields() {
+  const kind = $('newSourceKind').value;
+  document.querySelectorAll('.source-kind-field').forEach((node) => {
+    node.hidden = node.dataset.sourceKind !== kind;
+  });
+}
+
+$('newSourceKind').onchange = updateSourceKindFields;
+updateSourceKindFields();
+
+function sourceCreateBody() {
+  const inputKind = $('newSourceKind').value;
+  const body = {
+    sceneName: currentScene,
+    sourceName: $('newSourceName').value.trim(),
+    inputKind,
+  };
+  if (!body.sourceName) throw new Error('Введите название источника');
+  if (!currentScene) throw new Error('Сначала выберите или создайте сцену');
+
+  if (inputKind === 'browser_source') {
+    body.url = $('newSourceUrl').value.trim();
+    body.rerouteAudio = $('newSourceRerouteAudio').checked;
+    if (!body.url) throw new Error('Введите URL');
+  } else if (inputKind === 'text_gdiplus_v3') {
+    body.text = $('newSourceText').value.trim() || 'Новый текст';
+  } else if (inputKind === 'image_source') {
+    body.file = $('newSourceImageFile').value.trim();
+    if (!body.file) throw new Error('Введите путь к изображению');
+  } else if (inputKind === 'ffmpeg_source') {
+    body.file = $('newSourceMediaFile').value.trim();
+    if (!body.file) throw new Error('Введите путь к медиафайлу');
+  }
+  return body;
+}
+
+$('createSourceForm').onsubmit = async (event) => {
+  event.preventDefault();
+  try {
+    const body = sourceCreateBody();
+    await post('/api/obs/sources', body);
+    $('newSourceName').value = '';
+    $('newSourceUrl').value = '';
+    $('newSourceText').value = '';
+    $('newSourceImageFile').value = '';
+    $('newSourceMediaFile').value = '';
+    say('Источник добавлен: ' + body.sourceName);
+    await refreshSources();
+  } catch (e) {
+    fail(e);
+  }
+};
 
 // -------------------------------------------------------- тревоги эфира
 //
@@ -1262,6 +1357,7 @@ $('shortcutsOn').onchange = (event) => {
 };
 
 (async function start() {
+  setupCollapsibleSections();
   await loadRuntime();
   const status = await api('/api/auth/status').catch(() => ({ authenticated: false }));
   if (!status.authenticated) {

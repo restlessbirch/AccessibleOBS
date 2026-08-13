@@ -270,9 +270,9 @@ async fn main() -> Result<()> {
         .route("/api/obs", get(obs_status))
         .route("/api/obs/launch", post(obs_launch))
         .route("/api/obs/request", post(obs_request))
-        .route("/api/obs/scenes", get(obs_scenes))
+        .route("/api/obs/scenes", get(obs_scenes).post(obs_scene_create))
         .route("/api/obs/scenes/current", post(obs_set_scene))
-        .route("/api/obs/sources", get(obs_sources))
+        .route("/api/obs/sources", get(obs_sources).post(obs_source_create))
         .route("/api/obs/source/visibility", post(obs_source_visibility))
         .route("/api/obs/audio", get(obs_audio))
         .route("/api/obs/audio/mute", post(obs_audio_mute))
@@ -819,6 +819,21 @@ async fn obs_scenes(State(st): State<AppState>, headers: HeaderMap) -> ApiResult
         .map_err(|e| err("Не удалось получить сцены OBS", e))
 }
 
+async fn obs_scene_create(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> ApiResult<Value> {
+    require_auth(&st, &headers).await?;
+    let scene =
+        required_trimmed(&body, "sceneName", "Название сцены обязательно").map_err(|e| bad(&e))?;
+    st.obs
+        .request("CreateScene", json!({"sceneName": scene}))
+        .await
+        .map(Json)
+        .map_err(|e| err("Не удалось создать сцену", e))
+}
+
 async fn obs_set_scene(
     State(st): State<AppState>,
     headers: HeaderMap,
@@ -848,6 +863,76 @@ async fn obs_sources(
         .await
         .map(Json)
         .map_err(|e| err("Не удалось получить источники сцены", e))
+}
+
+fn required_trimmed<'a>(body: &'a Value, field: &str, message: &str) -> Result<&'a str, String> {
+    body.get(field)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .ok_or_else(|| message.to_owned())
+}
+
+fn source_settings(input_kind: &str, body: &Value) -> Result<Value, String> {
+    match input_kind {
+        "browser_source" => {
+            let url = required_trimmed(body, "url", "URL browser source обязателен")?;
+            if !(url.starts_with("https://") || url.starts_with("http://127.0.0.1")) {
+                return Err(
+                    "Browser source принимает только https URL или localhost URL.".to_owned(),
+                );
+            }
+            Ok(json!({
+                "url": url,
+                "width": body.get("width").and_then(Value::as_i64).unwrap_or(1920),
+                "height": body.get("height").and_then(Value::as_i64).unwrap_or(1080),
+                "shutdown": false,
+                "restart_when_active": false,
+                "reroute_audio": body.get("rerouteAudio").and_then(Value::as_bool).unwrap_or(false),
+            }))
+        }
+        "text_gdiplus_v3" => Ok(json!({
+            "text": body.get("text").and_then(Value::as_str).unwrap_or("Новый текст"),
+        })),
+        "image_source" => Ok(json!({
+            "file": required_trimmed(body, "file", "Путь к изображению обязателен")?,
+        })),
+        "ffmpeg_source" => Ok(json!({
+            "local_file": required_trimmed(body, "file", "Путь к медиафайлу обязателен")?,
+            "is_local_file": true,
+            "restart_on_activate": true,
+        })),
+        _ => Err("Этот тип источника не разрешён для создания из панели.".to_owned()),
+    }
+}
+
+async fn obs_source_create(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> ApiResult<Value> {
+    require_auth(&st, &headers).await?;
+    let scene =
+        required_trimmed(&body, "sceneName", "sceneName обязателен").map_err(|e| bad(&e))?;
+    let source = required_trimmed(&body, "sourceName", "Название источника обязательно")
+        .map_err(|e| bad(&e))?;
+    let input_kind =
+        required_trimmed(&body, "inputKind", "Тип источника обязателен").map_err(|e| bad(&e))?;
+    let settings = source_settings(input_kind, &body).map_err(|e| bad(&e))?;
+    st.obs
+        .request(
+            "CreateInput",
+            json!({
+                "sceneName": scene,
+                "inputName": source,
+                "inputKind": input_kind,
+                "inputSettings": settings,
+                "sceneItemEnabled": true,
+            }),
+        )
+        .await
+        .map(Json)
+        .map_err(|e| err("Не удалось создать источник", e))
 }
 
 async fn obs_source_visibility(
@@ -2134,6 +2219,21 @@ mod tests {
         assert!(raw_obs_allowed("GetRecordStatus"));
         assert!(!raw_obs_allowed("SetCurrentProgramScene"));
         assert!(!raw_obs_allowed("SetStreamServiceSettings"));
+    }
+
+    #[test]
+    fn source_settings_reject_unlisted_input_kind() {
+        assert!(source_settings("dshow_input", &json!({})).is_err());
+    }
+
+    #[test]
+    fn browser_source_settings_require_https_or_loopback() {
+        assert!(source_settings("browser_source", &json!({"url": "http://example.com"})).is_err());
+        let settings = source_settings("browser_source", &json!({"url": "https://example.com"}))
+            .expect("https browser source is accepted");
+        assert_eq!(settings["url"], "https://example.com");
+        assert_eq!(settings["width"], 1920);
+        assert_eq!(settings["height"], 1080);
     }
 
     #[test]

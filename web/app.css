@@ -118,6 +118,26 @@ main {
   border-bottom: 1px solid var(--border);
   padding-bottom: 0.5rem;
 }
+.section-toggle {
+  width: 100%;
+  min-height: 0;
+  margin: 0;
+  padding: 0.25rem 0;
+  background: transparent;
+  color: var(--text);
+  border: 0;
+  text-align: left;
+  font-size: 1.2rem;
+}
+.section-toggle::before {
+  content: "▾ ";
+}
+.section-toggle[aria-expanded="false"]::before {
+  content: "▸ ";
+}
+.section-body[hidden] {
+  display: none;
+}
 .card > h3 {
   margin: 1rem 0 0.5rem;
   font-size: 1.05rem;
