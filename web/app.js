@@ -515,7 +515,9 @@ async function refreshAll() {
     ['Виртуальная камера', refreshVcam],
     ['Буфер повтора', refreshReplay],
     ['Профили и переходы', refreshSetups],
+    ['Регистрация DonationAlerts', refreshDaConfig],
     ['DonationAlerts', refreshDa],
+    ['Регистрация Twitch', refreshTwitchConfig],
     ['Twitch', refreshTwitch],
     ['Донаты', refreshDonations],
   ];
@@ -1341,6 +1343,43 @@ $('refreshStats').onclick = async () => {
 
 // ------------------------------------------------------ DonationAlerts
 
+function defaultDaRedirectUri() {
+  return window.location.origin + '/api/donationalerts/oauth/callback';
+}
+
+async function refreshDaConfig() {
+  try {
+    const c = await api('/api/donationalerts/config');
+    $('daClientId').value = c.client_id || '';
+    $('daClientSecret').placeholder = c.client_secret_configured
+      ? 'секрет сохранён; пусто = не менять'
+      : 'обязателен для OAuth';
+    $('daRedirectUri').value = c.redirect_uri || defaultDaRedirectUri();
+    $('daScopes').value = (c.oauth_scopes || []).join(' ');
+  } catch (e) {
+    fail(e);
+  }
+}
+
+$('daConfigForm').onsubmit = async (e) => {
+  e.preventDefault();
+  try {
+    const body = {
+      clientId: $('daClientId').value.trim(),
+      clientSecret: $('daClientSecret').value.trim(),
+      redirectUri: $('daRedirectUri').value.trim() || defaultDaRedirectUri(),
+      scopes: $('daScopes').value.trim(),
+    };
+    await post('/api/donationalerts/config', body);
+    $('daClientSecret').value = '';
+    say('Регистрация DonationAlerts сохранена');
+    await refreshDaConfig();
+    await refreshDa();
+  } catch (err) {
+    fail(err);
+  }
+};
+
 async function refreshDa() {
   try {
     const da = await api('/api/donationalerts/status');
@@ -1444,6 +1483,32 @@ async function refreshDonations() {
 }
 
 // -------------------------------------------------------------- Twitch
+
+async function refreshTwitchConfig() {
+  try {
+    const c = await api('/api/twitch/config');
+    $('twitchClientId').value = c.client_id || '';
+    $('twitchScopes').value = (c.scopes || []).join(' ');
+  } catch (e) {
+    fail(e);
+  }
+}
+
+$('twitchConfigForm').onsubmit = async (e) => {
+  e.preventDefault();
+  try {
+    await post('/api/twitch/config', {
+      clientId: $('twitchClientId').value.trim(),
+      scopes: $('twitchScopes').value.trim(),
+    });
+    replace($('twitchDevice'), el('p', { text: 'Регистрация сохранена. Теперь можно подключать Twitch.' }));
+    say('Регистрация Twitch сохранена');
+    await refreshTwitchConfig();
+    await refreshTwitch();
+  } catch (err) {
+    fail(err);
+  }
+};
 
 async function refreshTwitch() {
   try {

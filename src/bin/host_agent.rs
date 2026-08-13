@@ -311,6 +311,10 @@ async fn main() -> Result<()> {
             get(obs_transitions).post(obs_transition_set),
         )
         .route("/api/donationalerts/status", get(da_status))
+        .route(
+            "/api/donationalerts/config",
+            get(da_config_get).post(da_config_set),
+        )
         .route("/api/donationalerts/recent", get(da_recent))
         .route("/api/donationalerts/reconcile", post(da_reconcile))
         .route("/api/donationalerts/widget-url", post(da_widget_url))
@@ -323,6 +327,10 @@ async fn main() -> Result<()> {
         .route("/api/donationalerts/oauth/start", post(da_oauth_start))
         .route("/api/donationalerts/oauth/callback", get(da_oauth_callback))
         .route("/api/twitch/status", get(twitch_status))
+        .route(
+            "/api/twitch/config",
+            get(twitch_config_get).post(twitch_config_set),
+        )
         .route("/api/twitch/device/start", post(twitch_device_start))
         .route("/api/twitch/device/check", post(twitch_device_check))
         .route(
@@ -1482,8 +1490,81 @@ async fn da_status(State(st): State<AppState>, headers: HeaderMap) -> ApiResult<
     Ok(Json(donationalerts_status_value(&st).await))
 }
 
+async fn da_config_get(State(st): State<AppState>, headers: HeaderMap) -> ApiResult<Value> {
+    require_auth(&st, &headers).await?;
+    let c = effective_donationalerts_config(&st);
+    Ok(Json(json!({
+        "client_id": c.client_id,
+        "client_secret_configured": !c.client_secret.is_empty(),
+        "redirect_uri": c.redirect_uri,
+        "oauth_enabled": c.oauth_enabled,
+        "oauth_scopes": c.oauth_scopes,
+    })))
+}
+
+async fn da_config_set(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> ApiResult<Value> {
+    require_auth(&st, &headers).await?;
+    let current = effective_donationalerts_config(&st);
+    let client_id = required_trimmed(&body, "clientId", "DonationAlerts client_id обязателен")
+        .map_err(|e| bad(&e))?
+        .to_string();
+    let redirect_uri = required_trimmed(
+        &body,
+        "redirectUri",
+        "DonationAlerts redirect URI обязателен",
+    )
+    .map_err(|e| bad(&e))?
+    .to_string();
+    let scopes = scopes_from_body(&body, "scopes", &current.oauth_scopes);
+    let secret = body
+        .get("clientSecret")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(str::to_string);
+    if secret.is_none() && current.client_secret.is_empty() {
+        return Err(bad(
+            "DonationAlerts client_secret обязателен при первой настройке.",
+        ));
+    }
+
+    save_secret("donationalerts_client_id", &client_id)
+        .map_err(|e| err("Не удалось сохранить DonationAlerts client_id", e))?;
+    save_secret("donationalerts_redirect_uri", &redirect_uri)
+        .map_err(|e| err("Не удалось сохранить DonationAlerts redirect URI", e))?;
+    save_secret(
+        "donationalerts_oauth_scopes",
+        &serde_json::to_string(&scopes).unwrap_or_default(),
+    )
+    .map_err(|e| err("Не удалось сохранить DonationAlerts scopes", e))?;
+    if let Some(secret) = &secret {
+        save_secret("donationalerts_client_secret", secret)
+            .map_err(|e| err("Не удалось сохранить DonationAlerts client_secret", e))?;
+    }
+    save_host_config_update(|cfg| {
+        cfg.donationalerts.client_id = client_id.clone();
+        cfg.donationalerts.client_secret.clear();
+        cfg.donationalerts.redirect_uri = redirect_uri.clone();
+        cfg.donationalerts.oauth_scopes = scopes.clone();
+        cfg.donationalerts.oauth_enabled = true;
+    })
+    .map_err(|e| err("Не удалось обновить config/host.json", e))?;
+
+    Ok(Json(json!({
+        "ok": true,
+        "client_id": client_id,
+        "client_secret_configured": secret.is_some() || !current.client_secret.is_empty(),
+        "redirect_uri": redirect_uri,
+        "oauth_scopes": scopes,
+    })))
+}
+
 async fn donationalerts_status_value(st: &AppState) -> Value {
-    let c = &st.cfg.donationalerts;
+    let c = effective_donationalerts_config(st);
     let widget_mute = st
         .obs
         .request("GetInputMute", json!({"inputName": c.input_name}))
@@ -1854,12 +1935,85 @@ async fn raise_scene_item_to_top(obs: &ObsHandle, scene: &str, item_id: i64) -> 
     Ok(())
 }
 
+fn split_scopes(value: &str) -> Vec<String> {
+    value
+        .split(|c: char| c == ',' || c.is_whitespace())
+        .map(str::trim)
+        .filter(|scope| !scope.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+fn scopes_from_body(body: &Value, field: &str, fallback: &[String]) -> Vec<String> {
+    if let Some(raw) = body.get(field).and_then(Value::as_str) {
+        let scopes = split_scopes(raw);
+        if !scopes.is_empty() {
+            return scopes;
+        }
+    }
+    if let Some(values) = body.get(field).and_then(Value::as_array) {
+        let scopes: Vec<String> = values
+            .iter()
+            .filter_map(Value::as_str)
+            .flat_map(split_scopes)
+            .collect();
+        if !scopes.is_empty() {
+            return scopes;
+        }
+    }
+    fallback.to_vec()
+}
+
+fn secret_string(name: &str) -> Option<String> {
+    load_secret(name)
+        .ok()
+        .flatten()
+        .filter(|v| !v.trim().is_empty())
+}
+
+fn secret_scopes(name: &str, fallback: &[String]) -> Vec<String> {
+    secret_string(name)
+        .and_then(|raw| serde_json::from_str::<Vec<String>>(&raw).ok())
+        .filter(|scopes| !scopes.is_empty())
+        .unwrap_or_else(|| fallback.to_vec())
+}
+
+fn effective_twitch_config(st: &AppState) -> TwitchConfig {
+    let mut cfg = st.cfg.twitch.clone();
+    if let Some(client_id) = secret_string("twitch_client_id") {
+        cfg.client_id = client_id;
+    }
+    cfg.scopes = secret_scopes("twitch_scopes", &cfg.scopes);
+    cfg
+}
+
+fn effective_donationalerts_config(st: &AppState) -> DonationAlertsConfig {
+    let mut cfg = st.cfg.donationalerts.clone();
+    if let Some(client_id) = secret_string("donationalerts_client_id") {
+        cfg.client_id = client_id;
+    }
+    if let Some(secret) = secret_string("donationalerts_client_secret") {
+        cfg.client_secret = secret;
+    }
+    if let Some(redirect_uri) = secret_string("donationalerts_redirect_uri") {
+        cfg.redirect_uri = redirect_uri;
+    }
+    cfg.oauth_scopes = secret_scopes("donationalerts_oauth_scopes", &cfg.oauth_scopes);
+    cfg
+}
+
+fn save_host_config_update(update: impl FnOnce(&mut HostConfig)) -> Result<()> {
+    let mut cfg = load_host_config()?;
+    update(&mut cfg);
+    save_json(&config_dir().join("host.json"), &cfg)
+}
+
 async fn da_oauth_start(State(st): State<AppState>, headers: HeaderMap) -> ApiResult<Value> {
     require_auth(&st, &headers).await?;
-    let c = &st.cfg.donationalerts;
+    let c = effective_donationalerts_config(&st);
     if c.client_id.is_empty() || c.client_secret.is_empty() || c.redirect_uri.is_empty() {
         return Err(bad(
-            "Заполните donationalerts.client_id, client_secret и redirect_uri в config/host.json.",
+            "Сначала сохраните DonationAlerts client_id, client_secret и redirect URI в веб-панели.",
         ));
     }
     let state_token = random_secret_b64(16);
@@ -1894,7 +2048,7 @@ async fn da_oauth_callback(
         }
     }
 
-    let c = &st.cfg.donationalerts;
+    let c = effective_donationalerts_config(&st);
     let form = [
         ("grant_type", "authorization_code"),
         ("client_id", c.client_id.as_str()),
@@ -1975,13 +2129,57 @@ async fn twitch_status(State(st): State<AppState>, headers: HeaderMap) -> ApiRes
     Ok(Json(twitch_status_value(&st).await))
 }
 
+async fn twitch_config_get(State(st): State<AppState>, headers: HeaderMap) -> ApiResult<Value> {
+    require_auth(&st, &headers).await?;
+    let c = effective_twitch_config(&st);
+    Ok(Json(json!({
+        "client_id": c.client_id,
+        "scopes": c.scopes,
+    })))
+}
+
+async fn twitch_config_set(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> ApiResult<Value> {
+    require_auth(&st, &headers).await?;
+    let current = effective_twitch_config(&st);
+    let client_id = required_trimmed(&body, "clientId", "Twitch client_id обязателен")
+        .map_err(|e| bad(&e))?
+        .to_string();
+    let scopes = scopes_from_body(&body, "scopes", &current.scopes);
+    save_secret("twitch_client_id", &client_id)
+        .map_err(|e| err("Не удалось сохранить Twitch client_id", e))?;
+    save_secret(
+        "twitch_scopes",
+        &serde_json::to_string(&scopes).unwrap_or_default(),
+    )
+    .map_err(|e| err("Не удалось сохранить Twitch scopes", e))?;
+    if current.client_id != client_id {
+        delete_secret("twitch_tokens").ok();
+        delete_secret("twitch_device_code").ok();
+    }
+    save_host_config_update(|cfg| {
+        cfg.twitch.client_id = client_id.clone();
+        cfg.twitch.scopes = scopes.clone();
+    })
+    .map_err(|e| err("Не удалось обновить config/host.json", e))?;
+    Ok(Json(json!({
+        "ok": true,
+        "client_id": client_id,
+        "scopes": scopes,
+    })))
+}
+
 async fn twitch_status_value(st: &AppState) -> Value {
-    if st.cfg.twitch.client_id.is_empty() {
+    let cfg = effective_twitch_config(st);
+    if cfg.client_id.is_empty() {
         return json!({
-            "enabled": st.cfg.twitch.enabled,
+            "enabled": cfg.enabled,
             "configured": false,
             "connected": false,
-            "message": "Укажите twitch.client_id в config/host.json",
+            "message": "Сохраните Twitch client_id в веб-панели",
         });
     }
     if load_secret("twitch_tokens").ok().flatten().is_some() {
@@ -2023,12 +2221,13 @@ async fn twitch_status_value(st: &AppState) -> Value {
 
 async fn twitch_device_start(State(st): State<AppState>, headers: HeaderMap) -> ApiResult<Value> {
     require_auth(&st, &headers).await?;
-    if st.cfg.twitch.client_id.is_empty() {
-        return Err(bad("Укажите twitch.client_id в config/host.json"));
+    let cfg = effective_twitch_config(&st);
+    if cfg.client_id.is_empty() {
+        return Err(bad("Сначала сохраните Twitch client_id в веб-панели"));
     }
-    let scopes = st.cfg.twitch.scopes.join(" ");
+    let scopes = cfg.scopes.join(" ");
     let form = [
-        ("client_id", st.cfg.twitch.client_id.as_str()),
+        ("client_id", cfg.client_id.as_str()),
         ("scopes", scopes.as_str()),
     ];
     let response = st
@@ -2047,11 +2246,12 @@ async fn twitch_device_start(State(st): State<AppState>, headers: HeaderMap) -> 
 
 async fn twitch_device_check(State(st): State<AppState>, headers: HeaderMap) -> ApiResult<Value> {
     require_auth(&st, &headers).await?;
+    let cfg = effective_twitch_config(&st);
     let dc = load_secret("twitch_device_code")
         .map_err(|e| err("Не удалось прочитать device code", e))?
         .ok_or_else(|| bad("Сначала нажмите «Подключить Twitch»"))?;
     let form = [
-        ("client_id", st.cfg.twitch.client_id.as_str()),
+        ("client_id", cfg.client_id.as_str()),
         ("device_code", dc.as_str()),
         ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
     ];
@@ -2176,8 +2376,9 @@ async fn validate_twitch_access(st: &AppState, access: &str) -> Result<String> {
 }
 
 async fn refresh_twitch_tokens(st: &AppState, refresh: &str) -> Result<Value> {
+    let cfg = effective_twitch_config(st);
     let form = [
-        ("client_id", st.cfg.twitch.client_id.as_str()),
+        ("client_id", cfg.client_id.as_str()),
         ("grant_type", "refresh_token"),
         ("refresh_token", refresh),
     ];
@@ -2205,6 +2406,7 @@ async fn refresh_twitch_tokens(st: &AppState, refresh: &str) -> Result<Value> {
 
 async fn twitch_channel_get(State(st): State<AppState>, headers: HeaderMap) -> ApiResult<Value> {
     require_auth(&st, &headers).await?;
+    let cfg = effective_twitch_config(&st);
     let (access, uid) = twitch_user_refreshed(&st)
         .await
         .map_err(|e| err("Twitch не подключён", e))?;
@@ -2212,7 +2414,7 @@ async fn twitch_channel_get(State(st): State<AppState>, headers: HeaderMap) -> A
         .http
         .get("https://api.twitch.tv/helix/channels")
         .query(&[("broadcaster_id", uid.as_str())])
-        .header("Client-Id", &st.cfg.twitch.client_id)
+        .header("Client-Id", &cfg.client_id)
         .bearer_auth(access)
         .send()
         .await
@@ -2228,6 +2430,7 @@ async fn twitch_channel_modify(
     Json(body): Json<Value>,
 ) -> ApiResult<Value> {
     require_auth(&st, &headers).await?;
+    let cfg = effective_twitch_config(&st);
     let (access, uid) = twitch_user_refreshed(&st)
         .await
         .map_err(|e| err("Twitch не подключён", e))?;
@@ -2235,7 +2438,7 @@ async fn twitch_channel_modify(
         .http
         .patch("https://api.twitch.tv/helix/channels")
         .query(&[("broadcaster_id", uid.as_str())])
-        .header("Client-Id", &st.cfg.twitch.client_id)
+        .header("Client-Id", &cfg.client_id)
         .bearer_auth(access)
         .json(&body)
         .send()
@@ -2252,6 +2455,7 @@ async fn twitch_marker(
     Json(body): Json<Value>,
 ) -> ApiResult<Value> {
     require_auth(&st, &headers).await?;
+    let cfg = effective_twitch_config(&st);
     let (access, uid) = twitch_user_refreshed(&st)
         .await
         .map_err(|e| err("Twitch не подключён", e))?;
@@ -2262,7 +2466,7 @@ async fn twitch_marker(
     let response = st
         .http
         .post("https://api.twitch.tv/helix/streams/markers")
-        .header("Client-Id", &st.cfg.twitch.client_id)
+        .header("Client-Id", &cfg.client_id)
         .bearer_auth(access)
         .json(&json!({"user_id": uid, "description": description}))
         .send()

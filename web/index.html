@@ -222,6 +222,21 @@
         <h2>DonationAlerts</h2>
         <dl id="daStatus"></dl>
 
+        <form id="daConfigForm">
+          <fieldset>
+            <legend>Регистрация DonationAlerts</legend>
+            <label for="daClientId">Client ID</label>
+            <input id="daClientId" autocomplete="off">
+            <label for="daClientSecret">Client secret</label>
+            <input id="daClientSecret" type="password" autocomplete="off" placeholder="оставьте пустым, чтобы не менять">
+            <label for="daRedirectUri">Redirect URI</label>
+            <input id="daRedirectUri" type="url" inputmode="url">
+            <label for="daScopes">Scopes</label>
+            <input id="daScopes" autocomplete="off">
+            <button type="submit">Сохранить регистрацию DonationAlerts</button>
+          </fieldset>
+        </form>
+
         <form id="daUrlForm">
           <label for="daUrl">Ссылка на Alerts Widget</label>
           <input id="daUrl" type="url" inputmode="url"
@@ -259,6 +274,16 @@
       <section class="card">
         <h2>Twitch</h2>
         <dl id="twitchStatus"></dl>
+        <form id="twitchConfigForm">
+          <fieldset>
+            <legend>Регистрация Twitch</legend>
+            <label for="twitchClientId">Client ID</label>
+            <input id="twitchClientId" autocomplete="off">
+            <label for="twitchScopes">Scopes</label>
+            <input id="twitchScopes" autocomplete="off">
+            <button type="submit">Сохранить регистрацию Twitch</button>
+          </fieldset>
+        </form>
         <button id="twitchStart" type="button">Подключить Twitch</button>
         <button id="twitchCheck" type="button" data-variant="quiet">Проверить авторизацию</button>
         <div id="twitchDevice"></div>
