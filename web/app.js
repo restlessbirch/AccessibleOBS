@@ -38,6 +38,21 @@ function button(text, onClick, variant) {
   return el('button', { type: 'button', text, onClick, 'data-variant': variant });
 }
 
+function stateActionButton(active, activeText, inactiveText, onClick, variant) {
+  const node = button(active ? activeText : inactiveText, onClick, variant);
+  node.dataset.toggleState = active ? 'active' : 'inactive';
+  node.setAttribute('aria-pressed', String(active));
+  return node;
+}
+
+function setStateAction(node, active, activeText, inactiveText, variant) {
+  node.textContent = active ? activeText : inactiveText;
+  node.dataset.toggleState = active ? 'active' : 'inactive';
+  node.setAttribute('aria-pressed', String(active));
+  if (variant) node.dataset.variant = variant;
+  else delete node.dataset.variant;
+}
+
 function replace(container, nodes) {
   container.replaceChildren(...[].concat(nodes).filter(Boolean));
 }
@@ -350,18 +365,35 @@ function renderObsState(status) {
 /** OBS шлёт промежуточные состояния STARTING/STOPPING — показываем и их. */
 function renderOutputState(node, label, data) {
   const active = data.outputActive;
-  if (label === 'Эфир') streaming = Boolean(active);
   const raw = data.outputState || '';
-  if (raw === 'RECONNECTING') return setState(node, 'bad', `${label}: переподключается`);
-  if (raw.endsWith('STARTING')) return setState(node, 'warn', `${label}: запускается`);
-  if (raw.endsWith('STOPPING')) return setState(node, 'warn', `${label}: останавливается`);
-  if (raw.endsWith('PAUSED')) return setState(node, 'warn', `${label}: на паузе`);
+  if (label === 'Эфир') streaming = Boolean(active);
+  if (label === 'Запись') {
+    recording = Boolean(active);
+    recordPaused = Boolean(data.outputPaused) || raw.endsWith('PAUSED');
+  }
+  if (raw === 'RECONNECTING') {
+    setState(node, 'bad', `${label}: переподключается`);
+    return updateActionButtons();
+  }
+  if (raw.endsWith('STARTING')) {
+    setState(node, 'warn', `${label}: запускается`);
+    return updateActionButtons();
+  }
+  if (raw.endsWith('STOPPING')) {
+    setState(node, 'warn', `${label}: останавливается`);
+    return updateActionButtons();
+  }
+  if (raw.endsWith('PAUSED')) {
+    setState(node, 'warn', `${label}: на паузе`);
+    return updateActionButtons();
+  }
   if (active) {
     setState(node, 'ok', `${label}: идёт`);
     say(`${label} идёт`);
   } else {
     setState(node, 'bad', `${label}: остановлен${label === 'Запись' ? 'а' : ''}`);
   }
+  updateActionButtons();
 }
 
 // ---------------------------------------------------------- обновление
@@ -371,7 +403,84 @@ let sceneNames = [];
 /// Когда данные обновлялись в последний раз и что не ответило.
 let lastRefresh = null;
 let streaming = false;
+let recording = false;
+let recordPaused = false;
 let streamTrouble = false;
+let studioEnabled = false;
+let vcamActive = false;
+let replayAvailable = true;
+let replayActive = false;
+let daWidgetMuted = null;
+
+function setupStatefulActions() {
+  for (const id of ['stopStream', 'stopRecord', 'resumeRecord', 'studioOff', 'vcamStop', 'replayStop', 'daUnmute']) {
+    $(id).hidden = true;
+  }
+  updateActionButtons();
+}
+
+function updateActionButtons() {
+  setStateAction(
+    $('startStream'),
+    streaming,
+    'Эфир идёт — остановить эфир',
+    'Эфир остановлен — начать эфир',
+    streaming ? 'danger' : null,
+  );
+  setStateAction(
+    $('startRecord'),
+    recording,
+    'Запись идёт — остановить запись',
+    'Запись остановлена — начать запись',
+    recording ? 'danger' : null,
+  );
+  $('pauseRecord').hidden = !recording;
+  if (recording) {
+    setStateAction(
+      $('pauseRecord'),
+      !recordPaused,
+      'Запись идёт — поставить на паузу',
+      'Запись на паузе — продолжить запись',
+      'quiet',
+    );
+  }
+  setStateAction(
+    $('studioOn'),
+    studioEnabled,
+    'Studio Mode включён — выключить',
+    'Studio Mode выключен — включить',
+    'quiet',
+  );
+  setStateAction(
+    $('vcamStart'),
+    vcamActive,
+    'Виртуальная камера включена — выключить',
+    'Виртуальная камера выключена — включить',
+    'quiet',
+  );
+  setStateAction(
+    $('replayStart'),
+    replayActive,
+    'Буфер повтора включён — выключить',
+    'Буфер повтора выключен — включить',
+    'quiet',
+  );
+  $('replayStart').disabled = !replayAvailable;
+  $('replaySave').disabled = !replayActive;
+  if (daWidgetMuted === null) {
+    $('daMute').textContent = 'Звук донатов: состояние неизвестно — выключить';
+    $('daMute').dataset.toggleState = 'unknown';
+    $('daMute').setAttribute('aria-pressed', 'false');
+  } else {
+    setStateAction(
+      $('daMute'),
+      !daWidgetMuted,
+      'Звук донатов включён — выключить',
+      'Звук донатов выключен — включить',
+      'quiet',
+    );
+  }
+}
 
 /// Обновляет всё и честно сообщает, что именно обновить не удалось.
 ///
@@ -584,6 +693,7 @@ function fillSelect(node, items, current) {
 async function refreshStudio() {
   try {
     const data = await api('/api/obs/studio');
+    studioEnabled = Boolean(data.enabled);
     setState(
       $('studioState'),
       data.enabled ? 'ok' : 'off',
@@ -595,6 +705,7 @@ async function refreshStudio() {
     for (const id of ['previewScene', 'setPreviewScene', 'studioTransition']) {
       $(id).disabled = !data.enabled;
     }
+    updateActionButtons();
   } catch (e) {
     setState($('studioState'), 'warn', e.message);
   }
@@ -603,11 +714,13 @@ async function refreshStudio() {
 async function refreshVcam() {
   try {
     const data = await api('/api/obs/virtualcam');
+    vcamActive = Boolean(data.outputActive);
     setState(
       $('vcamState'),
       data.outputActive ? 'ok' : 'off',
       data.outputActive ? 'Виртуальная камера работает' : 'Виртуальная камера выключена',
     );
+    updateActionButtons();
   } catch (e) {
     setState($('vcamState'), 'warn', e.message);
   }
@@ -616,6 +729,8 @@ async function refreshVcam() {
 async function refreshReplay() {
   try {
     const data = await api('/api/obs/replay');
+    replayAvailable = Boolean(data.available);
+    replayActive = Boolean(data.outputActive);
     if (!data.available) {
       setState($('replayState'), 'off', data.message || 'Буфер повтора недоступен');
     } else {
@@ -625,8 +740,7 @@ async function refreshReplay() {
         data.outputActive ? 'Буфер повтора работает' : 'Буфер повтора выключен',
       );
     }
-    for (const id of ['replayStart', 'replayStop']) $(id).disabled = !data.available;
-    $('replaySave').disabled = !data.outputActive;
+    updateActionButtons();
   } catch (e) {
     setState($('replayState'), 'warn', e.message);
   }
@@ -712,8 +826,13 @@ async function refreshSources() {
           return el('div', { class: 'source' }, [
             el('h3', { text: name }),
             el('p', { text: 'Состояние: ' + (visible ? 'виден' : 'скрыт') }),
-            button('Показать', () => setSource(sceneItemId, name, true)),
-            button('Скрыть', () => setSource(sceneItemId, name, false), 'quiet'),
+            stateActionButton(
+              visible,
+              'Сейчас виден — скрыть источник',
+              'Сейчас скрыт — показать источник',
+              () => setSource(sceneItemId, name, !visible),
+              'quiet',
+            ),
           ]);
         })
       : el('p', { class: 'empty', text: 'в этой сцене нет источников' }));
@@ -907,8 +1026,13 @@ function renderMicSummary(rows) {
       text: `Звук: ${mic.muted ? 'выключен' : 'включён'}. Громкость: ${db.toFixed(1)} dB.`,
     }),
     button('Проверить микрофон', () => announceLevel(mic.inputName), 'quiet'),
-    button('Выключить микрофон', () => audioMute(mic.inputName, true), 'quiet'),
-    button('Включить микрофон', () => audioMute(mic.inputName, false), 'quiet'),
+    stateActionButton(
+      !mic.muted,
+      'Микрофон включён — выключить',
+      'Микрофон выключен — включить',
+      () => audioMute(mic.inputName, !mic.muted),
+      'quiet',
+    ),
   ]));
 }
 
@@ -947,8 +1071,13 @@ async function refreshAudio() {
             }),
             el('p', { class: 'hint' }, [document.createTextNode('Уровень: '), level]),
             button('Проверить звук', () => announceLevel(name), 'quiet'),
-            button('Выключить звук', () => audioMute(name, true), 'quiet'),
-            button('Включить звук', () => audioMute(name, false), 'quiet'),
+            stateActionButton(
+              !a.muted,
+              'Звук включён — выключить',
+              'Звук выключен — включить',
+              () => audioMute(name, !a.muted),
+              'quiet',
+            ),
             button('−1 dB', () => audioVolume(name, db - 1), 'quiet'),
             button('+1 dB', () => audioVolume(name, db + 1), 'quiet'),
             field,
@@ -966,6 +1095,7 @@ async function audioMute(inputName, muted) {
   try {
     await post('/api/obs/audio/mute', { inputName, muted });
     say(`${inputName}: звук ${muted ? 'выключен' : 'включён'}`);
+    await refreshAudio();
   } catch (e) {
     fail(e);
   }
@@ -986,23 +1116,34 @@ async function command(path, message, confirmText) {
   try {
     await post(path);
     say(message);
+    schedule('all', refreshAll, 500);
   } catch (e) {
     fail(e);
   }
 }
 
-$('startStream').onclick = () => command('/api/obs/stream/start', 'Эфир запускается');
+$('startStream').onclick = () => streaming
+  ? command('/api/obs/stream/stop', 'Эфир останавливается', 'Остановить активный эфир?')
+  : command('/api/obs/stream/start', 'Эфир запускается');
 $('stopStream').onclick = () =>
   command('/api/obs/stream/stop', 'Эфир останавливается', 'Остановить активный эфир?');
-$('startRecord').onclick = () => command('/api/obs/record/start', 'Запись запускается');
+$('startRecord').onclick = () => recording
+  ? command('/api/obs/record/stop', 'Запись останавливается', 'Остановить запись?')
+  : command('/api/obs/record/start', 'Запись запускается');
 $('stopRecord').onclick = () =>
   command('/api/obs/record/stop', 'Запись останавливается', 'Остановить запись?');
-$('pauseRecord').onclick = () => command('/api/obs/record/pause', 'Запись на паузе');
+$('pauseRecord').onclick = () => recordPaused
+  ? command('/api/obs/record/resume', 'Запись продолжена')
+  : command('/api/obs/record/pause', 'Запись на паузе');
 $('resumeRecord').onclick = () => command('/api/obs/record/resume', 'Запись продолжена');
 
-$('vcamStart').onclick = () => command('/api/obs/virtualcam/start', 'Виртуальная камера включается');
+$('vcamStart').onclick = () => vcamActive
+  ? command('/api/obs/virtualcam/stop', 'Виртуальная камера выключается')
+  : command('/api/obs/virtualcam/start', 'Виртуальная камера включается');
 $('vcamStop').onclick = () => command('/api/obs/virtualcam/stop', 'Виртуальная камера выключается');
-$('replayStart').onclick = () => command('/api/obs/replay/start', 'Буфер повтора включается');
+$('replayStart').onclick = () => replayActive
+  ? command('/api/obs/replay/stop', 'Буфер повтора выключается')
+  : command('/api/obs/replay/start', 'Буфер повтора включается');
 $('replayStop').onclick = () => command('/api/obs/replay/stop', 'Буфер повтора выключается');
 $('replaySave').onclick = () => command('/api/obs/replay/save', 'Повтор сохранён');
 $('studioTransition').onclick = () =>
@@ -1010,8 +1151,9 @@ $('studioTransition').onclick = () =>
 
 $('studioOn').onclick = async () => {
   try {
-    await post('/api/obs/studio', { enabled: true });
-    say('Studio Mode включён');
+    const enabled = !studioEnabled;
+    await post('/api/obs/studio', { enabled });
+    say(`Studio Mode ${enabled ? 'включён' : 'выключен'}`);
     await refreshStudio();
   } catch (e) { fail(e); }
 };
@@ -1076,15 +1218,23 @@ $('refreshStats').onclick = async () => {
 async function refreshDa() {
   try {
     const da = await api('/api/donationalerts/status');
+    daWidgetMuted = typeof da.widget_muted === 'boolean' ? da.widget_muted : null;
     renderDl($('daStatus'), {
       'Виджет настроен': da.widget_url_configured ? 'да' : 'нет',
       'Звук ведётся в OBS': da.widget_url_configured ? 'да' : 'нет',
+      'Звук виджета': daWidgetMuted === null
+        ? 'неизвестно'
+        : (daWidgetMuted ? 'выключен' : 'включён'),
+      'Громкость виджета': Number.isFinite(Number(da.widget_volume_db))
+        ? Number(da.widget_volume_db).toFixed(1) + ' dB'
+        : 'неизвестно',
       'Сцена оверлея': da.overlay_scene,
       'Источник': da.input_name,
       'Лента донатов': da.realtime?.connected
         ? 'подключена'
         : (da.tokens_stored ? (da.realtime?.error || 'подключаюсь…') : 'OAuth не пройден'),
     });
+    updateActionButtons();
   } catch (e) {
     renderDl($('daStatus'), { 'Ошибка': e.message });
   }
@@ -1108,8 +1258,12 @@ $('daRefreshWidget').onclick = () =>
   command('/api/donationalerts/widget/refresh', 'Виджет перезагружен');
 $('daMute').onclick = async () => {
   try {
-    await post('/api/donationalerts/widget/mute', { muted: true });
-    say('Звук оповещений выключен');
+    const muted = daWidgetMuted !== true;
+    await post('/api/donationalerts/widget/mute', { muted });
+    say(`Звук оповещений ${muted ? 'выключен' : 'включён'}`);
+    daWidgetMuted = muted;
+    updateActionButtons();
+    await refreshDa();
   } catch (e) { fail(e); }
 };
 $('daUnmute').onclick = async () => {
@@ -1358,6 +1512,7 @@ $('shortcutsOn').onchange = (event) => {
 
 (async function start() {
   setupCollapsibleSections();
+  setupStatefulActions();
   await loadRuntime();
   const status = await api('/api/auth/status').catch(() => ({ authenticated: false }));
   if (!status.authenticated) {

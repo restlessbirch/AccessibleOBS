@@ -1403,6 +1403,23 @@ async fn da_status(State(st): State<AppState>, headers: HeaderMap) -> ApiResult<
 
 async fn donationalerts_status_value(st: &AppState) -> Value {
     let c = &st.cfg.donationalerts;
+    let widget_mute = st
+        .obs
+        .request("GetInputMute", json!({"inputName": c.input_name}))
+        .await
+        .ok()
+        .and_then(|v| v.get("inputMuted").cloned());
+    let widget_volume_db = st
+        .obs
+        .request("GetInputVolume", json!({"inputName": c.input_name}))
+        .await
+        .ok()
+        .and_then(|v| {
+            v.get("inputVolumeMul")
+                .and_then(Value::as_f64)
+                .map(mul_to_db)
+                .map(|db| json!(db))
+        });
     json!({
         "enabled": c.enabled,
         "widget_url_configured": load_secret("donationalerts_widget_url").ok().flatten().is_some(),
@@ -1411,6 +1428,8 @@ async fn donationalerts_status_value(st: &AppState) -> Value {
         "realtime": st.feed.status().await,
         "overlay_scene": c.overlay_scene_name,
         "input_name": c.input_name,
+        "widget_muted": widget_mute,
+        "widget_volume_db": widget_volume_db,
     })
 }
 

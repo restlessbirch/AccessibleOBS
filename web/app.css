@@ -178,6 +178,19 @@ button[data-variant="quiet"] {
   color: var(--text);
   border-color: var(--border);
 }
+button[data-toggle-state] {
+  text-align: left;
+  border-width: 2px;
+}
+button[data-toggle-state="active"] {
+  border-color: var(--ok);
+}
+button[data-toggle-state="inactive"] {
+  border-color: var(--text-muted);
+}
+button[data-toggle-state="unknown"] {
+  border-color: var(--warn);
+}
 button:disabled {
   opacity: 0.55;
   cursor: not-allowed;

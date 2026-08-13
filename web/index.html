@@ -121,8 +121,8 @@
 
       <section class="card">
         <h2>Эфир</h2>
-        <button id="startStream" type="button">Начать эфир</button>
-        <button id="stopStream" type="button" data-variant="danger">Остановить эфир</button>
+        <button id="startStream" type="button">Эфир остановлен — начать эфир</button>
+        <button id="stopStream" type="button" data-variant="danger" hidden>Остановить эфир</button>
         <p class="hint">
           Потеря кадров означает, что интернета или мощности процессора у актёра
           не хватает. Переподключение — что эфир рвётся.
@@ -132,10 +132,10 @@
 
       <section class="card two">
         <h2>Запись</h2>
-        <button id="startRecord" type="button">Начать запись</button>
-        <button id="stopRecord" type="button" data-variant="danger">Остановить запись</button>
-        <button id="pauseRecord" type="button" data-variant="quiet">Пауза</button>
-        <button id="resumeRecord" type="button" data-variant="quiet">Продолжить</button>
+        <button id="startRecord" type="button">Запись остановлена — начать запись</button>
+        <button id="stopRecord" type="button" data-variant="danger" hidden>Остановить запись</button>
+        <button id="pauseRecord" type="button" data-variant="quiet" hidden>Запись идёт — поставить на паузу</button>
+        <button id="resumeRecord" type="button" data-variant="quiet" hidden>Продолжить запись</button>
       </section>
 
       <section class="card">
@@ -144,8 +144,8 @@
           Позволяет подготовить сцену на предпросмотре и вывести её в эфир одной командой.
         </p>
         <p><span class="state" id="studioState" data-state="warn">Проверяю…</span></p>
-        <button id="studioOn" type="button">Включить Studio Mode</button>
-        <button id="studioOff" type="button" data-variant="quiet">Выключить</button>
+        <button id="studioOn" type="button">Studio Mode выключен — включить</button>
+        <button id="studioOff" type="button" data-variant="quiet" hidden>Выключить</button>
         <div class="row">
           <label for="previewScene">Сцена на предпросмотре</label>
           <select id="previewScene"></select>
@@ -172,8 +172,8 @@
       <section class="card two">
         <h2>Виртуальная камера</h2>
         <p><span class="state" id="vcamState" data-state="warn">Проверяю…</span></p>
-        <button id="vcamStart" type="button">Включить</button>
-        <button id="vcamStop" type="button" data-variant="quiet">Выключить</button>
+        <button id="vcamStart" type="button">Виртуальная камера выключена — включить</button>
+        <button id="vcamStop" type="button" data-variant="quiet" hidden>Выключить</button>
       </section>
 
       <section class="card">
@@ -182,8 +182,8 @@
           Держит последние секунды эфира в памяти, чтобы сохранить момент задним числом.
         </p>
         <p><span class="state" id="replayState" data-state="warn">Проверяю…</span></p>
-        <button id="replayStart" type="button">Включить буфер</button>
-        <button id="replayStop" type="button" data-variant="quiet">Выключить</button>
+        <button id="replayStart" type="button">Буфер повтора выключен — включить</button>
+        <button id="replayStop" type="button" data-variant="quiet" hidden>Выключить</button>
         <button id="replaySave" type="button">Сохранить повтор</button>
       </section>
 
@@ -260,8 +260,8 @@
 
         <fieldset>
           <legend>Громкость оповещений</legend>
-          <button id="daMute" type="button" data-variant="quiet">Выключить звук</button>
-          <button id="daUnmute" type="button" data-variant="quiet">Включить звук</button>
+          <button id="daMute" type="button" data-variant="quiet">Звук донатов: состояние неизвестно — выключить</button>
+          <button id="daUnmute" type="button" data-variant="quiet" hidden>Включить звук</button>
           <label for="daVolume">Громкость, dB</label>
           <input id="daVolume" type="number" step="0.5" value="-8">
           <button id="daSetVolume" type="button">Применить</button>
