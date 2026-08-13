@@ -275,6 +275,10 @@ async fn main() -> Result<()> {
         .route("/api/obs/input-kinds", get(obs_input_kinds))
         .route("/api/obs/sources", get(obs_sources).post(obs_source_create))
         .route("/api/obs/source/properties", post(obs_source_properties))
+        .route(
+            "/api/obs/source/settings",
+            get(obs_source_settings).post(obs_source_settings_set),
+        )
         .route("/api/obs/source/visibility", post(obs_source_visibility))
         .route("/api/obs/audio", get(obs_audio))
         .route("/api/obs/audio/mute", post(obs_audio_mute))
@@ -965,6 +969,51 @@ async fn obs_source_properties(
             }))
         })
         .map_err(|e| err("OBS не смог открыть окно свойств источника", e))
+}
+
+async fn obs_source_settings(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<HashMap<String, String>>,
+) -> ApiResult<Value> {
+    require_auth(&st, &headers).await?;
+    let source = q
+        .get("source")
+        .map(String::as_str)
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .ok_or_else(|| bad("source обязателен"))?;
+    st.obs
+        .request("GetInputSettings", json!({"inputName": source}))
+        .await
+        .map(Json)
+        .map_err(|e| err("Не удалось получить настройки источника", e))
+}
+
+async fn obs_source_settings_set(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> ApiResult<Value> {
+    require_auth(&st, &headers).await?;
+    let source = required_trimmed(&body, "sourceName", "Название источника обязательно")
+        .map_err(|e| bad(&e))?;
+    let settings = body
+        .get("inputSettings")
+        .and_then(Value::as_object)
+        .ok_or_else(|| bad("inputSettings должен быть объектом"))?;
+    st.obs
+        .request(
+            "SetInputSettings",
+            json!({
+                "inputName": source,
+                "inputSettings": settings,
+                "overlay": true,
+            }),
+        )
+        .await
+        .map(Json)
+        .map_err(|e| err("Не удалось сохранить настройки источника", e))
 }
 
 async fn obs_source_visibility(

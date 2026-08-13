@@ -403,6 +403,8 @@ let sceneNames = [];
 let inputKinds = [];
 let lastCreatedSceneName = '';
 let lastCreatedSourceName = '';
+let expandedSourceSettings = '';
+const sourceSettingsCache = new Map();
 /// Когда данные обновлялись в последний раз и что не ответило.
 let lastRefresh = null;
 let streaming = false;
@@ -856,6 +858,45 @@ async function refreshInputKinds() {
   }
 }
 
+function settingsCacheKey(sourceName) {
+  return 'source:' + sourceName;
+}
+
+function settingsTextareaId(sourceName) {
+  return 'settings_' + btoa(unescape(encodeURIComponent(sourceName))).replace(/=+$/g, '');
+}
+
+function renderSourceSettings(sourceName, inputKind) {
+  const key = settingsCacheKey(sourceName);
+  const cached = sourceSettingsCache.get(key);
+  if (!cached) {
+    return el('div', { class: 'settings-panel' }, [
+      el('p', { class: 'hint', text: 'Загружаю реальные настройки OBS…' }),
+    ]);
+  }
+
+  const textareaId = settingsTextareaId(sourceName);
+  const textarea = el('textarea', {
+    id: textareaId,
+    rows: 10,
+    value: JSON.stringify(cached.inputSettings || {}, null, 2),
+  });
+  textarea.setAttribute('aria-label', `JSON настройки OBS для ${sourceName}`);
+
+  return el('form', {
+    class: 'settings-panel',
+    onSubmit: (event) => saveSourceSettings(event, sourceName),
+  }, [
+    el('p', {
+      class: 'hint',
+      text: `Реальные настройки OBS для ${inputKindLabel(cached.inputKind || inputKind)}. Поля совпадают с тем, что OBS отдаёт через WebSocket.`,
+    }),
+    el('label', { htmlFor: textareaId, text: 'inputSettings JSON' }),
+    textarea,
+    el('button', { type: 'submit', text: 'Сохранить настройки в OBS' }),
+  ]);
+}
+
 async function refreshSources() {
   if (!currentScene) return;
   try {
@@ -880,10 +921,17 @@ async function refreshSources() {
               () => setSource(sceneItemId, name, !visible),
               'quiet',
             ),
-            button('Открыть свойства OBS', () => openSourceProperties(name), 'quiet'),
+            button(
+              expandedSourceSettings === name
+                ? 'Скрыть настройки в панели'
+                : 'Настройки источника в панели',
+              () => toggleSourceSettings(name),
+              'quiet',
+            ),
             name === lastCreatedSourceName
               ? el('p', { class: 'notice', text: 'Только что добавлен в OBS.' })
               : null,
+            expandedSourceSettings === name ? renderSourceSettings(name, kind) : null,
           ]);
         })
       : el('p', { class: 'empty', text: 'в этой сцене нет источников' }));
@@ -931,6 +979,50 @@ $('createSourceForm').onsubmit = async (event) => {
     fail(e);
   }
 };
+
+async function toggleSourceSettings(sourceName) {
+  if (expandedSourceSettings === sourceName) {
+    expandedSourceSettings = '';
+    await refreshSources();
+    return;
+  }
+  expandedSourceSettings = sourceName;
+  await refreshSources();
+  await loadSourceSettings(sourceName);
+}
+
+async function loadSourceSettings(sourceName) {
+  try {
+    const data = await api('/api/obs/source/settings?source=' + encodeURIComponent(sourceName));
+    sourceSettingsCache.set(settingsCacheKey(sourceName), {
+      inputKind: data.inputKind,
+      inputSettings: data.inputSettings || {},
+    });
+    await refreshSources();
+  } catch (e) {
+    fail(e);
+  }
+}
+
+async function saveSourceSettings(event, sourceName) {
+  event.preventDefault();
+  const textarea = $(settingsTextareaId(sourceName));
+  try {
+    const inputSettings = JSON.parse(textarea.value || '{}');
+    if (!inputSettings || Array.isArray(inputSettings) || typeof inputSettings !== 'object') {
+      throw new Error('inputSettings должен быть JSON-объектом');
+    }
+    await post('/api/obs/source/settings', { sourceName, inputSettings });
+    sourceSettingsCache.set(settingsCacheKey(sourceName), {
+      ...(sourceSettingsCache.get(settingsCacheKey(sourceName)) || {}),
+      inputSettings,
+    });
+    say('Настройки источника сохранены в OBS: ' + sourceName);
+    await refreshSources();
+  } catch (e) {
+    fail(e);
+  }
+}
 
 async function openSourceProperties(sourceName) {
   try {
