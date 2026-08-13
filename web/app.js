@@ -97,6 +97,30 @@ function fail(error) {
   announce('Ошибка: ' + message);
 }
 
+function openAuthTab() {
+  const tab = window.open('about:blank', '_blank');
+  if (tab) {
+    tab.opener = null;
+    tab.document.title = 'Открываю авторизацию…';
+    tab.document.body.textContent = 'Открываю авторизацию…';
+  }
+  return tab;
+}
+
+function navigateAuthTab(tab, url) {
+  if (tab) {
+    tab.location.href = url;
+    return true;
+  }
+  return false;
+}
+
+function closeAuthTab(tab) {
+  try {
+    tab?.close();
+  } catch { /* браузер мог не дать доступ к вкладке */ }
+}
+
 // ---------------------------------------------------------------- API
 
 async function api(path, options = {}) {
@@ -1394,13 +1418,38 @@ $('refreshStats').onclick = async () => {
 
 // ------------------------------------------------------ DonationAlerts
 
+let daSecretConfigured = false;
+let daOauthPoll = null;
+
 function defaultDaRedirectUri() {
   return window.location.origin + '/api/donationalerts/oauth/callback';
+}
+
+function donationAlertsRegistrationBody() {
+  return {
+    clientId: $('daClientId').value.trim(),
+    clientSecret: $('daClientSecret').value.trim(),
+    redirectUri: $('daRedirectUri').value.trim() || defaultDaRedirectUri(),
+    scopes: $('daScopes').value.trim(),
+  };
+}
+
+async function saveDaConfigFromForm() {
+  const body = donationAlertsRegistrationBody();
+  if (!body.clientId) throw new Error('Заполните DonationAlerts Client ID');
+  if (!body.clientSecret && !daSecretConfigured) {
+    throw new Error('Заполните DonationAlerts client secret');
+  }
+  const saved = await post('/api/donationalerts/config', body);
+  daSecretConfigured = Boolean(saved.client_secret_configured);
+  $('daClientSecret').value = '';
+  return saved;
 }
 
 async function refreshDaConfig() {
   try {
     const c = await api('/api/donationalerts/config');
+    daSecretConfigured = Boolean(c.client_secret_configured);
     $('daClientId').value = c.client_id || '';
     $('daClientSecret').placeholder = c.client_secret_configured
       ? 'секрет сохранён; пусто = не менять'
@@ -1415,14 +1464,7 @@ async function refreshDaConfig() {
 $('daConfigForm').onsubmit = async (e) => {
   e.preventDefault();
   try {
-    const body = {
-      clientId: $('daClientId').value.trim(),
-      clientSecret: $('daClientSecret').value.trim(),
-      redirectUri: $('daRedirectUri').value.trim() || defaultDaRedirectUri(),
-      scopes: $('daScopes').value.trim(),
-    };
-    await post('/api/donationalerts/config', body);
-    $('daClientSecret').value = '';
+    await saveDaConfigFromForm();
     say('Регистрация DonationAlerts сохранена');
     await refreshDaConfig();
     await refreshDa();
@@ -1451,8 +1493,10 @@ async function refreshDa() {
         : (da.tokens_stored ? (da.realtime?.error || 'подключаюсь…') : 'OAuth не пройден'),
     });
     updateActionButtons();
+    return da;
   } catch (e) {
     renderDl($('daStatus'), { 'Ошибка': e.message });
+    throw e;
   }
 }
 
@@ -1495,14 +1539,51 @@ $('daSetVolume').onclick = async () => {
   } catch (e) { fail(e); }
 };
 $('daOauth').onclick = async () => {
+  const tab = openAuthTab();
   try {
+    await saveDaConfigFromForm();
     const r = await post('/api/donationalerts/oauth/start');
-    window.open(r.authorize_url, '_blank', 'noopener');
-    say('Откройте вкладку авторизации DonationAlerts');
+    if (!navigateAuthTab(tab, r.authorize_url)) {
+      replace($('daOauthStatus'), el('p', {}, [
+        el('span', { text: 'Откройте авторизацию DonationAlerts: ' }),
+        el('a', { href: r.authorize_url, target: '_blank', rel: 'noopener', text: 'перейти' }),
+      ]));
+    } else {
+      replace($('daOauthStatus'), el('p', { text: 'Открыта страница авторизации DonationAlerts.' }));
+    }
+    say('Авторизация DonationAlerts открыта. После входа панель сама обновит статус.');
+    startDaOauthPolling();
   } catch (e) {
+    closeAuthTab(tab);
     fail(e);
   }
 };
+
+function startDaOauthPolling() {
+  clearInterval(daOauthPoll);
+  let tries = 0;
+  daOauthPoll = setInterval(async () => {
+    tries += 1;
+    try {
+      const da = await refreshDa();
+      if (da.tokens_stored) {
+        clearInterval(daOauthPoll);
+        daOauthPoll = null;
+        say('DonationAlerts подключён');
+        await refreshDonations();
+      } else if (tries >= 120) {
+        clearInterval(daOauthPoll);
+        daOauthPoll = null;
+        say('DonationAlerts ещё не подключён. Завершите вход на открытой странице.');
+      }
+    } catch {
+      if (tries >= 120) {
+        clearInterval(daOauthPoll);
+        daOauthPoll = null;
+      }
+    }
+  }, 3000);
+}
 
 function donationText(d) {
   const who = d.username || d.name || 'Аноним';
@@ -1536,6 +1617,7 @@ async function refreshDonations() {
 // -------------------------------------------------------------- Twitch
 
 let savedTwitchClientId = '';
+let twitchDevicePoll = null;
 
 function twitchRegistrationBody() {
   return {
@@ -1603,9 +1685,53 @@ async function refreshTwitch() {
   }
 }
 
+function twitchDeviceText(r) {
+  return {
+    connected: 'Twitch подключён.',
+    pending: 'Жду подтверждение на странице Twitch…',
+    expired: 'Код устарел. Нажмите «Подключить Twitch» заново.',
+  }[r.status] || r.message || 'Непонятный ответ Twitch.';
+}
+
+async function checkTwitchAuthorization(announcePending = true) {
+  const r = await post('/api/twitch/device/check');
+  const text = twitchDeviceText(r);
+  replace($('twitchDevice'), el('p', { text }));
+  if (announcePending || r.status !== 'pending') say(text);
+  await refreshTwitch();
+  return r;
+}
+
+function startTwitchDevicePolling(intervalSeconds = 5) {
+  clearInterval(twitchDevicePoll);
+  let tries = 0;
+  const delay = Math.max(3000, Number(intervalSeconds || 5) * 1000);
+  twitchDevicePoll = setInterval(async () => {
+    tries += 1;
+    try {
+      const r = await checkTwitchAuthorization(false);
+      if (r.status === 'connected' || r.status === 'expired') {
+        clearInterval(twitchDevicePoll);
+        twitchDevicePoll = null;
+      } else if (tries >= 120) {
+        clearInterval(twitchDevicePoll);
+        twitchDevicePoll = null;
+        say('Twitch ещё не подключён. Завершите вход на открытой странице.');
+      }
+    } catch {
+      if (tries >= 120) {
+        clearInterval(twitchDevicePoll);
+        twitchDevicePoll = null;
+      }
+    }
+  }, delay);
+}
+
 $('twitchStart').onclick = async () => {
+  const tab = openAuthTab();
   try {
     if (!$('twitchClientId').value.trim() && !savedTwitchClientId) {
+      closeAuthTab(tab);
       replace($('twitchDevice'), el('p', { text: 'Сначала заполните Twitch Client ID.' }));
       updateTwitchConnectButton();
       return;
@@ -1614,38 +1740,35 @@ $('twitchStart').onclick = async () => {
       await saveTwitchConfigFromForm();
     }
     const r = await post('/api/twitch/device/start');
+    const url = r.verification_uri_complete || r.verification_uri;
+    const opened = navigateAuthTab(tab, url);
     const link = el('a', {
-      href: r.verification_uri_complete || r.verification_uri,
+      href: url,
       target: '_blank',
       rel: 'noopener',
-      text: 'страницу активации Twitch',
+      text: 'открыть Twitch',
     });
-    replace($('twitchDevice'), el('p', {}, [
-      el('span', { text: 'Откройте ' }),
+    replace($('twitchDevice'), el('p', {}, opened ? [
+      el('span', { text: 'Открыта страница Twitch. Если браузер всё равно попросит код: ' }),
+      el('strong', { text: r.user_code || '' }),
+      el('span', { text: '. Панель сама проверит подключение.' }),
+    ] : [
+      el('span', { text: 'Браузер заблокировал вкладку: ' }),
       link,
-      el('span', { text: ' и введите код: ' }),
+      el('span', { text: '. Код: ' }),
       el('strong', { text: r.user_code || '' }),
     ]));
-    say('Код Twitch получен: ' + (r.user_code || ''));
+    say('Авторизация Twitch открыта. После подтверждения панель сама обновит статус.');
+    startTwitchDevicePolling(r.interval);
   } catch (e) {
+    closeAuthTab(tab);
     fail(e);
   }
 };
 
 $('twitchCheck').onclick = async () => {
   try {
-    // Backend различает три исхода: подключено, ждём подтверждения, код
-    // устарел. Раньше панель смотрела на наличие access_token и любую неудачу
-    // показывала одинаково — владелец не понимал, ждать ему или начинать заново.
-    const r = await post('/api/twitch/device/check');
-    const text = {
-      connected: 'Twitch подключён.',
-      pending: 'Пока не подтверждено. Завершите вход на странице Twitch и нажмите проверку ещё раз.',
-      expired: 'Код устарел. Нажмите «Подключить Twitch» заново.',
-    }[r.status] || r.message || 'Непонятный ответ Twitch.';
-    replace($('twitchDevice'), el('p', { text }));
-    say(text);
-    await refreshTwitch();
+    await checkTwitchAuthorization(true);
   } catch (e) {
     fail(e);
   }
