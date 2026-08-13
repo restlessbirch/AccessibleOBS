@@ -1,62 +1,158 @@
+// В релизе агент работает фоном без консольного окна — иначе при каждом входе
+// в Windows у актёра мигало бы чёрное окно. В отладке консоль оставляем.
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
 use anyhow::{Result, anyhow};
 use axum::{
     Json, Router,
     extract::{Query, State},
     http::{HeaderMap, HeaderValue, StatusCode},
-    response::{Html, IntoResponse, Response},
+    response::{
+        Html, IntoResponse, Response,
+        sse::{Event, KeepAlive, Sse},
+    },
     routing::{get, post},
 };
 use remote_stream_control::{
-    obs::{ObsClient, db_to_mul, mul_to_db},
+    donationalerts::{self, DonationFeed},
+    obs::{BatchItem, ObsHandle, ObsStatus, db_to_mul, mul_to_db, response_data},
     *,
 };
 use serde_json::{Value, json};
 use std::{
     collections::HashMap,
+    convert::Infallible,
     net::{IpAddr, Ipv4Addr, SocketAddr},
-    process::Command,
     sync::Arc,
+    time::{Duration, Instant},
 };
-use tokio::sync::Mutex;
+use subtle::ConstantTimeEq;
+use tokio::sync::{Mutex, RwLock, broadcast};
+use tokio_stream::{StreamExt as _, wrappers::BroadcastStream};
 use tower_http::{services::ServeDir, trace::TraceLayer};
-use tracing::{error, info};
+use tracing::{error, info, warn};
+
+const EVENT_CAPACITY: usize = 256;
+const MAX_LOGIN_FAILURES: u32 = 5;
+const LOGIN_BLOCK: Duration = Duration::from_secs(30);
+const STATUS_POLL: Duration = Duration::from_secs(3);
+/// Как часто уровни звука уходят в панель. OBS считает их ~50 раз в секунду;
+/// четырёх обновлений хватает, чтобы видеть, что звук идёт.
+const LEVELS_INTERVAL: Duration = Duration::from_millis(250);
 
 #[derive(Clone)]
 struct AppState {
-    cfg: HostConfig,
-    obs: ObsClient,
+    cfg: Arc<HostConfig>,
+    obs: ObsHandle,
     http: reqwest::Client,
-    donations: Arc<Mutex<Vec<Value>>>,
+    feed: DonationFeed,
+    events: broadcast::Sender<Value>,
+    /// Токен сессии держим в памяти: расшифровывать DPAPI-файл на каждый
+    /// запрос панели — лишний диск и лишняя криптография.
+    session: Arc<RwLock<Option<String>>>,
+    /// Одноразовый state для OAuth DonationAlerts (защита от подмены кода).
+    oauth_state: Arc<RwLock<Option<String>>>,
+    login_guard: Arc<Mutex<LoginGuard>>,
+}
+
+#[derive(Default)]
+struct LoginGuard {
+    failures: u32,
+    blocked_until: Option<Instant>,
+}
+
+impl LoginGuard {
+    fn blocked_for(&self) -> Option<Duration> {
+        let until = self.blocked_until?;
+        until.checked_duration_since(Instant::now())
+    }
+    fn record_failure(&mut self) {
+        self.failures += 1;
+        if self.failures >= MAX_LOGIN_FAILURES {
+            self.blocked_until = Some(Instant::now() + LOGIN_BLOCK);
+            self.failures = 0;
+        }
+    }
+    fn record_success(&mut self) {
+        self.failures = 0;
+        self.blocked_until = None;
+    }
 }
 
 type ApiResult<T> = Result<Json<T>, Response>;
 
-#[tokio::main]
+/// Два воркера вместо «по числу ядер».
+///
+/// Агент почти всё время ждёт сокет: нагрузка на ввод-вывод, а не на счёт.
+/// По умолчанию tokio поднял бы воркер на каждое ядро, и на 16-ядерной машине
+/// это 16 простаивающих потоков со своими стеками. Машина актёра занята
+/// кодированием видео, и такты стоит оставить OBS, а не нам. Двух хватает,
+/// чтобы обработка запроса не блокировала фоновые задачи.
+#[tokio::main(flavor = "multi_thread", worker_threads = 2)]
 async fn main() -> Result<()> {
     ensure_dirs()?;
     init_logging()?;
+
     let mut cfg = load_host_config()?;
     let obs_password = load_secret("obs_websocket_password")?
         .unwrap_or_else(|| cfg.obs_websocket_password.clone());
+    // Пароль не должен остаться в памяти конфига, который сериализуется в ответы.
     cfg.obs_websocket_password.clear();
-    let obs = ObsClient::new(
+    let cfg = Arc::new(cfg);
+
+    // Автозапуск: агент стартует при входе в Windows, поэтому сам поднимает OBS.
+    if cfg.auto_start_obs {
+        match start_obs_if_needed(&cfg.obs_path) {
+            Ok(true) => info!("OBS запущен агентом"),
+            Ok(false) => info!("OBS уже работает"),
+            Err(e) => warn!("OBS не запущен: {e:#}"),
+        }
+    }
+
+    let (events, _) = broadcast::channel(EVENT_CAPACITY);
+    let obs = ObsHandle::spawn(
         &cfg.obs_websocket_host,
         cfg.obs_websocket_port,
         obs_password,
     );
+    let feed = DonationFeed::new(events.clone());
+
     let state = AppState {
         cfg: cfg.clone(),
-        obs,
-        http: reqwest::Client::new(),
-        donations: Arc::new(Mutex::new(Vec::new())),
+        obs: obs.clone(),
+        http: reqwest::Client::builder()
+            .timeout(Duration::from_secs(15))
+            .build()?,
+        feed: feed.clone(),
+        events: events.clone(),
+        session: Arc::new(RwLock::new(load_secret("session_token")?)),
+        oauth_state: Arc::new(RwLock::new(None)),
+        login_guard: Arc::new(Mutex::new(LoginGuard::default())),
     };
+
+    forward_obs_events(obs.clone(), events.clone());
+    watch_obs_status(obs.clone(), events.clone());
+    if cfg.donationalerts.enabled && cfg.donationalerts.oauth_enabled {
+        donationalerts::spawn(cfg.donationalerts.clone(), state.http.clone(), feed.clone());
+    }
+    if load_secret("donationalerts_widget_url")?.is_some() {
+        let s = state.clone();
+        tokio::spawn(async move {
+            if let Err(e) = reconcile_donationalerts(&s).await {
+                error!("DonationAlerts reconcile при старте не удался: {e:#}");
+            }
+        });
+    }
 
     let app = Router::new()
         .route("/api/public/ping", get(public_ping))
         .route("/api/auth/status", get(auth_status))
         .route("/api/auth/login", post(auth_login))
+        .route("/api/auth/logout", post(auth_logout))
+        .route("/api/events", get(sse_events))
         .route("/api/health", get(health))
         .route("/api/obs", get(obs_status))
+        .route("/api/obs/launch", post(obs_launch))
         .route("/api/obs/request", post(obs_request))
         .route("/api/obs/scenes", get(obs_scenes))
         .route("/api/obs/scenes/current", post(obs_set_scene))
@@ -72,6 +168,26 @@ async fn main() -> Result<()> {
         .route("/api/obs/record/pause", post(obs_record_pause))
         .route("/api/obs/record/resume", post(obs_record_resume))
         .route("/api/obs/stats", get(obs_stats))
+        .route("/api/obs/preview", get(obs_preview))
+        .route("/api/obs/studio", get(obs_studio).post(obs_studio_set))
+        .route("/api/obs/studio/preview", post(obs_studio_preview))
+        .route("/api/obs/studio/transition", post(obs_studio_transition))
+        .route("/api/obs/virtualcam", get(obs_virtualcam))
+        .route("/api/obs/virtualcam/start", post(obs_virtualcam_start))
+        .route("/api/obs/virtualcam/stop", post(obs_virtualcam_stop))
+        .route("/api/obs/replay", get(obs_replay))
+        .route("/api/obs/replay/start", post(obs_replay_start))
+        .route("/api/obs/replay/stop", post(obs_replay_stop))
+        .route("/api/obs/replay/save", post(obs_replay_save))
+        .route("/api/obs/profiles", get(obs_profiles).post(obs_profile_set))
+        .route(
+            "/api/obs/collections",
+            get(obs_collections).post(obs_collection_set),
+        )
+        .route(
+            "/api/obs/transitions",
+            get(obs_transitions).post(obs_transition_set),
+        )
         .route("/api/donationalerts/status", get(da_status))
         .route("/api/donationalerts/recent", get(da_recent))
         .route("/api/donationalerts/reconcile", post(da_reconcile))
@@ -94,27 +210,64 @@ async fn main() -> Result<()> {
         .route("/api/twitch/marker", post(twitch_marker))
         .fallback_service(ServeDir::new(web_dir()).append_index_html_on_directories(true))
         .layer(TraceLayer::new_for_http())
-        .with_state(state.clone());
+        .with_state(state);
 
-    let addr = bind_addr(&cfg).await;
-    info!("Host Agent listening on http://{}", addr);
-    println!("Remote Stream Control Host Agent: http://{}", addr);
-    if load_secret("donationalerts_widget_url")?.is_some() {
-        let s = state.clone();
-        tokio::spawn(async move {
-            if let Err(e) = reconcile_donationalerts(&s).await {
-                error!("DonationAlerts reconcile failed: {}", e);
-            }
-        });
+    serve(app, &cfg).await
+}
+
+/// Слушаем и Tailscale-адрес, и localhost.
+///
+/// Localhost нужен не для удобства: `redirect_uri` OAuth DonationAlerts
+/// указывает на 127.0.0.1, и без этого слушателя браузер актёра не смог бы
+/// доставить authorization code агенту. На безопасность это не влияет —
+/// петлевой интерфейс недоступен извне.
+async fn serve(app: Router, cfg: &HostConfig) -> Result<()> {
+    let mut addrs = vec![SocketAddr::new(
+        IpAddr::V4(Ipv4Addr::LOCALHOST),
+        cfg.web_port,
+    )];
+    if cfg.listen_mode == "tailscale_only" {
+        match tailscale_ip() {
+            Some(ip) => addrs.push(SocketAddr::new(ip, cfg.web_port)),
+            None => warn!(
+                "Tailscale IP не определён — панель доступна только на localhost. \
+                 Проверьте, что Tailscale установлен и выполнен вход."
+            ),
+        }
     }
-    let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, app).await?;
+
+    let mut servers = Vec::new();
+    for addr in addrs {
+        match tokio::net::TcpListener::bind(addr).await {
+            Ok(listener) => {
+                info!("Host Agent слушает http://{}", addr);
+                println!("Remote Stream Control Host Agent: http://{addr}");
+                let app = app.clone();
+                servers.push(tokio::spawn(async move {
+                    if let Err(e) = axum::serve(listener, app).await {
+                        error!("Сервер на {addr} остановлен: {e}");
+                    }
+                }));
+            }
+            Err(e) => warn!("Не удалось занять {addr}: {e}"),
+        }
+    }
+    if servers.is_empty() {
+        return Err(anyhow!(
+            "Не удалось занять ни один адрес на порту {}. Возможно, агент уже запущен.",
+            cfg.web_port
+        ));
+    }
+    for s in servers {
+        let _ = s.await;
+    }
     Ok(())
 }
 
 fn init_logging() -> Result<()> {
     let file = tracing_appender::rolling::never(logs_dir(), "host.log");
     let (writer, guard) = tracing_appender::non_blocking(file);
+    // Guard должен жить всё время работы процесса, иначе логи перестанут писаться.
     std::mem::forget(guard);
     tracing_subscriber::fmt()
         .with_writer(writer)
@@ -124,27 +277,66 @@ fn init_logging() -> Result<()> {
         .ok();
     Ok(())
 }
-async fn bind_addr(cfg: &HostConfig) -> SocketAddr {
-    if cfg.listen_mode == "tailscale_only"
-        && let Some(ip) = tailscale_ip()
-    {
-        return SocketAddr::new(ip, cfg.web_port);
-    }
-    SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), cfg.web_port)
+
+/// События OBS уходят в общий поток панели.
+///
+/// Уровни звука обрабатываются отдельно: OBS шлёт их около 50 раз в секунду, и
+/// пересылать это в браузер как есть — значит завалить и канал, и отрисовку.
+/// Отдаём сводку не чаще LEVELS_INTERVAL, чего глазу достаточно.
+fn forward_obs_events(obs: ObsHandle, events: broadcast::Sender<Value>) {
+    tokio::spawn(async move {
+        let mut rx = obs.subscribe();
+        let mut levels_sent = Instant::now() - LEVELS_INTERVAL;
+        loop {
+            match rx.recv().await {
+                Ok(event) => {
+                    let kind = event.get("eventType").and_then(Value::as_str).unwrap_or("");
+                    if kind == "InputVolumeMeters" {
+                        if levels_sent.elapsed() < LEVELS_INTERVAL {
+                            continue;
+                        }
+                        levels_sent = Instant::now();
+                        let levels: serde_json::Map<String, Value> =
+                            obs::meter_levels(event.get("eventData").unwrap_or(&Value::Null))
+                                .into_iter()
+                                .map(|(name, db)| (name, json!((db * 10.0).round() / 10.0)))
+                                .collect();
+                        if !levels.is_empty() {
+                            let _ = events.send(json!({"type": "levels", "levels": levels}));
+                        }
+                        continue;
+                    }
+                    let _ = events.send(json!({"type": "obs", "event": event}));
+                }
+                Err(broadcast::error::RecvError::Lagged(n)) => {
+                    warn!("Панель отстала на {n} событий OBS");
+                }
+                Err(broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    });
 }
-fn tailscale_ip() -> Option<IpAddr> {
-    let exe = find_exe("tailscale.exe").or_else(|| {
-        let p = std::path::PathBuf::from(r"C:\Program Files\Tailscale\tailscale.exe");
-        p.exists().then_some(p)
-    })?;
-    let out = Command::new(exe).arg("ip").arg("-4").output().ok()?;
-    let txt = String::from_utf8_lossy(&out.stdout);
-    txt.lines().next()?.trim().parse().ok()
+
+/// OBS не сообщает о собственном обрыве событием, поэтому следим за статусом
+/// соединения сами и шлём в панель только изменения.
+fn watch_obs_status(obs: ObsHandle, events: broadcast::Sender<Value>) {
+    tokio::spawn(async move {
+        let mut last: Option<bool> = None;
+        loop {
+            let status = obs.status().await;
+            if last != Some(status.connected) {
+                last = Some(status.connected);
+                let _ = events.send(json!({"type": "obs_status", "status": status}));
+            }
+            tokio::time::sleep(STATUS_POLL).await;
+        }
+    });
 }
 
 async fn public_ping() -> Json<Value> {
-    Json(json!({"ok":true,"app":APP_NAME}))
+    Json(json!({"ok": true, "app": APP_NAME}))
 }
+
 fn cookie(headers: &HeaderMap, name: &str) -> Option<String> {
     headers
         .get("cookie")?
@@ -156,168 +348,270 @@ fn cookie(headers: &HeaderMap, name: &str) -> Option<String> {
             (k == name).then(|| v.to_string())
         })
 }
-fn is_auth(headers: &HeaderMap) -> bool {
-    match (
-        cookie(headers, "rsc_session"),
-        load_secret("session_token").ok().flatten(),
-    ) {
-        (Some(a), Some(b)) => a == b,
-        _ => false,
-    }
+
+/// Сравнение за постоянное время: обычный `==` выходит на первом различии и
+/// теоретически позволяет подбирать токен по времени ответа.
+fn secret_eq(a: &str, b: &str) -> bool {
+    a.as_bytes().ct_eq(b.as_bytes()).into()
 }
-#[allow(clippy::result_large_err)]
-fn require_auth(headers: &HeaderMap) -> Result<(), Response> {
-    if is_auth(headers) {
+
+async fn is_auth(st: &AppState, headers: &HeaderMap) -> bool {
+    let Some(presented) = cookie(headers, "rsc_session") else {
+        return false;
+    };
+    let guard = st.session.read().await;
+    guard
+        .as_deref()
+        .is_some_and(|real| secret_eq(&presented, real))
+}
+
+async fn require_auth(st: &AppState, headers: &HeaderMap) -> Result<(), Response> {
+    if is_auth(st, headers).await {
         Ok(())
     } else {
         Err((
             StatusCode::UNAUTHORIZED,
-            Json(json!({"error":{"message":"Требуется pairing-код Remote Stream Control."}})),
+            Json(json!({"error": {"message": "Требуется pairing-код Remote Stream Control."}})),
         )
             .into_response())
     }
 }
-async fn auth_status(headers: HeaderMap) -> Json<Value> {
-    Json(
-        json!({"paired": load_secret("pairing_secret").ok().flatten().is_some(), "authenticated": is_auth(&headers)}),
-    )
+
+async fn auth_status(State(st): State<AppState>, headers: HeaderMap) -> Json<Value> {
+    Json(json!({
+        "paired": load_secret("pairing_secret").ok().flatten().is_some(),
+        "authenticated": is_auth(&st, &headers).await,
+    }))
 }
-async fn auth_login(Json(body): Json<Value>) -> Response {
-    let Some(secret) = body.get("secret").and_then(|v| v.as_str()) else {
+
+async fn auth_login(State(st): State<AppState>, Json(body): Json<Value>) -> Response {
+    {
+        let guard = st.login_guard.lock().await;
+        if let Some(left) = guard.blocked_for() {
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(json!({"error": {"message": format!(
+                    "Слишком много неудачных попыток. Подождите {} секунд.",
+                    left.as_secs() + 1
+                )}})),
+            )
+                .into_response();
+        }
+    }
+
+    let Some(secret) = body.get("secret").and_then(Value::as_str) else {
+        return bad("Введите pairing-код.");
+    };
+    let Ok(Some(real)) = load_secret("pairing_secret") else {
         return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({"error":{"message":"Введите pairing-код."}})),
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": {"message": "Pairing-код ещё не создан. Запустите START_FRIEND.bat на компьютере актёра."}})),
         )
             .into_response();
     };
-    match load_secret("pairing_secret") {
-        Ok(Some(real)) if secret.trim() == real => {
-            let token = load_secret("session_token")
-                .ok()
-                .flatten()
-                .unwrap_or_else(|| random_secret_b64(32));
-            if let Err(e) = save_secret("session_token", &token) {
-                return err("Не удалось сохранить сессию", e);
-            }
-            let mut resp = Json(json!({"ok":true})).into_response();
-            resp.headers_mut().insert(
-                "set-cookie",
-                HeaderValue::from_str(&format!(
-                    "rsc_session={}; Path=/; HttpOnly; SameSite=Lax",
-                    token
-                ))
-                .unwrap(),
-            );
-            resp
-        }
-        _ => (
+
+    if !secret_eq(secret.trim(), &real) {
+        st.login_guard.lock().await.record_failure();
+        return (
             StatusCode::UNAUTHORIZED,
-            Json(json!({"error":{"message":"Неверный pairing-код."}})),
+            Json(json!({"error": {"message": "Неверный pairing-код."}})),
         )
-            .into_response(),
+            .into_response();
     }
+
+    st.login_guard.lock().await.record_success();
+    let token = match st.session.read().await.clone() {
+        Some(t) => t,
+        None => random_secret_b64(32),
+    };
+    if let Err(e) = save_secret("session_token", &token) {
+        return err("Не удалось сохранить сессию", e);
+    }
+    *st.session.write().await = Some(token.clone());
+
+    let mut resp = Json(json!({"ok": true})).into_response();
+    // Secure не ставим намеренно: связь идёт по http внутри tailnet, где
+    // шифрование обеспечивает сам WireGuard. С флагом Secure куку бы отбросили.
+    resp.headers_mut().insert(
+        "set-cookie",
+        HeaderValue::from_str(&format!(
+            "rsc_session={token}; Path=/; HttpOnly; SameSite=Lax"
+        ))
+        .expect("токен из base64 всегда валиден для заголовка"),
+    );
+    resp
 }
+
+async fn auth_logout(State(st): State<AppState>, headers: HeaderMap) -> Response {
+    if let Err(resp) = require_auth(&st, &headers).await {
+        return resp;
+    }
+    *st.session.write().await = None;
+    let _ = delete_secret("session_token");
+    let mut resp = Json(json!({"ok": true})).into_response();
+    resp.headers_mut().insert(
+        "set-cookie",
+        HeaderValue::from_static("rsc_session=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0"),
+    );
+    resp
+}
+
+/// Живой поток событий: OBS, статус соединения, донаты.
+async fn sse_events(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>>>, Response> {
+    require_auth(&st, &headers).await?;
+    let stream = BroadcastStream::new(st.events.subscribe()).filter_map(|msg| {
+        let value = msg.ok()?;
+        Event::default().json_data(&value).ok().map(Ok)
+    });
+    Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
+}
+
 fn err(msg: &str, e: anyhow::Error) -> Response {
-    error!("{}: {}", msg, e);
+    error!("{}: {:#}", msg, e);
     (
         StatusCode::INTERNAL_SERVER_ERROR,
-        Json(json!({"error":{"message":msg,"detail":e.to_string()}})),
+        Json(json!({"error": {"message": msg, "detail": e.to_string()}})),
     )
         .into_response()
 }
 fn bad(msg: &str) -> Response {
     (
         StatusCode::BAD_REQUEST,
-        Json(json!({"error":{"message":msg}})),
+        Json(json!({"error": {"message": msg}})),
     )
         .into_response()
 }
 
 async fn health(State(st): State<AppState>, headers: HeaderMap) -> ApiResult<Value> {
-    require_auth(&headers)?;
+    require_auth(&st, &headers).await?;
     let obs = st.obs.status().await;
-    let da = donationalerts_status_value(&st).await;
-    let tw = twitch_status_value(&st).await;
-    Json(json!({"tailscale": tailscale_ip().map(|i|i.to_string()).unwrap_or_else(||"not_detected".into()), "host_agent":"ok", "obs":obs, "donationalerts":da, "twitch":tw, "ready_to_stream": obs.get("connected").and_then(|v|v.as_bool()).unwrap_or(false)})).pipe(Ok)
+    let ready = obs.connected;
+    Ok(Json(json!({
+        "tailscale": tailscale_ip().map(|i| i.to_string()).unwrap_or_else(|| "not_detected".into()),
+        "tailscale_running": tailscale_running(),
+        "host_agent": "ok",
+        "autostart": autostart_registered(),
+        "obs": obs,
+        "obs_process_running": obs_is_running(),
+        "obs_crashed_last_run": obs_crashed_last_run(),
+        "donationalerts": donationalerts_status_value(&st).await,
+        "twitch": twitch_status_value(&st).await,
+        "ready_to_stream": ready,
+    })))
 }
-async fn obs_status(State(st): State<AppState>, headers: HeaderMap) -> ApiResult<Value> {
-    require_auth(&headers)?;
+
+async fn obs_status(State(st): State<AppState>, headers: HeaderMap) -> ApiResult<ObsStatus> {
+    require_auth(&st, &headers).await?;
     Ok(Json(st.obs.status().await))
 }
+
+/// Запуск OBS на машине актёра по команде из панели.
+///
+/// Агент поднимает OBS при входе в Windows, но актёр может закрыть его руками.
+/// Без этой ручки владелец остался бы без управления до следующей перезагрузки
+/// у актёра, а весь смысл проекта в том, что актёр ничего не делает.
+async fn obs_launch(State(st): State<AppState>, headers: HeaderMap) -> ApiResult<Value> {
+    require_auth(&st, &headers).await?;
+    match start_obs_if_needed(&st.cfg.obs_path) {
+        Ok(true) => {
+            // Сбрасываем паузу переподключения, иначе панель ждала бы
+            // до 15 секунд, хотя OBS уже поднимается.
+            st.obs.reconnect_now();
+            Ok(Json(
+                json!({"started": true, "message": "OBS запускается. Связь появится через несколько секунд."}),
+            ))
+        }
+        Ok(false) => Ok(Json(
+            json!({"started": false, "message": "OBS уже запущен."}),
+        )),
+        Err(e) => Err(err("Не удалось запустить OBS", e)),
+    }
+}
+
 async fn obs_request(
     State(st): State<AppState>,
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> ApiResult<Value> {
-    require_auth(&headers)?;
+    require_auth(&st, &headers).await?;
     let rt = body
         .get("requestType")
-        .and_then(|v| v.as_str())
+        .and_then(Value::as_str)
         .ok_or_else(|| bad("requestType обязателен"))?;
-    let data = body.get("requestData").cloned().unwrap_or(json!({}));
+    let data = body
+        .get("requestData")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
     st.obs
         .request(rt, data)
         .await
         .map(Json)
         .map_err(|e| err("Команда OBS не выполнена", e))
 }
+
 async fn obs_scenes(State(st): State<AppState>, headers: HeaderMap) -> ApiResult<Value> {
-    require_auth(&headers)?;
+    require_auth(&st, &headers).await?;
     st.obs
         .request("GetSceneList", json!({}))
         .await
         .map(Json)
         .map_err(|e| err("Не удалось получить сцены OBS", e))
 }
+
 async fn obs_set_scene(
     State(st): State<AppState>,
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> ApiResult<Value> {
-    require_auth(&headers)?;
+    require_auth(&st, &headers).await?;
     let scene = body
         .get("sceneName")
-        .and_then(|v| v.as_str())
+        .and_then(Value::as_str)
         .ok_or_else(|| bad("sceneName обязателен"))?;
     st.obs
-        .request("SetCurrentProgramScene", json!({"sceneName":scene}))
+        .request("SetCurrentProgramScene", json!({"sceneName": scene}))
         .await
         .map(Json)
         .map_err(|e| err("Не удалось переключить сцену", e))
 }
+
 async fn obs_sources(
     State(st): State<AppState>,
     headers: HeaderMap,
     Query(q): Query<HashMap<String, String>>,
 ) -> ApiResult<Value> {
-    require_auth(&headers)?;
+    require_auth(&st, &headers).await?;
     let scene = q.get("scene").ok_or_else(|| bad("scene обязателен"))?;
     st.obs
-        .request("GetSceneItemList", json!({"sceneName":scene}))
+        .request("GetSceneItemList", json!({"sceneName": scene}))
         .await
         .map(Json)
         .map_err(|e| err("Не удалось получить источники сцены", e))
 }
+
 async fn obs_source_visibility(
     State(st): State<AppState>,
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> ApiResult<Value> {
-    require_auth(&headers)?;
+    require_auth(&st, &headers).await?;
     let scene = body
         .get("sceneName")
-        .and_then(|v| v.as_str())
+        .and_then(Value::as_str)
         .ok_or_else(|| bad("sceneName обязателен"))?;
     let enabled = body
         .get("enabled")
-        .and_then(|v| v.as_bool())
+        .and_then(Value::as_bool)
         .ok_or_else(|| bad("enabled обязателен"))?;
-    let id = if let Some(id) = body.get("sceneItemId").and_then(|v| v.as_i64()) {
+    let id = if let Some(id) = body.get("sceneItemId").and_then(Value::as_i64) {
         id
     } else {
         let source = body
             .get("sourceName")
-            .and_then(|v| v.as_str())
+            .and_then(Value::as_str)
             .ok_or_else(|| bad("sourceName или sceneItemId обязателен"))?;
         find_scene_item_id(&st.obs, scene, source)
             .await
@@ -326,110 +620,144 @@ async fn obs_source_visibility(
     st.obs
         .request(
             "SetSceneItemEnabled",
-            json!({"sceneName":scene,"sceneItemId":id,"sceneItemEnabled":enabled}),
+            json!({"sceneName": scene, "sceneItemId": id, "sceneItemEnabled": enabled}),
         )
         .await
         .map(Json)
         .map_err(|e| err("Не удалось изменить видимость источника", e))
 }
-async fn find_scene_item_id(obs: &ObsClient, scene: &str, source: &str) -> Result<i64> {
+
+async fn find_scene_item_id(obs: &ObsHandle, scene: &str, source: &str) -> Result<i64> {
     let list = obs
-        .request("GetSceneItemList", json!({"sceneName":scene}))
+        .request("GetSceneItemList", json!({"sceneName": scene}))
         .await?;
-    for it in list
-        .get("sceneItems")
-        .and_then(|v| v.as_array())
+    list.get("sceneItems")
+        .and_then(Value::as_array)
         .into_iter()
         .flatten()
-    {
-        if it.get("sourceName").and_then(|v| v.as_str()) == Some(source) {
-            return it
-                .get("sceneItemId")
-                .and_then(|v| v.as_i64())
-                .ok_or_else(|| anyhow!("sceneItemId отсутствует"));
-        }
-    }
-    Err(anyhow!("{} отсутствует в {}", source, scene))
+        .find(|it| it.get("sourceName").and_then(Value::as_str) == Some(source))
+        .and_then(|it| it.get("sceneItemId").and_then(Value::as_i64))
+        .ok_or_else(|| anyhow!("{source} отсутствует в {scene}"))
 }
+
+/// Громкость и mute всех входов за два round-trip вместо 2N.
 async fn obs_audio(State(st): State<AppState>, headers: HeaderMap) -> ApiResult<Value> {
-    require_auth(&headers)?;
+    require_auth(&st, &headers).await?;
     let inputs = st
         .obs
         .request("GetInputList", json!({}))
         .await
-        .map_err(|e| err("Не удалось получить аудиоисточники", e))?;
-    let mut rows = Vec::new();
-    for inp in inputs
+        .map_err(|e| err("Не удалось получить список источников", e))?;
+
+    let names: Vec<(String, Value)> = inputs
         .get("inputs")
-        .and_then(|v| v.as_array())
+        .and_then(Value::as_array)
         .into_iter()
         .flatten()
-    {
-        if let Some(name) = inp.get("inputName").and_then(|v| v.as_str()) {
-            let vol = st
-                .obs
-                .request("GetInputVolume", json!({"inputName":name}))
-                .await
-                .unwrap_or(json!({}));
-            let mute = st
-                .obs
-                .request("GetInputMute", json!({"inputName":name}))
-                .await
-                .unwrap_or(json!({}));
-            if vol.get("inputVolumeMul").is_some() || mute.get("inputMuted").is_some() {
-                rows.push(json!({"inputName":name,"inputKind":inp.get("inputKind"),"muted":mute.get("inputMuted").cloned().unwrap_or(Value::Null),"volumeDb":vol.get("inputVolumeDb").cloned().unwrap_or_else(|| json!(vol.get("inputVolumeMul").and_then(|v|v.as_f64()).map(mul_to_db).unwrap_or(0.0))),"volumeMul":vol.get("inputVolumeMul").cloned().unwrap_or(Value::Null)}));
-            }
-        }
+        .filter_map(|i| {
+            let name = i.get("inputName").and_then(Value::as_str)?.to_string();
+            Some((name, i.get("inputKind").cloned().unwrap_or(Value::Null)))
+        })
+        .collect();
+
+    // Свежая установка OBS без источников — обычное состояние на первом
+    // запуске у актёра. Пустой RequestBatch отправлять незачем.
+    if names.is_empty() {
+        return Ok(Json(json!({"audio": []})));
     }
-    Ok(Json(json!({"audio":rows})))
+
+    let mut batch = Vec::with_capacity(names.len() * 2);
+    for (name, _) in &names {
+        batch.push(BatchItem::new("GetInputVolume", json!({"inputName": name})));
+        batch.push(BatchItem::new("GetInputMute", json!({"inputName": name})));
+    }
+    let results = st
+        .obs
+        .batch(batch)
+        .await
+        .map_err(|e| err("Не удалось получить состояние аудио", e))?;
+
+    let mut rows = Vec::new();
+    for (i, (name, kind)) in names.iter().enumerate() {
+        let volume = results.get(i * 2).and_then(response_data);
+        let mute = results.get(i * 2 + 1).and_then(response_data);
+        // Источники без аудио на эти запросы отвечают ошибкой — пропускаем их.
+        if volume.is_none() && mute.is_none() {
+            continue;
+        }
+        let db = volume
+            .and_then(|v| v.get("inputVolumeDb"))
+            .and_then(Value::as_f64)
+            .or_else(|| {
+                volume
+                    .and_then(|v| v.get("inputVolumeMul"))
+                    .and_then(Value::as_f64)
+                    .map(mul_to_db)
+            })
+            .unwrap_or(0.0);
+        rows.push(json!({
+            "inputName": name,
+            "inputKind": kind,
+            "muted": mute.and_then(|m| m.get("inputMuted")).cloned().unwrap_or(Value::Null),
+            "volumeDb": db,
+            "volumeMul": volume.and_then(|v| v.get("inputVolumeMul")).cloned().unwrap_or(Value::Null),
+        }));
+    }
+    Ok(Json(json!({"audio": rows})))
 }
+
 async fn obs_audio_mute(
     State(st): State<AppState>,
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> ApiResult<Value> {
-    require_auth(&headers)?;
+    require_auth(&st, &headers).await?;
     let name = body
         .get("inputName")
-        .and_then(|v| v.as_str())
+        .and_then(Value::as_str)
         .ok_or_else(|| bad("inputName обязателен"))?;
     let muted = body
         .get("muted")
-        .and_then(|v| v.as_bool())
+        .and_then(Value::as_bool)
         .ok_or_else(|| bad("muted обязателен"))?;
     st.obs
-        .request("SetInputMute", json!({"inputName":name,"inputMuted":muted}))
+        .request(
+            "SetInputMute",
+            json!({"inputName": name, "inputMuted": muted}),
+        )
         .await
         .map(Json)
         .map_err(|e| err("Не удалось изменить mute", e))
 }
+
 async fn obs_audio_volume(
     State(st): State<AppState>,
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> ApiResult<Value> {
-    require_auth(&headers)?;
+    require_auth(&st, &headers).await?;
     let name = body
         .get("inputName")
-        .and_then(|v| v.as_str())
+        .and_then(Value::as_str)
         .ok_or_else(|| bad("inputName обязателен"))?;
     let db = body
         .get("volumeDb")
-        .and_then(|v| v.as_f64())
+        .and_then(Value::as_f64)
         .ok_or_else(|| bad("volumeDb обязателен"))?;
     st.obs
         .request(
             "SetInputVolume",
-            json!({"inputName":name,"inputVolumeMul":db_to_mul(db)}),
+            json!({"inputName": name, "inputVolumeMul": db_to_mul(db)}),
         )
         .await
         .map(Json)
         .map_err(|e| err("Не удалось изменить громкость", e))
 }
+
 macro_rules! simple_obs {
-    ($fn:ident,$req:literal,$msg:literal) => {
+    ($fn:ident, $req:literal, $msg:literal) => {
         async fn $fn(State(st): State<AppState>, headers: HeaderMap) -> ApiResult<Value> {
-            require_auth(&headers)?;
+            require_auth(&st, &headers).await?;
             st.obs
                 .request($req, json!({}))
                 .await
@@ -457,252 +785,577 @@ simple_obs!(
     "Не удалось продолжить запись"
 );
 simple_obs!(obs_stats, "GetStats", "Не удалось получить статистику OBS");
+simple_obs!(
+    obs_studio_transition,
+    "TriggerStudioModeTransition",
+    "Не удалось выполнить переход"
+);
+simple_obs!(
+    obs_virtualcam,
+    "GetVirtualCamStatus",
+    "Не удалось узнать состояние виртуальной камеры"
+);
+simple_obs!(
+    obs_virtualcam_start,
+    "StartVirtualCam",
+    "Не удалось включить виртуальную камеру"
+);
+simple_obs!(
+    obs_virtualcam_stop,
+    "StopVirtualCam",
+    "Не удалось выключить виртуальную камеру"
+);
+/// Состояние буфера повтора.
+///
+/// Если буфер не включён в настройках OBS, запрос отвечает ошибкой. Это не
+/// поломка, а обычное положение дел, поэтому отдаём его как состояние —
+/// иначе панель пугала бы владельца красной ошибкой на пустом месте.
+async fn obs_replay(State(st): State<AppState>, headers: HeaderMap) -> ApiResult<Value> {
+    require_auth(&st, &headers).await?;
+    match st.obs.request("GetReplayBufferStatus", json!({})).await {
+        Ok(v) => Ok(Json(json!({
+            "available": true,
+            "outputActive": v.get("outputActive").cloned().unwrap_or(Value::Bool(false)),
+        }))),
+        Err(e) if e.to_string().contains("not available") => Ok(Json(json!({
+            "available": false,
+            "outputActive": false,
+            "message": "Буфер повтора выключен в настройках OBS у актёра \
+                        (Настройки → Вывод → Буфер повтора).",
+        }))),
+        Err(e) => Err(err("Не удалось узнать состояние повтора", e)),
+    }
+}
+simple_obs!(
+    obs_replay_start,
+    "StartReplayBuffer",
+    "Не удалось включить буфер повтора"
+);
+simple_obs!(
+    obs_replay_stop,
+    "StopReplayBuffer",
+    "Не удалось выключить буфер повтора"
+);
+simple_obs!(
+    obs_replay_save,
+    "SaveReplayBuffer",
+    "Не удалось сохранить повтор"
+);
+simple_obs!(
+    obs_profiles,
+    "GetProfileList",
+    "Не удалось получить список профилей"
+);
+simple_obs!(
+    obs_collections,
+    "GetSceneCollectionList",
+    "Не удалось получить список коллекций сцен"
+);
+simple_obs!(
+    obs_transitions,
+    "GetSceneTransitionList",
+    "Не удалось получить список переходов"
+);
+
+/// Кадр текущей сцены как data-URI.
+///
+/// Владелец не видит, что происходит у актёра, а актёр может не заметить
+/// чёрный экран или зависший источник. Кадр запрашивается по требованию,
+/// а не потоком: постоянный видеопоток занял бы канал и процессор актёра.
+async fn obs_preview(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<HashMap<String, String>>,
+) -> ApiResult<Value> {
+    require_auth(&st, &headers).await?;
+    let width = q
+        .get("width")
+        .and_then(|v| v.parse::<i64>().ok())
+        .unwrap_or(480)
+        .clamp(96, 1920);
+
+    let current = st
+        .obs
+        .request("GetCurrentProgramScene", json!({}))
+        .await
+        .map_err(|e| err("Не удалось узнать текущую сцену", e))?;
+    // Имя поля менялось между версиями obs-websocket 5.x.
+    let scene = current
+        .get("currentProgramSceneName")
+        .or_else(|| current.get("sceneName"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| bad("OBS не сообщил имя текущей сцены"))?;
+
+    st.obs
+        .request(
+            "GetSourceScreenshot",
+            json!({
+                "sourceName": scene,
+                "imageFormat": "jpg",
+                "imageWidth": width,
+                "imageCompressionQuality": 55,
+            }),
+        )
+        .await
+        .map(|mut v| {
+            if let Some(obj) = v.as_object_mut() {
+                obj.insert("sceneName".into(), Value::String(scene.to_string()));
+            }
+            Json(v)
+        })
+        .map_err(|e| err("Не удалось получить кадр", e))
+}
+
+async fn obs_studio(State(st): State<AppState>, headers: HeaderMap) -> ApiResult<Value> {
+    require_auth(&st, &headers).await?;
+    let enabled = st
+        .obs
+        .request("GetStudioModeEnabled", json!({}))
+        .await
+        .map_err(|e| err("Не удалось узнать состояние Studio Mode", e))?
+        .get("studioModeEnabled")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+
+    // Сцена предпросмотра существует только при включённом Studio Mode.
+    let preview = if enabled {
+        st.obs
+            .request("GetCurrentPreviewScene", json!({}))
+            .await
+            .ok()
+            .and_then(|v| {
+                v.get("currentPreviewSceneName")
+                    .or_else(|| v.get("sceneName"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            })
+    } else {
+        None
+    };
+
+    Ok(Json(json!({"enabled": enabled, "previewScene": preview})))
+}
+
+async fn obs_studio_set(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> ApiResult<Value> {
+    require_auth(&st, &headers).await?;
+    let enabled = body
+        .get("enabled")
+        .and_then(Value::as_bool)
+        .ok_or_else(|| bad("enabled обязателен"))?;
+    st.obs
+        .request(
+            "SetStudioModeEnabled",
+            json!({"studioModeEnabled": enabled}),
+        )
+        .await
+        .map(Json)
+        .map_err(|e| err("Не удалось переключить Studio Mode", e))
+}
+
+async fn obs_studio_preview(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> ApiResult<Value> {
+    require_auth(&st, &headers).await?;
+    let scene = body
+        .get("sceneName")
+        .and_then(Value::as_str)
+        .ok_or_else(|| bad("sceneName обязателен"))?;
+    st.obs
+        .request("SetCurrentPreviewScene", json!({"sceneName": scene}))
+        .await
+        .map(Json)
+        .map_err(|e| err("Не удалось выбрать сцену предпросмотра", e))
+}
+
+/// Переключение профиля, коллекции сцен и перехода — одинаковые по форме
+/// запросы, отличаются только именем поля.
+macro_rules! obs_setter {
+    ($fn:ident, $req:literal, $field:literal, $msg:literal) => {
+        async fn $fn(
+            State(st): State<AppState>,
+            headers: HeaderMap,
+            Json(body): Json<Value>,
+        ) -> ApiResult<Value> {
+            require_auth(&st, &headers).await?;
+            let value = body
+                .get($field)
+                .and_then(Value::as_str)
+                .ok_or_else(|| bad(concat!($field, " обязателен")))?;
+            st.obs
+                .request($req, json!({ $field: value }))
+                .await
+                .map(Json)
+                .map_err(|e| err($msg, e))
+        }
+    };
+}
+obs_setter!(
+    obs_profile_set,
+    "SetCurrentProfile",
+    "profileName",
+    "Не удалось переключить профиль"
+);
+obs_setter!(
+    obs_collection_set,
+    "SetCurrentSceneCollection",
+    "sceneCollectionName",
+    "Не удалось переключить коллекцию сцен"
+);
+obs_setter!(
+    obs_transition_set,
+    "SetCurrentSceneTransition",
+    "transitionName",
+    "Не удалось выбрать переход"
+);
 
 async fn da_status(State(st): State<AppState>, headers: HeaderMap) -> ApiResult<Value> {
-    require_auth(&headers)?;
+    require_auth(&st, &headers).await?;
     Ok(Json(donationalerts_status_value(&st).await))
 }
+
 async fn donationalerts_status_value(st: &AppState) -> Value {
-    json!({"enabled":st.cfg.donationalerts.enabled,"widget_url_configured":load_secret("donationalerts_widget_url").ok().flatten().is_some(),"oauth_configured": !st.cfg.donationalerts.client_id.is_empty() && !st.cfg.donationalerts.client_secret.is_empty(),"tokens_stored":load_secret("donationalerts_tokens").ok().flatten().is_some(),"overlay_scene":st.cfg.donationalerts.overlay_scene_name,"input_name":st.cfg.donationalerts.input_name})
+    let c = &st.cfg.donationalerts;
+    json!({
+        "enabled": c.enabled,
+        "widget_url_configured": load_secret("donationalerts_widget_url").ok().flatten().is_some(),
+        "oauth_configured": !c.client_id.is_empty() && !c.client_secret.is_empty(),
+        "tokens_stored": load_secret("donationalerts_tokens").ok().flatten().is_some(),
+        "realtime": st.feed.status().await,
+        "overlay_scene": c.overlay_scene_name,
+        "input_name": c.input_name,
+    })
 }
+
 async fn da_recent(State(st): State<AppState>, headers: HeaderMap) -> ApiResult<Value> {
-    require_auth(&headers)?;
-    let d = st.donations.lock().await.clone();
-    Ok(Json(json!({"donations":d})))
+    require_auth(&st, &headers).await?;
+    Ok(Json(json!({"donations": st.feed.recent().await})))
 }
+
 async fn da_widget_url(
     State(st): State<AppState>,
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> ApiResult<Value> {
-    require_auth(&headers)?;
-    let url = body
-        .get("url")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .trim();
-    if !(url.starts_with("https://") || url.starts_with("http://")) {
-        return Err(bad("Введите корректный URL Alerts Widget."));
+    require_auth(&st, &headers).await?;
+    let url = body.get("url").and_then(Value::as_str).unwrap_or("").trim();
+    // Виджет DonationAlerts всегда отдаётся по https; http означает опечатку
+    // или подмену, и в OBS такой источник грузить не стоит.
+    if !url.starts_with("https://") {
+        return Err(bad(
+            "Введите https-ссылку Alerts Widget со страницы DonationAlerts.",
+        ));
     }
     save_secret("donationalerts_widget_url", url)
         .map_err(|e| err("Не удалось сохранить DonationAlerts URL", e))?;
     reconcile_donationalerts(&st)
         .await
         .map(Json)
-        .map_err(|e| err("URL сохранён, но OBS не удалось настроить", e))
+        .map_err(|e| err("URL сохранён, но настроить OBS не удалось", e))
 }
+
 async fn da_reconcile(State(st): State<AppState>, headers: HeaderMap) -> ApiResult<Value> {
-    require_auth(&headers)?;
+    require_auth(&st, &headers).await?;
     reconcile_donationalerts(&st)
         .await
         .map(Json)
         .map_err(|e| err("Не удалось настроить DonationAlerts в OBS", e))
 }
+
 async fn da_widget_refresh(State(st): State<AppState>, headers: HeaderMap) -> ApiResult<Value> {
-    require_auth(&headers)?;
-    let first = st
+    require_auth(&st, &headers).await?;
+    let name = &st.cfg.donationalerts.input_name;
+    let pressed = st
         .obs
         .request(
             "PressInputPropertiesButton",
-            json!({"inputName":st.cfg.donationalerts.input_name,"propertyName":"refreshnocache"}),
+            json!({"inputName": name, "propertyName": "refreshnocache"}),
         )
         .await;
-    let result = match first { Ok(v)=>Ok(v), Err(_)=>st.obs.request("SetInputSettings", json!({"inputName":st.cfg.donationalerts.input_name,"inputSettings":{},"overlay":true})).await };
+    // Старые сборки OBS не знают эту кнопку — тогда достаточно переприменить настройки.
+    let result = match pressed {
+        Ok(v) => Ok(v),
+        Err(_) => {
+            st.obs
+                .request(
+                    "SetInputSettings",
+                    json!({"inputName": name, "inputSettings": {}, "overlay": true}),
+                )
+                .await
+        }
+    };
     result
         .map(Json)
         .map_err(|e| err("Не удалось обновить виджет", e))
 }
+
 async fn da_widget_mute(
     State(st): State<AppState>,
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> ApiResult<Value> {
-    require_auth(&headers)?;
+    require_auth(&st, &headers).await?;
     let muted = body
         .get("muted")
-        .and_then(|v| v.as_bool())
+        .and_then(Value::as_bool)
         .ok_or_else(|| bad("muted обязателен"))?;
     st.obs
         .request(
             "SetInputMute",
-            json!({"inputName":st.cfg.donationalerts.input_name,"inputMuted":muted}),
+            json!({"inputName": st.cfg.donationalerts.input_name, "inputMuted": muted}),
         )
         .await
         .map(Json)
         .map_err(|e| err("Не удалось изменить mute DonationAlerts", e))
 }
+
 async fn da_widget_volume(
     State(st): State<AppState>,
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> ApiResult<Value> {
-    require_auth(&headers)?;
+    require_auth(&st, &headers).await?;
     let db = body
         .get("volumeDb")
-        .and_then(|v| v.as_f64())
+        .and_then(Value::as_f64)
         .ok_or_else(|| bad("volumeDb обязателен"))?;
     st.obs
         .request(
             "SetInputVolume",
-            json!({"inputName":st.cfg.donationalerts.input_name,"inputVolumeMul":db_to_mul(db)}),
+            json!({"inputName": st.cfg.donationalerts.input_name, "inputVolumeMul": db_to_mul(db)}),
         )
         .await
         .map(Json)
         .map_err(|e| err("Не удалось изменить громкость DonationAlerts", e))
 }
 
+/// Приводит OBS к состоянию, в котором донаты видны и слышны в эфире:
+/// отдельная сцена-оверлей, browser_source с виджетом, звук в микшере OBS,
+/// и оверлей поверх каждой пользовательской сцены.
 async fn reconcile_donationalerts(st: &AppState) -> Result<Value> {
     let cfg = &st.cfg.donationalerts;
     let widget_url = load_secret("donationalerts_widget_url")?
         .ok_or_else(|| anyhow!("DonationAlerts Alerts Widget URL ещё не настроен"))?;
+
     let scene_list = st.obs.request("GetSceneList", json!({})).await?;
-    let scenes = scene_list
+    let has_overlay_scene = scene_list
         .get("scenes")
-        .and_then(|v| v.as_array())
-        .cloned()
-        .unwrap_or_default();
-    if !scenes
-        .iter()
-        .any(|s| s.get("sceneName").and_then(|v| v.as_str()) == Some(&cfg.overlay_scene_name))
-    {
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .any(|s| s.get("sceneName").and_then(Value::as_str) == Some(&cfg.overlay_scene_name));
+    if !has_overlay_scene {
         st.obs
-            .request("CreateScene", json!({"sceneName":cfg.overlay_scene_name}))
+            .request("CreateScene", json!({"sceneName": cfg.overlay_scene_name}))
             .await?;
     }
+
     let video = st
         .obs
         .request("GetVideoSettings", json!({}))
         .await
-        .unwrap_or(json!({"baseWidth":1920,"baseHeight":1080}));
+        .unwrap_or_else(|_| json!({"baseWidth": 1920, "baseHeight": 1080}));
     let width = video
         .get("baseWidth")
-        .and_then(|v| v.as_i64())
+        .and_then(Value::as_i64)
         .unwrap_or(1920);
     let height = video
         .get("baseHeight")
-        .and_then(|v| v.as_i64())
+        .and_then(Value::as_i64)
         .unwrap_or(1080);
-    let settings = json!({"url":widget_url,"width":width,"height":height,"reroute_audio":true,"shutdown":false,"restart_when_active":false});
+
+    // reroute_audio обязателен: без него звук алерта идёт мимо микшера OBS,
+    // и зрители его не услышат.
+    let settings = json!({
+        "url": widget_url,
+        "width": width,
+        "height": height,
+        "reroute_audio": cfg.reroute_audio,
+        "shutdown": false,
+        "restart_when_active": false,
+    });
+
     let inputs = st.obs.request("GetInputList", json!({})).await?;
     let existing = inputs
         .get("inputs")
-        .and_then(|v| v.as_array())
+        .and_then(Value::as_array)
         .into_iter()
         .flatten()
-        .find(|i| i.get("inputName").and_then(|v| v.as_str()) == Some(&cfg.input_name))
+        .find(|i| i.get("inputName").and_then(Value::as_str) == Some(&cfg.input_name))
         .cloned();
+
     if let Some(inp) = existing {
-        if inp.get("inputKind").and_then(|v| v.as_str()) != Some("browser_source") {
+        if inp.get("inputKind").and_then(Value::as_str) != Some("browser_source") {
             return Err(anyhow!(
-                "Имя {} уже занято источником другого типа. Переименуйте его в OBS или измените config.",
+                "Имя {} уже занято источником другого типа. Переименуйте его в OBS или измените input_name в config/host.json.",
                 cfg.input_name
             ));
         }
         st.obs
             .request(
                 "SetInputSettings",
-                json!({"inputName":cfg.input_name,"inputSettings":settings,"overlay":true}),
+                json!({"inputName": cfg.input_name, "inputSettings": settings, "overlay": true}),
             )
             .await?;
     } else {
-        st.obs.request("CreateInput", json!({"sceneName":cfg.overlay_scene_name,"inputName":cfg.input_name,"inputKind":"browser_source","inputSettings":settings,"sceneItemEnabled":true})).await?;
-        st.obs.request("SetInputVolume", json!({"inputName":cfg.input_name,"inputVolumeMul":db_to_mul(cfg.initial_volume_db)})).await.ok();
         st.obs
             .request(
-                "SetInputMute",
-                json!({"inputName":cfg.input_name,"inputMuted":false}),
+                "CreateInput",
+                json!({
+                    "sceneName": cfg.overlay_scene_name,
+                    "inputName": cfg.input_name,
+                    "inputKind": "browser_source",
+                    "inputSettings": settings,
+                    "sceneItemEnabled": true,
+                }),
             )
+            .await?;
+        st.obs
+            .batch(vec![
+                BatchItem::new(
+                    "SetInputVolume",
+                    json!({"inputName": cfg.input_name, "inputVolumeMul": db_to_mul(cfg.initial_volume_db)}),
+                ),
+                BatchItem::new(
+                    "SetInputMute",
+                    json!({"inputName": cfg.input_name, "inputMuted": false}),
+                ),
+            ])
             .await
             .ok();
     }
+
+    // Мониторинг выключаем: иначе актёр слышит алерт в наушниках дважды.
     st.obs
         .request(
             "SetInputAudioMonitorType",
-            json!({"inputName":cfg.input_name,"monitorType":"OBS_MONITORING_TYPE_NONE"}),
+            json!({"inputName": cfg.input_name, "monitorType": "OBS_MONITORING_TYPE_NONE"}),
         )
         .await
         .ok();
-    let scene_list = st.obs.request("GetSceneList", json!({})).await?;
+
     let mut added = 0;
     let mut present = 0;
-    for s in scene_list
-        .get("scenes")
-        .and_then(|v| v.as_array())
-        .into_iter()
-        .flatten()
-    {
-        let Some(scene) = s.get("sceneName").and_then(|v| v.as_str()) else {
-            continue;
-        };
-        if scene == cfg.overlay_scene_name {
-            continue;
-        };
-        let items = st
-            .obs
-            .request("GetSceneItemList", json!({"sceneName":scene}))
-            .await?;
-        let found = items
-            .get("sceneItems")
-            .and_then(|v| v.as_array())
+    if cfg.enforce_overlays {
+        let scene_list = st.obs.request("GetSceneList", json!({})).await?;
+        let scenes: Vec<String> = scene_list
+            .get("scenes")
+            .and_then(Value::as_array)
             .into_iter()
             .flatten()
-            .find(|i| {
-                i.get("sourceName").and_then(|v| v.as_str()) == Some(&cfg.overlay_scene_name)
-            });
-        if let Some(item) = found {
-            present += 1;
-            if let Some(id) = item.get("sceneItemId").and_then(|v| v.as_i64()) {
+            .filter_map(|s| {
+                s.get("sceneName")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            })
+            .filter(|s| s != &cfg.overlay_scene_name)
+            .collect();
+
+        for scene in scenes {
+            let items = st
+                .obs
+                .request("GetSceneItemList", json!({"sceneName": scene}))
+                .await?;
+            let found = items
+                .get("sceneItems")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .find(|i| {
+                    i.get("sourceName").and_then(Value::as_str) == Some(&cfg.overlay_scene_name)
+                })
+                .and_then(|i| i.get("sceneItemId").and_then(Value::as_i64));
+
+            let id = match found {
+                Some(id) => {
+                    present += 1;
+                    Some(id)
+                }
+                None => {
+                    let r = st
+                        .obs
+                        .request(
+                            "CreateSceneItem",
+                            json!({
+                                "sceneName": scene,
+                                "sourceName": cfg.overlay_scene_name,
+                                "sceneItemEnabled": true,
+                            }),
+                        )
+                        .await?;
+                    added += 1;
+                    r.get("sceneItemId").and_then(Value::as_i64)
+                }
+            };
+            // Индекс 0 — верхний слой, иначе алерт окажется под игрой или камерой.
+            if let Some(id) = id {
                 st.obs
                     .request(
                         "SetSceneItemIndex",
-                        json!({"sceneName":scene,"sceneItemId":id,"sceneItemIndex":0}),
-                    )
-                    .await
-                    .ok();
-            }
-        } else {
-            let r=st.obs.request("CreateSceneItem", json!({"sceneName":scene,"sourceName":cfg.overlay_scene_name,"sceneItemEnabled":true})).await?;
-            added += 1;
-            if let Some(id) = r.get("sceneItemId").and_then(|v| v.as_i64()) {
-                st.obs
-                    .request(
-                        "SetSceneItemIndex",
-                        json!({"sceneName":scene,"sceneItemId":id,"sceneItemIndex":0}),
+                        json!({"sceneName": scene, "sceneItemId": id, "sceneItemIndex": 0}),
                     )
                     .await
                     .ok();
             }
         }
     }
-    Ok(
-        json!({"ready":true,"overlay_scene":cfg.overlay_scene_name,"input_name":cfg.input_name,"widget_url":"configured","reroute_audio":true,"scenes_already_had_overlay":present,"scenes_added_overlay":added}),
-    )
+
+    Ok(json!({
+        "ready": true,
+        "overlay_scene": cfg.overlay_scene_name,
+        "input_name": cfg.input_name,
+        "widget_url": "configured",
+        "reroute_audio": cfg.reroute_audio,
+        "scenes_already_had_overlay": present,
+        "scenes_added_overlay": added,
+    }))
 }
 
 async fn da_oauth_start(State(st): State<AppState>, headers: HeaderMap) -> ApiResult<Value> {
-    require_auth(&headers)?;
+    require_auth(&st, &headers).await?;
     let c = &st.cfg.donationalerts;
     if c.client_id.is_empty() || c.redirect_uri.is_empty() {
         return Err(bad(
-            "Заполните donationalerts.client_id/client_secret/redirect_uri в config/host.json.",
+            "Заполните donationalerts.client_id, client_secret и redirect_uri в config/host.json.",
         ));
     }
-    let scope = c.oauth_scopes.join(" ");
+    let state_token = random_secret_b64(16);
+    *st.oauth_state.write().await = Some(state_token.clone());
     let url = format!(
-        "https://www.donationalerts.com/oauth/authorize?client_id={}&redirect_uri={}&response_type=code&scope={}",
+        "https://www.donationalerts.com/oauth/authorize?client_id={}&redirect_uri={}&response_type=code&scope={}&state={}",
         urlencoding::encode(&c.client_id),
         urlencoding::encode(&c.redirect_uri),
-        urlencoding::encode(&scope)
+        urlencoding::encode(&c.oauth_scopes.join(" ")),
+        urlencoding::encode(&state_token),
     );
-    Ok(Json(json!({"authorize_url":url})))
+    Ok(Json(json!({"authorize_url": url})))
 }
+
 async fn da_oauth_callback(
     State(st): State<AppState>,
     Query(q): Query<HashMap<String, String>>,
 ) -> Response {
     let Some(code) = q.get("code") else {
-        return Html("DonationAlerts: authorization code missing").into_response();
+        return Html("DonationAlerts: в ответе нет authorization code.").into_response();
     };
+    // Проверка state: без неё кто угодно в tailnet мог бы подсунуть чужой код.
+    let expected = st.oauth_state.write().await.take();
+    match (expected, q.get("state")) {
+        (Some(expected), Some(got)) if secret_eq(&expected, got) => {}
+        _ => {
+            warn!("DonationAlerts OAuth: неверный state, код отклонён");
+            return Html(
+                "DonationAlerts: проверка state не пройдена. Начните подключение заново из панели.",
+            )
+            .into_response();
+        }
+    }
+
     let c = &st.cfg.donationalerts;
     let form = [
         ("grant_type", "authorization_code"),
@@ -719,13 +1372,14 @@ async fn da_oauth_callback(
         .await
     {
         Ok(r) => match r.json::<Value>().await {
-            Ok(v) => {
+            Ok(v) if v.get("access_token").is_some() => {
                 if save_secret("donationalerts_tokens", &v.to_string()).is_ok() {
                     Html("DonationAlerts подключён. Можно закрыть эту вкладку.").into_response()
                 } else {
-                    Html("DonationAlerts token получен, но не сохранён.").into_response()
+                    Html("DonationAlerts: токен получен, но сохранить не удалось.").into_response()
                 }
             }
+            Ok(_) => Html("DonationAlerts: token endpoint не вернул access_token.").into_response(),
             Err(_) => {
                 Html("DonationAlerts: не удалось прочитать ответ token endpoint.").into_response()
             }
@@ -735,18 +1389,24 @@ async fn da_oauth_callback(
 }
 
 async fn twitch_status(State(st): State<AppState>, headers: HeaderMap) -> ApiResult<Value> {
-    require_auth(&headers)?;
+    require_auth(&st, &headers).await?;
     Ok(Json(twitch_status_value(&st).await))
 }
+
 async fn twitch_status_value(st: &AppState) -> Value {
     if st.cfg.twitch.client_id.is_empty() {
-        return json!({"enabled":st.cfg.twitch.enabled,"configured":false,"connected":false,"message":"Укажите twitch.client_id в config/host.json"});
-    };
+        return json!({
+            "enabled": st.cfg.twitch.enabled,
+            "configured": false,
+            "connected": false,
+            "message": "Укажите twitch.client_id в config/host.json",
+        });
+    }
     match load_secret("twitch_tokens").ok().flatten() {
-        None => json!({"enabled":true,"configured":true,"connected":false}),
+        None => json!({"enabled": true, "configured": true, "connected": false}),
         Some(tok) => {
-            let v: Value = serde_json::from_str(&tok).unwrap_or(json!({}));
-            let access = v.get("access_token").and_then(|v| v.as_str()).unwrap_or("");
+            let v: Value = serde_json::from_str(&tok).unwrap_or_else(|_| json!({}));
+            let access = v.get("access_token").and_then(Value::as_str).unwrap_or("");
             match st
                 .http
                 .get("https://id.twitch.tv/oauth2/validate")
@@ -755,23 +1415,28 @@ async fn twitch_status_value(st: &AppState) -> Value {
                 .await
             {
                 Ok(r) if r.status().is_success() => {
-                    json!({"enabled":true,"configured":true,"connected":true})
+                    json!({"enabled": true, "configured": true, "connected": true})
                 }
-                _ => {
-                    json!({"enabled":true,"configured":true,"connected":false,"message":"Twitch token устарел или недоступен"})
-                }
+                _ => json!({
+                    "enabled": true,
+                    "configured": true,
+                    "connected": false,
+                    "message": "Twitch token устарел или недоступен",
+                }),
             }
         }
     }
 }
+
 async fn twitch_device_start(State(st): State<AppState>, headers: HeaderMap) -> ApiResult<Value> {
-    require_auth(&headers)?;
+    require_auth(&st, &headers).await?;
     if st.cfg.twitch.client_id.is_empty() {
         return Err(bad("Укажите twitch.client_id в config/host.json"));
-    };
+    }
+    let scopes = st.cfg.twitch.scopes.join(" ");
     let form = [
         ("client_id", st.cfg.twitch.client_id.as_str()),
-        ("scopes", st.cfg.twitch.scopes.join(" ").leak()),
+        ("scopes", scopes.as_str()),
     ];
     let v = st
         .http
@@ -783,18 +1448,17 @@ async fn twitch_device_start(State(st): State<AppState>, headers: HeaderMap) -> 
         .json::<Value>()
         .await
         .map_err(|e| err("Twitch вернул непонятный ответ", e.into()))?;
-    save_secret(
-        "twitch_device_code",
-        v.get("device_code").and_then(|v| v.as_str()).unwrap_or(""),
-    )
-    .ok();
+    if let Some(code) = v.get("device_code").and_then(Value::as_str) {
+        save_secret("twitch_device_code", code).ok();
+    }
     Ok(Json(v))
 }
+
 async fn twitch_device_check(State(st): State<AppState>, headers: HeaderMap) -> ApiResult<Value> {
-    require_auth(&headers)?;
+    require_auth(&st, &headers).await?;
     let dc = load_secret("twitch_device_code")
-        .map_err(|e| err("Device code не найден", e))?
-        .ok_or_else(|| bad("Сначала нажмите Подключить Twitch"))?;
+        .map_err(|e| err("Не удалось прочитать device code", e))?
+        .ok_or_else(|| bad("Сначала нажмите «Подключить Twitch»"))?;
     let form = [
         ("client_id", st.cfg.twitch.client_id.as_str()),
         ("device_code", dc.as_str()),
@@ -806,7 +1470,7 @@ async fn twitch_device_check(State(st): State<AppState>, headers: HeaderMap) -> 
         .form(&form)
         .send()
         .await
-        .map_err(|e| err("Не удалось проверить Twitch authorization", e.into()))?
+        .map_err(|e| err("Не удалось проверить авторизацию Twitch", e.into()))?
         .json::<Value>()
         .await
         .map_err(|e| err("Twitch вернул непонятный token response", e.into()))?;
@@ -817,12 +1481,13 @@ async fn twitch_device_check(State(st): State<AppState>, headers: HeaderMap) -> 
     }
     Ok(Json(v))
 }
+
 async fn twitch_user(st: &AppState) -> Result<(String, String)> {
     let tok = load_secret("twitch_tokens")?.ok_or_else(|| anyhow!("Twitch не подключён"))?;
     let v: Value = serde_json::from_str(&tok)?;
     let access = v
         .get("access_token")
-        .and_then(|v| v.as_str())
+        .and_then(Value::as_str)
         .ok_or_else(|| anyhow!("access_token отсутствует"))?;
     let val: Value = st
         .http
@@ -834,13 +1499,14 @@ async fn twitch_user(st: &AppState) -> Result<(String, String)> {
         .await?;
     let uid = val
         .get("user_id")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| anyhow!("user_id отсутствует"))?
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("Twitch не вернул user_id — вероятно, токен истёк"))?
         .to_string();
     Ok((access.to_string(), uid))
 }
+
 async fn twitch_channel_get(State(st): State<AppState>, headers: HeaderMap) -> ApiResult<Value> {
-    require_auth(&headers)?;
+    require_auth(&st, &headers).await?;
     let (access, uid) = twitch_user(&st)
         .await
         .map_err(|e| err("Twitch не подключён", e))?;
@@ -855,15 +1521,16 @@ async fn twitch_channel_get(State(st): State<AppState>, headers: HeaderMap) -> A
         .map_err(|e| err("Twitch channel недоступен", e.into()))?
         .json::<Value>()
         .await
-        .map_err(|e| err("Twitch channel response непонятен", e.into()))?;
+        .map_err(|e| err("Непонятный ответ Twitch channel", e.into()))?;
     Ok(Json(v))
 }
+
 async fn twitch_channel_modify(
     State(st): State<AppState>,
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> ApiResult<Value> {
-    require_auth(&headers)?;
+    require_auth(&st, &headers).await?;
     let (access, uid) = twitch_user(&st)
         .await
         .map_err(|e| err("Twitch не подключён", e))?;
@@ -876,42 +1543,99 @@ async fn twitch_channel_modify(
         .json(&body)
         .send()
         .await
-        .map_err(|e| err("Не удалось изменить Twitch channel", e.into()))?;
-    Ok(Json(
-        json!({"ok":r.status().is_success(),"status":r.status().as_u16()}),
-    ))
+        .map_err(|e| err("Не удалось изменить канал Twitch", e.into()))?;
+    let status = r.status();
+    // Twitch отвечает 204 без тела, поэтому текст читаем только при ошибке.
+    let detail = if status.is_success() {
+        Value::Null
+    } else {
+        Value::String(r.text().await.unwrap_or_default())
+    };
+    Ok(Json(json!({
+        "ok": status.is_success(),
+        "status": status.as_u16(),
+        "detail": detail,
+    })))
 }
+
 async fn twitch_marker(
     State(st): State<AppState>,
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> ApiResult<Value> {
-    require_auth(&headers)?;
+    require_auth(&st, &headers).await?;
     let (access, uid) = twitch_user(&st)
         .await
         .map_err(|e| err("Twitch не подключён", e))?;
     let description = body
         .get("description")
-        .and_then(|v| v.as_str())
+        .and_then(Value::as_str)
         .unwrap_or("");
     let v = st
         .http
         .post("https://api.twitch.tv/helix/streams/markers")
         .header("Client-Id", &st.cfg.twitch.client_id)
         .bearer_auth(access)
-        .json(&json!({"user_id":uid,"description":description}))
+        .json(&json!({"user_id": uid, "description": description}))
         .send()
         .await
         .map_err(|e| err("Не удалось создать Twitch marker", e.into()))?
         .json::<Value>()
         .await
-        .map_err(|e| err("Twitch marker response непонятен", e.into()))?;
+        .map_err(|e| err("Непонятный ответ Twitch marker", e.into()))?;
     Ok(Json(v))
 }
 
-trait Pipe: Sized {
-    fn pipe<T>(self, f: impl FnOnce(Self) -> T) -> T {
-        f(self)
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::HeaderValue;
+
+    fn headers_with_cookie(value: &str) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert("cookie", HeaderValue::from_str(value).unwrap());
+        h
+    }
+
+    #[test]
+    fn cookie_parses_target_among_many() {
+        let h = headers_with_cookie("a=1; rsc_session=token-value; b=2");
+        assert_eq!(cookie(&h, "rsc_session").as_deref(), Some("token-value"));
+    }
+
+    #[test]
+    fn cookie_absent_returns_none() {
+        let h = headers_with_cookie("other=1");
+        assert!(cookie(&h, "rsc_session").is_none());
+    }
+
+    #[test]
+    fn secret_eq_rejects_different_lengths_and_values() {
+        assert!(secret_eq("abcdef", "abcdef"));
+        assert!(!secret_eq("abcdef", "abcdeg"));
+        assert!(!secret_eq("abcdef", "abcde"));
+        assert!(!secret_eq("", "x"));
+    }
+
+    #[test]
+    fn login_guard_blocks_after_repeated_failures() {
+        let mut g = LoginGuard::default();
+        for _ in 0..(MAX_LOGIN_FAILURES - 1) {
+            g.record_failure();
+            assert!(g.blocked_for().is_none());
+        }
+        g.record_failure();
+        let left = g.blocked_for().expect("блокировка включилась");
+        assert!(left <= LOGIN_BLOCK);
+    }
+
+    #[test]
+    fn login_guard_resets_after_success() {
+        let mut g = LoginGuard::default();
+        g.record_failure();
+        g.record_failure();
+        g.record_success();
+        assert!(g.blocked_for().is_none());
+        assert_eq!(g.failures, 0);
     }
 }
-impl<T> Pipe for T {}

@@ -1,1 +1,383 @@
-:root{color-scheme:light dark;--bg:#0f172a;--fg:#f8fafc;--card:#172033;--muted:#cbd5e1;--accent:#93c5fd;--danger:#fca5a5;--ok:#86efac}body{margin:0;font-family:system-ui,-apple-system,Segoe UI,Arial,sans-serif;background:var(--bg);color:var(--fg);line-height:1.5}header,main{max-width:1100px;margin:0 auto;padding:1rem}header{padding-top:1.5rem}.card{background:var(--card);border:1px solid #334155;border-radius:1rem;padding:1rem;margin:1rem 0;box-shadow:0 4px 16px #0004}.two button{margin-right:.5rem}button,input,select{font:inherit;margin:.25rem 0;padding:.55rem .7rem;border-radius:.5rem;border:1px solid #64748b}button{cursor:pointer;background:#2563eb;color:white;border-color:#60a5fa}button:hover,button:focus{outline:3px solid var(--accent);outline-offset:2px}button.danger{background:#991b1b}input,select{background:#020617;color:var(--fg);min-width:16rem}label{display:block;margin-top:.5rem;font-weight:600}fieldset{border:1px solid #475569;border-radius:.75rem;margin:.75rem 0;padding:.75rem}legend{font-weight:700}pre{white-space:pre-wrap;background:#020617;border:1px solid #334155;border-radius:.5rem;padding:.75rem;max-height:18rem;overflow:auto}dl{display:grid;grid-template-columns:minmax(10rem,18rem) 1fr;gap:.35rem .75rem}dt{font-weight:700;color:var(--muted)}dd{margin:0}.source,.audio-row{border-top:1px solid #334155;padding:.6rem 0}.status-ok{color:var(--ok);font-weight:700}.status-bad{color:var(--danger);font-weight:700}.skip{position:absolute;left:-999px;top:auto}.skip:focus{left:1rem;top:1rem;background:#fff;color:#000;padding:.5rem;z-index:10}.sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}a{color:var(--accent)}@media (prefers-color-scheme:light){:root{--bg:#f8fafc;--fg:#0f172a;--card:#ffffff;--muted:#334155;--accent:#1d4ed8;--danger:#991b1b;--ok:#166534}input,select,pre{background:#fff;color:#0f172a}}
+/*
+ * Remote Stream Control — оформление панели.
+ *
+ * Панелью пользуются в том числе через экранный диктор NVDA, поэтому здесь
+ * важнее структура и контраст, чем украшения:
+ *  - ничего не передаётся одним лишь цветом, всегда есть текст;
+ *  - фокус виден всегда и толстой рамкой;
+ *  - .sr-only прячет текст визуально, но оставляет его скринридеру;
+ *  - размеры в rem, чтобы масштаб шрифта в браузере реально работал.
+ */
+
+:root {
+  --bg: #f4f6f8;
+  --surface: #ffffff;
+  --border: #c3ccd6;
+  --text: #14181d;
+  --text-muted: #4a5563;
+  --accent: #0b5cad;
+  --accent-text: #ffffff;
+  --danger: #a4232b;
+  --danger-text: #ffffff;
+  --ok: #1c6b3a;
+  --warn: #8a5a00;
+  --focus: #b8560f;
+  --radius: 8px;
+  --gap: 0.75rem;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #14181d;
+    --surface: #1e242b;
+    --border: #3d4750;
+    --text: #f2f5f8;
+    --text-muted: #b3bdc7;
+    --accent: #63a9f0;
+    --accent-text: #0b1620;
+    --danger: #ff9a9f;
+    --danger-text: #2a0d0f;
+    --ok: #74d69b;
+    --warn: #ecc06a;
+    --focus: #ffb066;
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  padding: 0 0 3rem;
+  background: var(--bg);
+  color: var(--text);
+  font: 1rem/1.5 "Segoe UI", system-ui, -apple-system, sans-serif;
+}
+
+/* Ссылка «перейти к управлению»: видна только при получении фокуса. */
+.skip {
+  position: absolute;
+  left: -9999px;
+  top: 0;
+  z-index: 10;
+  padding: 0.75rem 1rem;
+  background: var(--accent);
+  color: var(--accent-text);
+  font-weight: 600;
+}
+.skip:focus {
+  left: 0;
+}
+
+/* Текст только для скринридера: убираем со страницы, но не из дерева
+   доступности. display:none или visibility:hidden скрыли бы его и от NVDA. */
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+  border: 0;
+}
+
+header {
+  padding: 1.25rem 1rem;
+  background: var(--surface);
+  border-bottom: 2px solid var(--border);
+}
+header h1 {
+  margin: 0 0 0.25rem;
+  font-size: 1.5rem;
+}
+header p {
+  margin: 0;
+  color: var(--text-muted);
+}
+
+main {
+  max-width: 60rem;
+  margin: 0 auto;
+  padding: 1rem;
+  display: grid;
+  gap: 1rem;
+}
+
+.card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 1rem;
+}
+.card > h2 {
+  margin: 0 0 0.75rem;
+  font-size: 1.2rem;
+  border-bottom: 1px solid var(--border);
+  padding-bottom: 0.5rem;
+}
+.card > h3 {
+  margin: 1rem 0 0.5rem;
+  font-size: 1.05rem;
+}
+
+/* Ряды кнопок: перенос вместо горизонтальной прокрутки. */
+.card.two {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--gap);
+  align-items: center;
+}
+.card.two > h2 {
+  flex-basis: 100%;
+}
+
+button {
+  font: inherit;
+  font-weight: 600;
+  min-height: 2.75rem;
+  padding: 0.5rem 1rem;
+  margin: 0 0.375rem 0.375rem 0;
+  background: var(--accent);
+  color: var(--accent-text);
+  border: 1px solid transparent;
+  border-radius: var(--radius);
+  cursor: pointer;
+}
+button:hover {
+  filter: brightness(1.1);
+}
+button[data-variant="danger"] {
+  background: var(--danger);
+  color: var(--danger-text);
+}
+button[data-variant="quiet"] {
+  background: transparent;
+  color: var(--text);
+  border-color: var(--border);
+}
+button:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+/* Толстая, всегда заметная рамка фокуса — важнее эстетики. */
+:is(button, input, select, a, [tabindex]):focus-visible {
+  outline: 3px solid var(--focus);
+  outline-offset: 2px;
+}
+
+label {
+  display: inline-block;
+  margin: 0.5rem 0.5rem 0.25rem 0;
+  font-weight: 600;
+}
+
+input,
+select {
+  font: inherit;
+  min-height: 2.75rem;
+  padding: 0.4rem 0.6rem;
+  max-width: 100%;
+  color: var(--text);
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+}
+input[type="number"] {
+  width: 7rem;
+}
+input[type="url"],
+input[type="text"],
+input:not([type]) {
+  width: min(100%, 30rem);
+}
+
+fieldset {
+  margin: 1rem 0 0;
+  padding: 0.75rem;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+}
+legend {
+  padding: 0 0.4rem;
+  font-weight: 600;
+}
+
+a {
+  color: var(--accent);
+}
+
+dl {
+  margin: 0;
+  display: grid;
+  grid-template-columns: minmax(8rem, max-content) 1fr;
+  gap: 0.35rem 1rem;
+}
+dt {
+  font-weight: 600;
+  color: var(--text-muted);
+}
+dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+pre {
+  margin: 0;
+  padding: 0.75rem;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  overflow-x: auto;
+  font-size: 0.9rem;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+ul {
+  margin: 0.5rem 0 0;
+  padding-left: 1.25rem;
+}
+li {
+  margin-bottom: 0.35rem;
+}
+
+/* Строка источника или аудиовхода. */
+.source,
+.audio-row {
+  padding: 0.75rem;
+  margin-bottom: 0.75rem;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg);
+}
+.source h3,
+.audio-row h3 {
+  margin: 0 0 0.35rem;
+  font-size: 1rem;
+}
+.source p,
+.audio-row p {
+  margin: 0 0 0.5rem;
+  color: var(--text-muted);
+}
+
+/* Состояния подписываем словом, не только цветом. */
+.state {
+  display: inline-block;
+  padding: 0.15rem 0.5rem;
+  border-radius: var(--radius);
+  border: 1px solid currentColor;
+  font-weight: 600;
+  font-size: 0.9rem;
+}
+.state[data-state="ok"] {
+  color: var(--ok);
+}
+/* «Выключено» — не ошибка и не предупреждение, а спокойное состояние
+   покоя: буфер повтора или Studio Mode обычно и должны быть выключены. */
+.state[data-state="off"] {
+  color: var(--text-muted);
+}
+.state[data-state="bad"] {
+  color: var(--danger);
+}
+.state[data-state="warn"] {
+  color: var(--warn);
+}
+
+.toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--gap);
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 0.5rem;
+}
+
+.notice {
+  margin: 0.5rem 0 0;
+  padding: 0.6rem 0.75rem;
+  border-left: 4px solid var(--warn);
+  background: var(--bg);
+  color: var(--text);
+}
+.notice[data-kind="error"] {
+  border-left-color: var(--danger);
+}
+
+.empty {
+  color: var(--text-muted);
+  font-style: italic;
+}
+
+/* Пояснения под заголовками разделов: почему кнопка делает то, что делает. */
+.hint {
+  margin: 0 0 0.6rem;
+  color: var(--text-muted);
+  font-size: 0.9rem;
+  max-width: 60ch;
+}
+
+/* Уровень звука. Моноширинный, чтобы число не прыгало четыре раза в секунду. */
+.level {
+  font-family: ui-monospace, "Cascadia Mono", Consolas, monospace;
+  font-variant-numeric: tabular-nums;
+  color: var(--text);
+}
+
+.check {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  margin-left: 0.5rem;
+}
+.check input {
+  width: 1.1rem;
+  height: 1.1rem;
+}
+
+#previewBox {
+  margin-top: var(--gap);
+}
+#previewBox img {
+  max-width: 100%;
+  height: auto;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: #000;
+}
+#previewBox p {
+  margin: 0.35rem 0 0;
+}
+
+/* Выключенная кнопка обязана выглядеть выключенной, а не просто не работать. */
+button:disabled,
+select:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  * {
+    transition: none !important;
+    animation: none !important;
+  }
+}
+
+@media (max-width: 30rem) {
+  dl {
+    grid-template-columns: 1fr;
+    gap: 0.1rem;
+  }
+  dt {
+    margin-top: 0.5rem;
+  }
+  button {
+    width: 100%;
+    margin-right: 0;
+  }
+}

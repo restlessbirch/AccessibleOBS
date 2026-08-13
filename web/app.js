@@ -1,50 +1,993 @@
+'use strict';
+
+/*
+ * Панель Remote Stream Control.
+ *
+ * Два принципа, от которых лучше не отступать при правках:
+ *
+ * 1. Никакого innerHTML с данными. Имена сцен и источников задаёт актёр
+ *    в OBS, а список донатов приходит из интернета. Строка вида
+ *    <img src=x onerror=…> в имени источника выполнила бы скрипт прямо
+ *    в панели владельца, у которой есть сессионная кука. Поэтому весь DOM
+ *    собирается через el() и textContent.
+ *
+ * 2. Состояние приходит событиями, а не опросом. EventSource слушает
+ *    /api/events, куда агент шлёт события OBS и донаты. Опрос остаётся
+ *    только как ручная кнопка «Обновить».
+ */
+
 const $ = (id) => document.getElementById(id);
-let currentScene = '';
-function say(text){ $('live').textContent = text; }
-function pretty(v){ return JSON.stringify(v, null, 2); }
-async function api(path, opts={}){
-  const res = await fetch(path, {credentials:'same-origin', headers:{'content-type':'application/json', ...(opts.headers||{})}, ...opts});
-  const txt = await res.text(); let data; try{ data = txt ? JSON.parse(txt) : {}; }catch{ data = {raw:txt}; }
-  if(res.status === 401){ showLogin(true); throw new Error(data?.error?.message || 'Требуется pairing'); }
-  if(!res.ok){ throw new Error(data?.error?.message || data?.message || `HTTP ${res.status}`); }
+
+/** Безопасное создание узла: текст всегда попадает через textContent. */
+function el(tag, props = {}, children = []) {
+  const node = document.createElement(tag);
+  for (const [key, value] of Object.entries(props)) {
+    if (value === null || value === undefined) continue;
+    if (key === 'text') node.textContent = String(value);
+    else if (key === 'onClick') node.addEventListener('click', value);
+    else if (key in node) node[key] = value;
+    else node.setAttribute(key, String(value));
+  }
+  for (const child of [].concat(children)) {
+    if (child) node.append(child);
+  }
+  return node;
+}
+
+function button(text, onClick, variant) {
+  return el('button', { type: 'button', text, onClick, 'data-variant': variant });
+}
+
+function replace(container, nodes) {
+  container.replaceChildren(...[].concat(nodes).filter(Boolean));
+}
+
+/** Вежливое сообщение: NVDA прочитает, не прерывая текущую фразу. */
+function say(text) {
+  $('live').textContent = text;
+}
+/** Настойчивое сообщение — для ошибок и донатов. */
+function announce(text) {
+  $('alerts').textContent = text;
+}
+
+function fail(error) {
+  const message = error?.message || String(error);
+  announce('Ошибка: ' + message);
+}
+
+// ---------------------------------------------------------------- API
+
+async function api(path, options = {}) {
+  const res = await fetch(path, {
+    credentials: 'same-origin',
+    headers: { 'content-type': 'application/json', ...(options.headers || {}) },
+    ...options,
+  });
+  const text = await res.text();
+  let data = {};
+  if (text) {
+    try {
+      data = JSON.parse(text);
+    } catch {
+      data = { raw: text };
+    }
+  }
+  if (res.status === 401) {
+    showLogin(true);
+    throw new Error(data?.error?.message || 'Требуется pairing-код');
+  }
+  if (!res.ok) {
+    throw new Error(data?.error?.message || data?.message || `HTTP ${res.status}`);
+  }
   return data;
 }
-function showLogin(show){ $('login').hidden = !show; if(show) $('pairingSecret').focus(); }
-function renderDl(el, obj){ el.innerHTML=''; Object.entries(obj||{}).forEach(([k,v])=>{ const dt=document.createElement('dt'); dt.textContent=k; const dd=document.createElement('dd'); dd.textContent=typeof v==='object'?pretty(v):String(v); el.append(dt,dd); }); }
-async function checkAuth(){ const s=await api('/api/auth/status').catch(()=>({authenticated:false})); showLogin(!s.authenticated); if(s.authenticated) await refreshAll(); }
-$('loginForm').addEventListener('submit', async e=>{ e.preventDefault(); try{ await api('/api/auth/login',{method:'POST',body:JSON.stringify({secret:$('pairingSecret').value})}); showLogin(false); say('Панель подключена'); await refreshAll(); }catch(err){ alert(err.message); }});
-async function refreshAll(){ await Promise.allSettled([refreshHealth(), refreshObs(), refreshScenes(), refreshAudio(), refreshStats(), refreshDa(), refreshTwitch(), refreshDonations()]); }
-async function refreshHealth(){ try{ const h=await api('/api/health'); renderDl($('health'), h); }catch(e){ renderDl($('health'), {Ошибка:e.message}); }}
-async function refreshObs(){ try{ $('obsStatus').textContent=pretty(await api('/api/obs')); }catch(e){ $('obsStatus').textContent=e.message; }}
-async function refreshScenes(){ try{ const data=await api('/api/obs/scenes'); const scenes=data.scenes||[]; currentScene=data.currentProgramSceneName||''; $('sceneSelect').innerHTML=''; $('sceneList').innerHTML=''; scenes.forEach(s=>{ const name=s.sceneName; const opt=document.createElement('option'); opt.value=name; opt.textContent=name+(name===currentScene?' — текущая':''); opt.selected=name===currentScene; $('sceneSelect').append(opt); const li=document.createElement('li'); li.textContent=name+(name===currentScene?' — текущая':''); $('sceneList').append(li); }); await refreshSources(); }catch(e){ $('sceneList').innerHTML=`<li>${e.message}</li>`; }}
-$('setScene').onclick=async()=>{ const scene=$('sceneSelect').value; try{ await api('/api/obs/scenes/current',{method:'POST',body:JSON.stringify({sceneName:scene})}); currentScene=scene; say('Сцена изменена: '+scene); await refreshScenes(); }catch(e){ alert(e.message); }};
-async function refreshSources(){ if(!currentScene) return; const box=$('sources'); box.innerHTML=''; try{ const data=await api('/api/obs/sources?scene='+encodeURIComponent(currentScene)); (data.sceneItems||[]).forEach(it=>{ const div=document.createElement('div'); div.className='source'; const name=it.sourceName; const enabled=!!it.sceneItemEnabled; div.innerHTML=`<h3>${name}</h3><p>Состояние: ${enabled?'видим':'скрыт'}</p>`; const show=document.createElement('button'); show.textContent='Показать'; show.onclick=()=>setSource(name,true); const hide=document.createElement('button'); hide.textContent='Скрыть'; hide.onclick=()=>setSource(name,false); div.append(show, hide); box.append(div); }); }catch(e){ box.textContent=e.message; }}
-async function setSource(name, enabled){ try{ await api('/api/obs/source/visibility',{method:'POST',body:JSON.stringify({sceneName:currentScene,sourceName:name,enabled})}); say(`${name}: ${enabled?'показан':'скрыт'}`); await refreshSources(); }catch(e){ alert(e.message); }}
-async function refreshAudio(){ const box=$('audio'); box.innerHTML=''; try{ const data=await api('/api/obs/audio'); (data.audio||[]).forEach(a=>{ const row=document.createElement('div'); row.className='audio-row'; const name=a.inputName; const db=Number(a.volumeDb||0).toFixed(1); row.innerHTML=`<h3>${name}</h3><p>Mute: ${a.muted?'да':'нет'}. Громкость: ${db} dB.</p>`; const mute=btn('Mute',()=>audioMute(name,true)); const unmute=btn('Unmute',()=>audioMute(name,false)); const down=btn('-1 dB',()=>audioVol(name,Number(a.volumeDb||0)-1)); const up=btn('+1 dB',()=>audioVol(name,Number(a.volumeDb||0)+1)); const input=document.createElement('input'); input.type='number'; input.step='0.5'; input.value=db; input.setAttribute('aria-label',`Громкость ${name} dB`); const set=btn('Установить dB',()=>audioVol(name,Number(input.value))); row.append(mute,unmute,down,up,input,set); box.append(row); }); }catch(e){ box.textContent=e.message; }}
-function btn(text, on){ const b=document.createElement('button'); b.type='button'; b.textContent=text; b.onclick=on; return b; }
-async function audioMute(inputName, muted){ try{ await api('/api/obs/audio/mute',{method:'POST',body:JSON.stringify({inputName,muted})}); say(`${inputName}: ${muted?'mute':'unmute'}`); await refreshAudio(); }catch(e){ alert(e.message); }}
-async function audioVol(inputName, volumeDb){ try{ await api('/api/obs/audio/volume',{method:'POST',body:JSON.stringify({inputName,volumeDb})}); say(`${inputName}: громкость ${volumeDb} dB`); await refreshAudio(); }catch(e){ alert(e.message); }}
-async function cmd(path, msg, confirmText){ if(confirmText && !confirm(confirmText)) return; try{ await api(path,{method:'POST',body:'{}'}); say(msg); }catch(e){ alert(e.message); }}
-$('startStream').onclick=()=>cmd('/api/obs/stream/start','Эфир начат');
-$('stopStream').onclick=()=>cmd('/api/obs/stream/stop','Эфир остановлен','Остановить активный эфир?');
-$('startRecord').onclick=()=>cmd('/api/obs/record/start','Запись начата');
-$('stopRecord').onclick=()=>cmd('/api/obs/record/stop','Запись остановлена');
-$('pauseRecord').onclick=()=>cmd('/api/obs/record/pause','Запись на паузе');
-$('resumeRecord').onclick=()=>cmd('/api/obs/record/resume','Запись продолжена');
-async function refreshStats(){ try{ $('stats').textContent=pretty(await api('/api/obs/stats')); }catch(e){ $('stats').textContent=e.message; }}
-async function refreshDa(){ try{ renderDl($('daStatus'), await api('/api/donationalerts/status')); }catch(e){ renderDl($('daStatus'), {Ошибка:e.message}); }}
-$('daUrlForm').onsubmit=async e=>{ e.preventDefault(); try{ const r=await api('/api/donationalerts/widget-url',{method:'POST',body:JSON.stringify({url:$('daUrl').value})}); $('daUrl').value=''; say('DonationAlerts настроен'); alert(pretty(r)); await refreshDa(); }catch(err){ alert(err.message); }};
-$('daReconcile').onclick=()=>cmd('/api/donationalerts/reconcile','DonationAlerts проверен и восстановлен');
-$('daRefreshWidget').onclick=()=>cmd('/api/donationalerts/widget/refresh','DonationAlerts widget обновлён');
-$('daMute').onclick=()=>api('/api/donationalerts/widget/mute',{method:'POST',body:JSON.stringify({muted:true})}).then(()=>say('DonationAlerts выключен')).catch(e=>alert(e.message));
-$('daUnmute').onclick=()=>api('/api/donationalerts/widget/mute',{method:'POST',body:JSON.stringify({muted:false})}).then(()=>say('DonationAlerts включён')).catch(e=>alert(e.message));
-$('daSetVolume').onclick=()=>api('/api/donationalerts/widget/volume',{method:'POST',body:JSON.stringify({volumeDb:Number($('daVolume').value)})}).then(()=>say('Громкость DonationAlerts изменена')).catch(e=>alert(e.message));
-$('daOauth').onclick=async()=>{ try{ const r=await api('/api/donationalerts/oauth/start',{method:'POST',body:'{}'}); window.open(r.authorize_url,'_blank','noopener'); }catch(e){ alert(e.message); }};
-async function refreshDonations(){ try{ const r=await api('/api/donationalerts/recent'); $('donations').innerHTML=''; (r.donations||[]).forEach(d=>{ const li=document.createElement('li'); li.textContent=`${d.username||'Неизвестно'} — ${d.amount||''} ${d.currency||''}. ${d.message||''}`; $('donations').append(li); }); }catch{} }
-async function refreshTwitch(){ try{ renderDl($('twitchStatus'), await api('/api/twitch/status')); }catch(e){ renderDl($('twitchStatus'), {Ошибка:e.message}); }}
-$('twitchStart').onclick=async()=>{ try{ const r=await api('/api/twitch/device/start',{method:'POST',body:'{}'}); $('twitchDevice').innerHTML=`<p>Откройте <a href="${r.verification_uri||r.verification_uri_complete}" target="_blank" rel="noopener">страницу Twitch Activate</a> и введите код: <strong>${r.user_code||''}</strong></p>`; if(r.verification_uri_complete) window.open(r.verification_uri_complete,'_blank','noopener'); }catch(e){ alert(e.message); }};
-$('twitchCheck').onclick=async()=>{ try{ const r=await api('/api/twitch/device/check',{method:'POST',body:'{}'}); $('twitchDevice').textContent=pretty(r); await refreshTwitch(); }catch(e){ alert(e.message); }};
-$('twitchChannelForm').onsubmit=async e=>{ e.preventDefault(); const body={}; ['streamTitle','streamGame','streamLang'].forEach(id=>{ const el=$(id); if(el.value.trim()) body[el.name||id]=el.value.trim(); }); if(body.streamTitle){ body.title=body.streamTitle; delete body.streamTitle; } try{ await api('/api/twitch/channel',{method:'POST',body:JSON.stringify(body)}); say('Twitch channel обновлён'); }catch(err){ alert(err.message); }};
-$('markerForm').onsubmit=async e=>{ e.preventDefault(); try{ await api('/api/twitch/marker',{method:'POST',body:JSON.stringify({description:$('markerDescription').value})}); say('Twitch marker создан'); }catch(err){ alert(err.message); }};
-$('refreshAll').onclick=refreshAll; $('refreshObs').onclick=refreshObs; $('refreshScenes').onclick=refreshScenes; $('refreshSources').onclick=refreshSources; $('refreshAudio').onclick=refreshAudio; $('refreshStats').onclick=refreshStats;
-checkAuth();
+
+const post = (path, body) =>
+  api(path, { method: 'POST', body: JSON.stringify(body ?? {}) });
+
+/** Запрос к OBS, для которого нет отдельной ручки в API агента. */
+const obsRequest = (requestType, requestData) =>
+  post('/api/obs/request', { requestType, requestData: requestData ?? {} });
+
+// ---------------------------------------------------------------- вход
+
+function showLogin(show) {
+  $('login').hidden = !show;
+  $('panel').hidden = show;
+  if (show) {
+    closeEvents();
+    // Иначе автообновление кадра продолжало бы дёргать API каждые две
+    // секунды после выхода, получая 401 в бесконечном цикле.
+    stopAutoPreview();
+    $('pairingSecret').focus();
+  }
+}
+
+$('loginForm').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const error = $('loginError');
+  error.hidden = true;
+  try {
+    await post('/api/auth/login', { secret: $('pairingSecret').value });
+    $('pairingSecret').value = '';
+    showLogin(false);
+    say('Панель подключена');
+    openEvents();
+    await refreshAll();
+  } catch (err) {
+    error.textContent = err.message;
+    error.hidden = false;
+    announce(err.message);
+  }
+});
+
+$('logout').onclick = async () => {
+  try {
+    await post('/api/auth/logout');
+  } catch { /* всё равно возвращаемся к экрану входа */ }
+  showLogin(true);
+  say('Сеанс завершён');
+};
+
+// ------------------------------------------------------- поток событий
+
+let source = null;
+/** Обновления после событий склеиваем, чтобы шквал не дёргал API. */
+const pending = new Map();
+
+function schedule(key, fn, delay = 250) {
+  clearTimeout(pending.get(key));
+  pending.set(key, setTimeout(() => {
+    pending.delete(key);
+    fn().catch(() => {});
+  }, delay));
+}
+
+function openEvents() {
+  if (source) return;
+  source = new EventSource('/api/events');
+  source.onmessage = (e) => {
+    let msg;
+    try {
+      msg = JSON.parse(e.data);
+    } catch {
+      return;
+    }
+    handleEvent(msg);
+  };
+  source.onerror = () => {
+    // EventSource переподключается сам; сообщаем только о факте разрыва.
+    setState($('obsState'), 'warn', 'Связь с агентом: восстанавливаю…');
+  };
+}
+
+function closeEvents() {
+  source?.close();
+  source = null;
+}
+
+function handleEvent(msg) {
+  switch (msg.type) {
+    case 'obs':
+      handleObsEvent(msg.event?.eventType, msg.event?.eventData || {});
+      break;
+    case 'obs_status':
+      renderObsState(msg.status);
+      if (msg.status?.connected) schedule('all', refreshAll, 500);
+      break;
+    case 'levels':
+      handleLevels(msg.levels);
+      break;
+    case 'donation':
+      addDonation(msg.donation, true);
+      break;
+    case 'donationalerts_status':
+      schedule('da', refreshDa);
+      break;
+  }
+}
+
+function handleObsEvent(type, data) {
+  switch (type) {
+    case 'CurrentProgramSceneChanged':
+      currentScene = data.sceneName || currentScene;
+      say('Текущая сцена: ' + currentScene);
+      schedule('scenes', refreshScenes);
+      break;
+    case 'SceneListChanged':
+    case 'SceneCreated':
+    case 'SceneRemoved':
+    case 'SceneNameChanged':
+      schedule('scenes', refreshScenes);
+      break;
+    case 'SceneItemEnableStateChanged':
+    case 'SceneItemCreated':
+    case 'SceneItemRemoved':
+      schedule('sources', refreshSources);
+      break;
+    case 'InputMuteStateChanged':
+    case 'InputVolumeChanged':
+    case 'InputCreated':
+    case 'InputRemoved':
+    case 'InputNameChanged':
+      schedule('audio', refreshAudio);
+      break;
+    case 'StreamStateChanged':
+      renderOutputState($('streamState'), 'Эфир', data);
+      schedule('outputs', refreshOutputs, 1000);
+      break;
+    case 'RecordStateChanged':
+      renderOutputState($('recordState'), 'Запись', data);
+      break;
+    case 'StudioModeStateChanged':
+    case 'CurrentPreviewSceneChanged':
+      schedule('studio', refreshStudio);
+      break;
+    case 'VirtualcamStateChanged':
+      schedule('vcam', refreshVcam);
+      break;
+    case 'ReplayBufferStateChanged':
+      schedule('replay', refreshReplay);
+      break;
+    case 'ReplayBufferSaved':
+      say('Повтор сохранён: ' + (data.savedReplayPath || 'файл записан'));
+      break;
+    case 'CurrentSceneTransitionChanged':
+    case 'ProfileListChanged':
+    case 'CurrentProfileChanged':
+    case 'SceneCollectionListChanged':
+    case 'CurrentSceneCollectionChanged':
+      schedule('setups', refreshSetups);
+      break;
+    case 'ExitStarted':
+      // OBS предупреждает о закрытии до того, как оборвётся сокет. Без этого
+      // владелец увидел бы просто «нет связи» и не понял, что произошло.
+      announce('Актёр закрывает OBS. Управление пропадёт.');
+      break;
+  }
+}
+
+// -------------------------------------------------------- индикаторы
+
+function setState(node, state, text) {
+  node.dataset.state = state;
+  node.textContent = text;
+}
+
+function renderObsState(status) {
+  if (status?.connected) {
+    const version = status.obs_version ? ` ${status.obs_version}` : '';
+    setState($('obsState'), 'ok', `OBS${version}: подключён`);
+  } else {
+    setState($('obsState'), 'bad', 'OBS: нет связи');
+  }
+}
+
+/** OBS шлёт промежуточные состояния STARTING/STOPPING — показываем и их. */
+function renderOutputState(node, label, data) {
+  const active = data.outputActive;
+  if (label === 'Эфир') streaming = Boolean(active);
+  const raw = data.outputState || '';
+  if (raw === 'RECONNECTING') return setState(node, 'bad', `${label}: переподключается`);
+  if (raw.endsWith('STARTING')) return setState(node, 'warn', `${label}: запускается`);
+  if (raw.endsWith('STOPPING')) return setState(node, 'warn', `${label}: останавливается`);
+  if (raw.endsWith('PAUSED')) return setState(node, 'warn', `${label}: на паузе`);
+  if (active) {
+    setState(node, 'ok', `${label}: идёт`);
+    say(`${label} идёт`);
+  } else {
+    setState(node, 'bad', `${label}: остановлен${label === 'Запись' ? 'а' : ''}`);
+  }
+}
+
+// ---------------------------------------------------------- обновление
+
+let currentScene = '';
+let sceneNames = [];
+let streaming = false;
+let streamTrouble = false;
+
+async function refreshAll() {
+  // Сцены обновляем первыми и дожидаемся: от их списка зависит выбор сцены
+  // предпросмотра в Studio Mode. Запуск всего скопом оставлял бы этот
+  // список пустым при первой загрузке — кто успел, тот и прав.
+  await refreshScenes().catch(() => {});
+  await Promise.allSettled([
+    refreshHealth(),
+    refreshAudio(),
+    refreshOutputs(),
+    refreshStudio(),
+    refreshVcam(),
+    refreshReplay(),
+    refreshSetups(),
+    refreshDa(),
+    refreshTwitch(),
+    refreshDonations(),
+  ]);
+}
+
+function renderDl(node, obj) {
+  const rows = [];
+  for (const [key, value] of Object.entries(obj || {})) {
+    rows.push(el('dt', { text: key }));
+    rows.push(
+      el('dd', {
+        text: value !== null && typeof value === 'object'
+          ? JSON.stringify(value)
+          : String(value),
+      }),
+    );
+  }
+  replace(node, rows.length ? rows : [el('dd', { class: 'empty', text: 'нет данных' })]);
+}
+
+async function refreshHealth() {
+  try {
+    const health = await api('/api/health');
+    renderObsState(health.obs);
+    renderDl($('health'), {
+      'Tailscale': health.tailscale,
+      'OBS процесс': health.obs_process_running ? 'запущен' : 'не запущен',
+      'OBS WebSocket': health.obs?.connected ? 'подключён' : (health.obs?.error || 'нет связи'),
+      'Автозапуск у актёра': health.autostart ? 'настроен' : 'не настроен',
+      'Готов к эфиру': health.ready_to_stream ? 'да' : 'нет',
+      ...(health.obs_crashed_last_run
+        ? { 'Внимание': 'прошлый сеанс OBS завершился аварийно' }
+        : {}),
+    });
+  } catch (e) {
+    renderDl($('health'), { 'Ошибка': e.message });
+  }
+}
+
+function formatDuration(ms) {
+  const total = Math.floor(Number(ms || 0) / 1000);
+  const pad = (n) => String(n).padStart(2, '0');
+  return `${pad(Math.floor(total / 3600))}:${pad(Math.floor(total / 60) % 60)}:${pad(total % 60)}`;
+}
+
+/// Показывает здоровье эфира, а не только «идёт / не идёт».
+///
+/// Потеря кадров и переподключение — аварии, которые владелец иначе не
+/// заметит: у актёра всё выглядит работающим, а зрители видят заикания или
+/// чёрный экран.
+function renderStreamHealth(stream) {
+  const total = Number(stream.outputTotalFrames || 0);
+  const skipped = Number(stream.outputSkippedFrames || 0);
+  const percent = total > 0 ? (skipped / total) * 100 : 0;
+  const rows = {
+    'Длительность': formatDuration(stream.outputDuration),
+    'Потеряно кадров': total > 0
+      ? `${skipped} из ${total} (${percent.toFixed(2)} %)`
+      : 'нет данных',
+    'Отправлено': (Number(stream.outputBytes || 0) / 1048576).toFixed(0) + ' МБ',
+  };
+  if (stream.outputReconnecting) rows['Внимание'] = 'эфир переподключается';
+  renderDl($('streamHealth'), rows);
+
+  // Переподключение и заметная потеря кадров — то, ради чего владелец здесь.
+  if (stream.outputReconnecting) {
+    if (!streamTrouble) {
+      streamTrouble = true;
+      announce('Внимание: эфир переподключается');
+    }
+  } else if (streamTrouble) {
+    streamTrouble = false;
+    say('Эфир восстановлен');
+  }
+}
+
+async function refreshOutputs() {
+  try {
+    const stream = await obsRequest('GetStreamStatus');
+    renderOutputState($('streamState'), 'Эфир', {
+      outputActive: stream.outputActive,
+      outputState: stream.outputReconnecting ? 'RECONNECTING' : '',
+    });
+    renderStreamHealth(stream);
+  } catch { /* индикатор останется в состоянии «неизвестно» */ }
+  try {
+    const record = await obsRequest('GetRecordStatus');
+    renderOutputState($('recordState'), 'Запись', {
+      outputActive: record.outputActive,
+      outputState: record.outputPaused ? 'PAUSED' : '',
+      outputDuration: record.outputDuration,
+    });
+  } catch { /* см. выше */ }
+}
+
+async function refreshScenes() {
+  try {
+    const data = await api('/api/obs/scenes');
+    const scenes = data.scenes || [];
+    currentScene = data.currentProgramSceneName || currentScene;
+    sceneNames = scenes.map((s) => s.sceneName);
+
+    replace($('sceneSelect'), scenes.map((s) =>
+      el('option', {
+        value: s.sceneName,
+        text: s.sceneName,
+        selected: s.sceneName === currentScene,
+      })));
+
+    replace($('sceneList'), scenes.length
+      ? scenes.map((s) => el('li', {
+          text: s.sceneName + (s.sceneName === currentScene ? ' — текущая' : ''),
+        }))
+      : el('li', { class: 'empty', text: 'сцен нет' }));
+
+    await refreshSources();
+  } catch (e) {
+    replace($('sceneList'), el('li', { text: e.message }));
+  }
+}
+
+$('setScene').onclick = async () => {
+  const scene = $('sceneSelect').value;
+  if (!scene) return;
+  try {
+    await post('/api/obs/scenes/current', { sceneName: scene });
+    say('Сцена переключена: ' + scene);
+  } catch (e) {
+    fail(e);
+  }
+};
+
+// -------------------------------------------------- Studio Mode и прочее
+
+/// Заполняет выпадающий список, сохраняя выбранное значение.
+function fillSelect(node, items, current) {
+  replace(node, items.map((name) =>
+    el('option', { value: name, text: name, selected: name === current })));
+}
+
+async function refreshStudio() {
+  try {
+    const data = await api('/api/obs/studio');
+    setState(
+      $('studioState'),
+      data.enabled ? 'ok' : 'off',
+      data.enabled
+        ? 'Studio Mode включён. Предпросмотр: ' + (data.previewScene || 'не выбран')
+        : 'Studio Mode выключен',
+    );
+    fillSelect($('previewScene'), sceneNames, data.previewScene);
+    for (const id of ['previewScene', 'setPreviewScene', 'studioTransition']) {
+      $(id).disabled = !data.enabled;
+    }
+  } catch (e) {
+    setState($('studioState'), 'warn', e.message);
+  }
+}
+
+async function refreshVcam() {
+  try {
+    const data = await api('/api/obs/virtualcam');
+    setState(
+      $('vcamState'),
+      data.outputActive ? 'ok' : 'off',
+      data.outputActive ? 'Виртуальная камера работает' : 'Виртуальная камера выключена',
+    );
+  } catch (e) {
+    setState($('vcamState'), 'warn', e.message);
+  }
+}
+
+async function refreshReplay() {
+  try {
+    const data = await api('/api/obs/replay');
+    if (!data.available) {
+      setState($('replayState'), 'off', data.message || 'Буфер повтора недоступен');
+    } else {
+      setState(
+        $('replayState'),
+        data.outputActive ? 'ok' : 'off',
+        data.outputActive ? 'Буфер повтора работает' : 'Буфер повтора выключен',
+      );
+    }
+    for (const id of ['replayStart', 'replayStop']) $(id).disabled = !data.available;
+    $('replaySave').disabled = !data.outputActive;
+  } catch (e) {
+    setState($('replayState'), 'warn', e.message);
+  }
+}
+
+/// Профили, коллекции сцен и переходы — три одинаковых по форме списка.
+async function refreshSetups() {
+  const lists = [
+    ['/api/obs/profiles', 'profileSelect', 'profiles', 'currentProfileName'],
+    ['/api/obs/collections', 'collectionSelect', 'sceneCollections', 'currentSceneCollectionName'],
+    ['/api/obs/transitions', 'transitionSelect', 'transitions', 'currentSceneTransitionName'],
+  ];
+  for (const [path, nodeId, listKey, currentKey] of lists) {
+    try {
+      const data = await api(path);
+      const raw = data[listKey] || [];
+      // Профили и коллекции приходят строками, переходы — объектами.
+      const names = raw.map((i) => (typeof i === 'string' ? i : i.transitionName));
+      fillSelect($(nodeId), names, data[currentKey]);
+    } catch {
+      replace($(nodeId), el('option', { text: 'недоступно' }));
+    }
+  }
+}
+
+// ------------------------------------------------------------ кадр эфира
+
+let previewTimer = null;
+
+async function grabPreview() {
+  try {
+    const data = await api('/api/obs/preview?width=640');
+    const img = el('img', { alt: 'Кадр сцены ' + (data.sceneName || '') });
+    img.src = data.imageData;
+    replace($('previewBox'), [
+      img,
+      el('p', { class: 'hint', text: 'Сцена: ' + (data.sceneName || 'неизвестна') }),
+    ]);
+  } catch (e) {
+    replace($('previewBox'), el('p', { text: e.message }));
+  }
+}
+
+function stopAutoPreview() {
+  clearInterval(previewTimer);
+  previewTimer = null;
+  $('autoPreview').checked = false;
+}
+
+$('grabPreview').onclick = grabPreview;
+
+$('autoPreview').onchange = (event) => {
+  clearInterval(previewTimer);
+  previewTimer = null;
+  if (event.target.checked) {
+    grabPreview();
+    previewTimer = setInterval(grabPreview, 2000);
+    say('Автообновление кадра включено');
+  } else {
+    say('Автообновление кадра выключено');
+  }
+};
+
+async function refreshSources() {
+  if (!currentScene) return;
+  try {
+    const data = await api('/api/obs/sources?scene=' + encodeURIComponent(currentScene));
+    const items = data.sceneItems || [];
+    replace($('sources'), items.length
+      ? items.map((item) => {
+          const name = item.sourceName;
+          const visible = !!item.sceneItemEnabled;
+          return el('div', { class: 'source' }, [
+            el('h3', { text: name }),
+            el('p', { text: 'Состояние: ' + (visible ? 'виден' : 'скрыт') }),
+            button('Показать', () => setSource(name, true)),
+            button('Скрыть', () => setSource(name, false), 'quiet'),
+          ]);
+        })
+      : el('p', { class: 'empty', text: 'в этой сцене нет источников' }));
+  } catch (e) {
+    replace($('sources'), el('p', { text: e.message }));
+  }
+}
+
+async function setSource(sourceName, enabled) {
+  try {
+    await post('/api/obs/source/visibility', {
+      sceneName: currentScene,
+      sourceName,
+      enabled,
+    });
+    say(`${sourceName}: ${enabled ? 'показан' : 'скрыт'}`);
+  } catch (e) {
+    fail(e);
+  }
+}
+
+// ------------------------------------------------------- уровни звука
+//
+// Владелец не слышит, что происходит у актёра. Пропавший микрофон — самая
+// частая авария на стриме, и заметить её иначе нечем.
+
+/// Ниже этого порога считаем, что звука нет.
+const SILENCE_DB = -50;
+/// Столько замеров тишины подряд (по 250 мс) до предупреждения.
+const SILENCE_SAMPLES = 40;
+
+const levelNodes = new Map();
+const lastLevels = new Map();
+const silenceCount = new Map();
+const silenceWarned = new Set();
+
+function levelText(db) {
+  if (db <= -100) return 'тишина';
+  return db.toFixed(0) + ' dB';
+}
+
+function announceLevel(name) {
+  const db = lastLevels.get(name);
+  if (db === undefined) {
+    say(`${name}: уровень пока не известен`);
+  } else if (db <= SILENCE_DB) {
+    say(`${name}: тишина`);
+  } else {
+    say(`${name}: ${db.toFixed(0)} децибел, звук идёт`);
+  }
+}
+
+function handleLevels(levels) {
+  for (const [name, db] of Object.entries(levels || {})) {
+    lastLevels.set(name, db);
+    const node = levelNodes.get(name);
+    if (node) node.textContent = levelText(db);
+
+    // Предупреждаем один раз за период тишины и только во время эфира:
+    // вне эфира молчащий микрофон — нормальное положение дел.
+    if (db > SILENCE_DB) {
+      silenceCount.set(name, 0);
+      silenceWarned.delete(name);
+      continue;
+    }
+    const count = (silenceCount.get(name) || 0) + 1;
+    silenceCount.set(name, count);
+    if (streaming && count >= SILENCE_SAMPLES && !silenceWarned.has(name)) {
+      silenceWarned.add(name);
+      announce(`Внимание: ${name} молчит уже десять секунд, а эфир идёт`);
+    }
+  }
+}
+
+async function refreshAudio() {
+  try {
+    const data = await api('/api/obs/audio');
+    const rows = data.audio || [];
+    levelNodes.clear();
+    replace($('audio'), rows.length
+      ? rows.map((a) => {
+          const name = a.inputName;
+          const db = Number(a.volumeDb || 0);
+          const field = el('input', {
+            type: 'number',
+            step: '0.5',
+            value: db.toFixed(1),
+          });
+          field.setAttribute('aria-label', `Громкость источника ${name}, dB`);
+
+          // Уровень обновляется четыре раза в секунду. Озвучивать это
+          // непрерывно нельзя — скринридер превратится в пытку, поэтому
+          // читаем его только по кнопке «Проверить звук».
+          const level = el('span', { class: 'level', text: '—' });
+          level.setAttribute('aria-hidden', 'true');
+          levelNodes.set(name, level);
+
+          return el('div', { class: 'audio-row' }, [
+            el('h3', { text: name }),
+            el('p', {
+              text: `Звук: ${a.muted ? 'выключен' : 'включён'}. Громкость: ${db.toFixed(1)} dB.`,
+            }),
+            el('p', { class: 'hint' }, [document.createTextNode('Уровень: '), level]),
+            button('Проверить звук', () => announceLevel(name), 'quiet'),
+            button('Выключить звук', () => audioMute(name, true), 'quiet'),
+            button('Включить звук', () => audioMute(name, false), 'quiet'),
+            button('−1 dB', () => audioVolume(name, db - 1), 'quiet'),
+            button('+1 dB', () => audioVolume(name, db + 1), 'quiet'),
+            field,
+            button('Применить', () => audioVolume(name, Number(field.value))),
+          ]);
+        })
+      : el('p', { class: 'empty', text: 'аудиоисточников нет' }));
+  } catch (e) {
+    replace($('audio'), el('p', { text: e.message }));
+  }
+}
+
+async function audioMute(inputName, muted) {
+  try {
+    await post('/api/obs/audio/mute', { inputName, muted });
+    say(`${inputName}: звук ${muted ? 'выключен' : 'включён'}`);
+  } catch (e) {
+    fail(e);
+  }
+}
+
+async function audioVolume(inputName, volumeDb) {
+  if (!Number.isFinite(volumeDb)) return fail(new Error('Введите число'));
+  try {
+    await post('/api/obs/audio/volume', { inputName, volumeDb });
+    say(`${inputName}: громкость ${volumeDb.toFixed(1)} dB`);
+  } catch (e) {
+    fail(e);
+  }
+}
+
+async function command(path, message, confirmText) {
+  if (confirmText && !confirm(confirmText)) return;
+  try {
+    await post(path);
+    say(message);
+  } catch (e) {
+    fail(e);
+  }
+}
+
+$('startStream').onclick = () => command('/api/obs/stream/start', 'Эфир запускается');
+$('stopStream').onclick = () =>
+  command('/api/obs/stream/stop', 'Эфир останавливается', 'Остановить активный эфир?');
+$('startRecord').onclick = () => command('/api/obs/record/start', 'Запись запускается');
+$('stopRecord').onclick = () =>
+  command('/api/obs/record/stop', 'Запись останавливается', 'Остановить запись?');
+$('pauseRecord').onclick = () => command('/api/obs/record/pause', 'Запись на паузе');
+$('resumeRecord').onclick = () => command('/api/obs/record/resume', 'Запись продолжена');
+
+$('vcamStart').onclick = () => command('/api/obs/virtualcam/start', 'Виртуальная камера включается');
+$('vcamStop').onclick = () => command('/api/obs/virtualcam/stop', 'Виртуальная камера выключается');
+$('replayStart').onclick = () => command('/api/obs/replay/start', 'Буфер повтора включается');
+$('replayStop').onclick = () => command('/api/obs/replay/stop', 'Буфер повтора выключается');
+$('replaySave').onclick = () => command('/api/obs/replay/save', 'Повтор сохранён');
+$('studioTransition').onclick = () =>
+  command('/api/obs/studio/transition', 'Предпросмотр выведен в эфир');
+
+$('studioOn').onclick = async () => {
+  try {
+    await post('/api/obs/studio', { enabled: true });
+    say('Studio Mode включён');
+    await refreshStudio();
+  } catch (e) { fail(e); }
+};
+
+$('studioOff').onclick = async () => {
+  try {
+    await post('/api/obs/studio', { enabled: false });
+    say('Studio Mode выключен');
+    await refreshStudio();
+  } catch (e) { fail(e); }
+};
+
+$('setPreviewScene').onclick = async () => {
+  const sceneName = $('previewScene').value;
+  if (!sceneName) return;
+  try {
+    await post('/api/obs/studio/preview', { sceneName });
+    say('Сцена предпросмотра: ' + sceneName);
+  } catch (e) { fail(e); }
+};
+
+/// Переключатели профиля, коллекции и перехода устроены одинаково.
+for (const [buttonId, selectId, path, field, label, warn] of [
+  ['setProfile', 'profileSelect', '/api/obs/profiles', 'profileName', 'Профиль',
+    'Смена профиля перезагрузит настройки OBS у актёра. Продолжить?'],
+  ['setCollection', 'collectionSelect', '/api/obs/collections', 'sceneCollectionName',
+    'Коллекция сцен', 'Смена коллекции перезагрузит сцены у актёра. Продолжить?'],
+  ['setTransition', 'transitionSelect', '/api/obs/transitions', 'transitionName',
+    'Переход', null],
+]) {
+  $(buttonId).onclick = async () => {
+    const value = $(selectId).value;
+    if (!value) return;
+    if (warn && !confirm(warn)) return;
+    try {
+      await post(path, { [field]: value });
+      say(label + ': ' + value);
+      schedule('all', refreshAll, 800);
+    } catch (e) { fail(e); }
+  };
+}
+
+$('refreshStats').onclick = async () => {
+  try {
+    const s = await api('/api/obs/stats');
+    renderDl($('stats'), {
+      'Загрузка CPU, %': Number(s.cpuUsage || 0).toFixed(1),
+      'Память, МБ': Number(s.memoryUsage || 0).toFixed(0),
+      'Свободно на диске, МБ': Number(s.availableDiskSpace || 0).toFixed(0),
+      'FPS': Number(s.activeFps || 0).toFixed(1),
+      'Пропущено кадров (рендер)': s.renderSkippedFrames ?? 0,
+      'Пропущено кадров (вывод)': s.outputSkippedFrames ?? 0,
+    });
+    say('Статистика обновлена');
+  } catch (e) {
+    renderDl($('stats'), { 'Ошибка': e.message });
+  }
+};
+
+// ------------------------------------------------------ DonationAlerts
+
+async function refreshDa() {
+  try {
+    const da = await api('/api/donationalerts/status');
+    renderDl($('daStatus'), {
+      'Виджет настроен': da.widget_url_configured ? 'да' : 'нет',
+      'Звук ведётся в OBS': da.widget_url_configured ? 'да' : 'нет',
+      'Сцена оверлея': da.overlay_scene,
+      'Источник': da.input_name,
+      'Лента донатов': da.realtime?.connected
+        ? 'подключена'
+        : (da.tokens_stored ? (da.realtime?.error || 'подключаюсь…') : 'OAuth не пройден'),
+    });
+  } catch (e) {
+    renderDl($('daStatus'), { 'Ошибка': e.message });
+  }
+}
+
+$('daUrlForm').onsubmit = async (e) => {
+  e.preventDefault();
+  try {
+    const r = await post('/api/donationalerts/widget-url', { url: $('daUrl').value });
+    $('daUrl').value = '';
+    say(`DonationAlerts настроен. Оверлей добавлен в ${r.scenes_added_overlay} сцен, уже был в ${r.scenes_already_had_overlay}.`);
+    await refreshDa();
+  } catch (err) {
+    fail(err);
+  }
+};
+
+$('daReconcile').onclick = () =>
+  command('/api/donationalerts/reconcile', 'Конфигурация DonationAlerts проверена');
+$('daRefreshWidget').onclick = () =>
+  command('/api/donationalerts/widget/refresh', 'Виджет перезагружен');
+$('daMute').onclick = async () => {
+  try {
+    await post('/api/donationalerts/widget/mute', { muted: true });
+    say('Звук оповещений выключен');
+  } catch (e) { fail(e); }
+};
+$('daUnmute').onclick = async () => {
+  try {
+    await post('/api/donationalerts/widget/mute', { muted: false });
+    say('Звук оповещений включён');
+  } catch (e) { fail(e); }
+};
+$('daSetVolume').onclick = async () => {
+  try {
+    await post('/api/donationalerts/widget/volume', { volumeDb: Number($('daVolume').value) });
+    say('Громкость оповещений изменена');
+  } catch (e) { fail(e); }
+};
+$('daOauth').onclick = async () => {
+  try {
+    const r = await post('/api/donationalerts/oauth/start');
+    window.open(r.authorize_url, '_blank', 'noopener');
+    say('Откройте вкладку авторизации DonationAlerts');
+  } catch (e) {
+    fail(e);
+  }
+};
+
+function donationText(d) {
+  const who = d.username || d.name || 'Аноним';
+  const amount = d.amount_in_user_currency ?? d.amount ?? '';
+  const currency = d.currency || '';
+  const message = d.message ? `. ${d.message}` : '';
+  return `${who} — ${amount} ${currency}${message}`.replace(/\s+/g, ' ').trim();
+}
+
+function addDonation(donation, isNew) {
+  const list = $('donations');
+  if (list.firstElementChild?.classList.contains('empty')) list.replaceChildren();
+  const text = donationText(donation);
+  list.prepend(el('li', { text }));
+  while (list.children.length > 50) list.lastElementChild.remove();
+  if (isNew && $('announceDonations').checked) {
+    announce('Новый донат: ' + text);
+  }
+}
+
+async function refreshDonations() {
+  try {
+    const r = await api('/api/donationalerts/recent');
+    const donations = r.donations || [];
+    replace($('donations'), donations.length
+      ? donations.map((d) => el('li', { text: donationText(d) }))
+      : el('li', { class: 'empty', text: 'донатов пока нет' }));
+  } catch { /* лента необязательна, молчим */ }
+}
+
+// -------------------------------------------------------------- Twitch
+
+async function refreshTwitch() {
+  try {
+    const t = await api('/api/twitch/status');
+    renderDl($('twitchStatus'), {
+      'Настроен client_id': t.configured ? 'да' : 'нет',
+      'Подключён': t.connected ? 'да' : 'нет',
+      ...(t.message ? { 'Примечание': t.message } : {}),
+    });
+  } catch (e) {
+    renderDl($('twitchStatus'), { 'Ошибка': e.message });
+  }
+}
+
+$('twitchStart').onclick = async () => {
+  try {
+    const r = await post('/api/twitch/device/start');
+    const link = el('a', {
+      href: r.verification_uri_complete || r.verification_uri,
+      target: '_blank',
+      rel: 'noopener',
+      text: 'страницу активации Twitch',
+    });
+    replace($('twitchDevice'), el('p', {}, [
+      el('span', { text: 'Откройте ' }),
+      link,
+      el('span', { text: ' и введите код: ' }),
+      el('strong', { text: r.user_code || '' }),
+    ]));
+    say('Код Twitch получен: ' + (r.user_code || ''));
+  } catch (e) {
+    fail(e);
+  }
+};
+
+$('twitchCheck').onclick = async () => {
+  try {
+    const r = await post('/api/twitch/device/check');
+    const done = !!r.access_token;
+    replace($('twitchDevice'), el('p', {
+      text: done
+        ? 'Twitch подключён.'
+        : 'Пока не подтверждено. Завершите вход на странице Twitch и нажмите проверку ещё раз.',
+    }));
+    say(done ? 'Twitch подключён' : 'Авторизация Twitch не завершена');
+    await refreshTwitch();
+  } catch (e) {
+    fail(e);
+  }
+};
+
+$('twitchChannelForm').onsubmit = async (e) => {
+  e.preventDefault();
+  const body = {};
+  for (const id of ['streamTitle', 'streamGame', 'streamLang']) {
+    const field = $(id);
+    const value = field.value.trim();
+    if (value) body[field.name] = value;
+  }
+  if (!Object.keys(body).length) return fail(new Error('Заполните хотя бы одно поле'));
+  try {
+    const r = await post('/api/twitch/channel', body);
+    if (!r.ok) throw new Error(`Twitch отклонил изменение (код ${r.status})`);
+    say('Параметры канала обновлены');
+  } catch (err) {
+    fail(err);
+  }
+};
+
+$('markerForm').onsubmit = async (e) => {
+  e.preventDefault();
+  try {
+    await post('/api/twitch/marker', { description: $('markerDescription').value });
+    $('markerDescription').value = '';
+    say('Маркер создан');
+  } catch (err) {
+    fail(err);
+  }
+};
+
+// --------------------------------------------------------------- старт
+
+$('launchObs').onclick = async () => {
+  try {
+    const r = await post('/api/obs/launch');
+    say(r.message);
+  } catch (e) {
+    fail(e);
+  }
+};
+
+$('refreshAll').onclick = () => refreshAll().then(() => say('Состояние обновлено'));
+$('refreshScenes').onclick = refreshScenes;
+$('refreshSources').onclick = refreshSources;
+$('refreshAudio').onclick = refreshAudio;
+
+(async function start() {
+  const status = await api('/api/auth/status').catch(() => ({ authenticated: false }));
+  if (!status.authenticated) {
+    showLogin(true);
+    return;
+  }
+  showLogin(false);
+  openEvents();
+  await refreshAll();
+})();

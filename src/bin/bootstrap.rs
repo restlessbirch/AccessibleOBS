@@ -1,3 +1,12 @@
+//! Первичная настройка. Запускается один раз на каждой стороне.
+//!
+//! `--host` (компьютер актёра): ставит Tailscale и OBS, генерирует пароль
+//! WebSocket, поднимает host-agent, прописывает автозапуск и показывает
+//! pairing-код. После этого актёру больше ничего делать не нужно — при каждом
+//! входе в Windows агент стартует сам и сам поднимает OBS.
+//!
+//! `--controller` (компьютер владельца): находит агента в tailnet и открывает панель.
+
 use anyhow::{Context, Result, anyhow};
 use remote_stream_control::*;
 use std::{
@@ -13,13 +22,26 @@ use tokio::time::sleep;
 async fn main() -> Result<()> {
     ensure_dirs()?;
     init_logging()?;
-    let arg = std::env::args().nth(1).unwrap_or_else(|| "--help".into());
-    match arg.as_str() {
+    match std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| "--help".into())
+        .as_str()
+    {
         "--host" => host_flow().await,
         "--controller" => controller_flow().await,
+        "--remove-autostart" => {
+            unregister_autostart()?;
+            println!("Автозапуск Remote Stream Control удалён.");
+            pause_if_console();
+            Ok(())
+        }
         _ => {
             println!(
-                "Remote Stream Control bootstrap\n\nИспользование:\n  bootstrap.exe --host        компьютер актёра/стримера\n  bootstrap.exe --controller  компьютер владельца"
+                "Remote Stream Control bootstrap\n\n\
+                 Использование:\n  \
+                 bootstrap.exe --host              компьютер актёра/стримера\n  \
+                 bootstrap.exe --controller        компьютер владельца\n  \
+                 bootstrap.exe --remove-autostart  убрать агент из автозагрузки"
             );
             Ok(())
         }
@@ -28,8 +50,8 @@ async fn main() -> Result<()> {
 
 fn init_logging() -> Result<()> {
     let file = tracing_appender::rolling::never(logs_dir(), "bootstrap.log");
-    let (writer, _guard) = tracing_appender::non_blocking(file);
-    std::mem::forget(_guard);
+    let (writer, guard) = tracing_appender::non_blocking(file);
+    std::mem::forget(guard);
     tracing_subscriber::fmt()
         .with_writer(writer)
         .with_ansi(false)
@@ -40,49 +62,84 @@ fn init_logging() -> Result<()> {
 }
 
 async fn host_flow() -> Result<()> {
-    println!("Remote Stream Control — запуск компьютера актёра\n");
+    println!("Remote Stream Control — настройка компьютера актёра\n");
     let mut cfg = load_host_config()?;
     ensure_tailscale().await?;
     ensure_tailscale_up(cfg.enable_tailscale_unattended_after_login).await?;
 
+    // Порядок важен: сначала OBS должен существовать, иначе мы настраиваем
+    // ещё не установленный плагин и надеемся, что он подхватит наш файл.
+    if cfg.auto_start_obs {
+        ensure_obs_installed(&cfg).await?;
+    }
+
     let obs_password = match load_secret("obs_websocket_password")? {
         Some(p) => p,
         None => {
-            let p = random_secret_b64(24);
+            // Если OBS уже настроен, берём его пароль, а не навязываем свой:
+            // на этот пароль могут быть настроены другие пульты у актёра.
+            let p = match existing_obs_websocket_password() {
+                Some(existing) => {
+                    println!("OBS WebSocket: использую пароль, уже заданный в OBS");
+                    existing
+                }
+                None => random_secret_b64(24),
+            };
             save_secret("obs_websocket_password", &p)?;
             p
         }
     };
-    ensure_obs_websocket_config(&obs_password, cfg.obs_websocket_port)?;
-    if cfg.obs_websocket_password.is_empty() {
-        cfg.obs_websocket_password = String::new();
+    configure_obs_websocket(&obs_password, cfg.obs_websocket_port).await?;
+
+    // Пароль обязан жить только в DPAPI-хранилище. Если он попал в host.json
+    // (например, его вписали руками), вычищаем файл.
+    if !cfg.obs_websocket_password.is_empty() {
+        cfg.obs_websocket_password.clear();
         save_json(&config_dir().join("host.json"), &cfg)?;
+        println!("Пароль OBS убран из host.json — он хранится через DPAPI.");
     }
 
+    // Запускаем только теперь, когда config.json уже лежит на диске: OBS
+    // читает настройки плагина при старте.
     if cfg.auto_start_obs {
-        ensure_obs_installed(&cfg).await?;
-        ensure_obs_started(&cfg).await?;
+        match start_obs_if_needed(&cfg.obs_path) {
+            Ok(true) => println!("OBS: запущен"),
+            Ok(false) => println!("OBS: уже запущен"),
+            Err(e) => println!("OBS: не удалось запустить — {e:#}"),
+        }
     }
     wait_for_obs(&cfg, 25).await;
     ensure_host_agent_started().await?;
     wait_for_web(cfg.web_port, 20).await;
 
+    match register_autostart() {
+        Ok(path) => println!("Автозапуск настроен: {}", path.display()),
+        Err(e) => println!(
+            "Не удалось настроить автозапуск ({e:#}).\n\
+             Ничего страшного: просто запускайте START_FRIEND.bat после входа в Windows."
+        ),
+    }
+
     let pairing = ensure_pairing_secret()?;
+    println!("\n{}", "=".repeat(60));
+    println!("Готово. Компьютер актёра настроен.");
     println!(
-        "\nГотово. Панель владельца должна открываться через Tailscale на порту {}.",
+        "Панель владельца доступна через Tailscale на порту {}.",
         cfg.web_port
     );
+    println!("\nPairing-код для владельца (сообщить один раз): {pairing}");
+    println!("{}", "=".repeat(60));
     println!(
-        "Если владелец видит экран pairing, одноразово введите этот код: {}",
-        pairing
+        "\nПри следующих включениях компьютера всё поднимется само —\n\
+         запускать этот файл повторно не нужно.\n\
+         Секреты не хранятся в JSON/BAT и защищены DPAPI Windows.\n"
     );
-    println!("Секреты не записаны в JSON/BAT и защищены DPAPI Windows. Это окно можно свернуть.\n");
     pause_if_console();
     Ok(())
 }
 
 async fn controller_flow() -> Result<()> {
-    println!("Remote Stream Control — запуск владельца\n");
+    println!("Remote Stream Control — запуск панели владельца\n");
     let cfg = load_controller_config()?;
     ensure_tailscale().await?;
     ensure_tailscale_up(true).await?;
@@ -92,7 +149,7 @@ async fn controller_flow() -> Result<()> {
         .build()?;
     let mut chosen = None;
     for url in &targets {
-        print!("Проверяю {} ... ", url);
+        print!("Проверяю {url} ... ");
         io::stdout().flush().ok();
         match client
             .get(format!("{}/api/public/ping", url.trim_end_matches('/')))
@@ -107,8 +164,17 @@ async fn controller_flow() -> Result<()> {
             _ => println!("нет ответа"),
         }
     }
-    let url = chosen.unwrap_or_else(|| targets[0].clone());
-    println!("Открываю панель: {}", url);
+    let Some(url) = chosen else {
+        println!(
+            "\nНи один адрес не ответил. Проверьте:\n\
+             1. Компьютер актёра включён и на нём хотя бы раз запускали START_FRIEND.bat.\n\
+             2. Оба компьютера в одном tailnet (tailscale status).\n\
+             3. friend_machine_name в config\\controller.json совпадает с именем машины в Tailscale.\n"
+        );
+        pause_if_console();
+        return Err(anyhow!("host-agent недоступен"));
+    };
+    println!("Открываю панель: {url}");
     if cfg.auto_open_browser {
         open::that(&url).context("не удалось открыть браузер")?;
     }
@@ -136,56 +202,52 @@ fn candidate_urls(cfg: &ControllerConfig) -> Vec<String> {
     v
 }
 
-fn tailscale_exe() -> Option<PathBuf> {
-    find_exe("tailscale.exe").or_else(|| {
-        let p = PathBuf::from(r"C:\Program Files\Tailscale\tailscale.exe");
-        p.exists().then_some(p)
-    })
-}
 async fn ensure_tailscale() -> Result<()> {
     if tailscale_exe().is_some() {
         println!("Tailscale: найден");
         return Ok(());
     }
-    println!("Tailscale не найден. Пробую установить официальный MSI...");
+    println!("Tailscale не найден. Устанавливаю официальный MSI...");
     let msi = installer_path("tailscale-setup-latest-amd64.msi");
     if !msi.exists() {
         download_tailscale(&msi).await?;
     }
     let status = Command::new("msiexec")
-        .args(["/i", msi.to_str().unwrap(), "/passive", "/norestart"])
+        .args([
+            "/i",
+            msi.to_str()
+                .context("путь к MSI содержит недопустимые символы")?,
+            "/passive",
+            "/norestart",
+        ])
         .status()?;
     if !status.success() {
         open::that("https://tailscale.com/download/windows")?;
         return Err(anyhow!(
-            "Установите Tailscale в открывшемся окне и запустите BAT ещё раз."
+            "Установите Tailscale в открывшемся окне и запустите START_FRIEND.bat ещё раз."
         ));
     }
     Ok(())
 }
+
 async fn download_tailscale(msi: &Path) -> Result<()> {
-    fs::create_dir_all(msi.parent().unwrap())?;
+    fs::create_dir_all(msi.parent().context("нет родительской папки")?)?;
     let url = "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi";
     let bytes = reqwest::get(url).await?.bytes().await?;
     fs::write(msi, bytes)?;
     Ok(())
 }
+
 async fn ensure_tailscale_up(unattended: bool) -> Result<()> {
     let exe = tailscale_exe().ok_or_else(|| anyhow!("tailscale.exe не найден после установки"))?;
-    let status = Command::new(&exe).args(["status", "--json"]).output();
-    let mut running = false;
-    if let Ok(out) = status {
-        let txt = String::from_utf8_lossy(&out.stdout);
-        running = txt.contains("\"BackendState\":\"Running\"")
-            || txt.contains("\"BackendState\": \"Running\"");
-    }
-    if running {
+    if tailscale_running() {
         println!("Tailscale: подключён");
         return Ok(());
     }
-    println!("Tailscale требует вход. Откроется стандартная авторизация Tailscale.");
+    println!("Tailscale требует вход. Откроется стандартная страница авторизации.");
     let mut args = vec!["up".to_string()];
     if unattended {
+        // Без этого флага туннель отваливается при выходе пользователя из системы.
         args.push("--unattended=true".into());
     }
     let out = Command::new(&exe).args(args).output()?;
@@ -195,11 +257,43 @@ async fn ensure_tailscale_up(unattended: bool) -> Result<()> {
         .split_whitespace()
         .find(|s| s.starts_with("http://") || s.starts_with("https://"))
     {
-        let _ = open::that(url.trim_matches(|c: char| c == '.' || c == ','));
-        println!("Открыта ссылка входа Tailscale: {}", url);
+        let url = url.trim_matches(|c: char| c == '.' || c == ',');
+        let _ = open::that(url);
+        println!("Открыта ссылка входа Tailscale: {url}");
     }
-    println!("Если авторизация только что выполнена, подождите пару секунд...");
+    println!("Если вход только что выполнен, подождите пару секунд...");
     sleep(Duration::from_secs(3)).await;
+    Ok(())
+}
+
+/// Включает WebSocket-сервер OBS.
+///
+/// Тонкость: OBS перезаписывает свой config.json при выходе из памяти. Если
+/// писать настройки, пока OBS запущен, он затрёт их при закрытии, и пароль
+/// не применится. Поэтому при необходимости изменений просим закрыть OBS
+/// и ждём — запустим его потом сами.
+async fn configure_obs_websocket(password: &str, port: u16) -> Result<()> {
+    if !obs_websocket_config_matches(password, port) && obs_is_running() {
+        println!("\nOBS запущен, а его настройки WebSocket нужно изменить.");
+        println!("Закройте OBS — я подожду до 60 секунд и запущу его сам.");
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while obs_is_running() && Instant::now() < deadline {
+            print!(".");
+            io::stdout().flush().ok();
+            sleep(Duration::from_secs(1)).await;
+        }
+        println!();
+        if obs_is_running() {
+            println!(
+                "OBS всё ещё запущен. Настройки записаны, но применятся\n\
+                 только после того, как вы его перезапустите."
+            );
+        }
+    }
+    match ensure_obs_websocket_config(password, port)? {
+        true => println!("OBS WebSocket: включён, пароль обновлён"),
+        false => println!("OBS WebSocket: уже настроен"),
+    }
     Ok(())
 }
 
@@ -208,20 +302,24 @@ async fn ensure_obs_installed(cfg: &HostConfig) -> Result<()> {
         println!("OBS Studio: найден");
         return Ok(());
     }
-    println!("OBS Studio не найден. Пробую скачать официальный installer OBS...");
+    println!("OBS Studio не найден. Скачиваю официальный установщик...");
     let installer = preferred_obs_installer_path();
     if !installer.exists() {
-        let url = latest_obs_installer_url().await.unwrap_or_else(|_| "https://cdn-fastly.obsproject.com/downloads/OBS-Studio-31.1.2-Windows-Installer.exe".to_string());
-        println!("Скачиваю OBS: {}", url);
+        let url = latest_obs_installer_url().await?;
+        println!("Скачиваю OBS: {url}");
         let bytes = reqwest::Client::builder()
-            .user_agent("RemoteStreamControl/1.0")
+            .user_agent("RemoteStreamControl/0.2")
             .build()?
             .get(url)
             .send()
             .await?
             .bytes()
             .await?;
-        fs::create_dir_all(installer.parent().unwrap_or(Path::new("third_party")))?;
+        fs::create_dir_all(
+            installer
+                .parent()
+                .context("нет папки third_party/installers")?,
+        )?;
         fs::write(&installer, bytes)?;
     }
     println!("Запускаю установку OBS. Если появится окно установщика — нажмите Install/Next.");
@@ -230,73 +328,47 @@ async fn ensure_obs_installed(cfg: &HostConfig) -> Result<()> {
     if find_obs(&cfg.obs_path).is_none() {
         let _ = open::that("https://obsproject.com/download");
         return Err(anyhow!(
-            "OBS Studio пока не найден. Установите OBS из открывшегося окна/страницы и запустите START_FRIEND.bat ещё раз."
+            "OBS Studio всё ещё не найден. Установите его вручную из открывшейся страницы и запустите START_FRIEND.bat ещё раз."
         ));
     }
     if let Ok(s) = status
         && !s.success()
     {
-        println!("OBS installer завершился не идеально, но OBS найден — продолжаю.");
+        println!("Установщик OBS завершился с ошибкой, но OBS найден — продолжаю.");
     }
     Ok(())
 }
+
 async fn latest_obs_installer_url() -> Result<String> {
     let v: serde_json::Value = reqwest::Client::builder()
-        .user_agent("RemoteStreamControl/1.0")
+        .user_agent("RemoteStreamControl/0.2")
         .build()?
         .get("https://api.github.com/repos/obsproject/obs-studio/releases/latest")
         .send()
         .await?
         .json()
         .await?;
-    let assets = v
-        .get("assets")
-        .and_then(|v| v.as_array())
-        .ok_or_else(|| anyhow!("OBS GitHub release assets missing"))?;
-    for a in assets {
-        let name = a
-            .get("name")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_ascii_lowercase();
-        if name.contains("windows")
-            && name.ends_with("installer.exe")
-            && let Some(url) = a.get("browser_download_url").and_then(|v| v.as_str())
-        {
-            return Ok(url.to_string());
-        }
-    }
-    Err(anyhow!("OBS Windows installer asset not found"))
-}
-async fn ensure_obs_started(cfg: &HostConfig) -> Result<()> {
-    if process_running("obs64.exe") || process_running("obs.exe") {
-        println!("OBS: уже запущен");
-        return Ok(());
-    }
-    let obs=find_obs(&cfg.obs_path).ok_or_else(|| anyhow!("OBS Studio не найден. Установите OBS Studio 28+ с https://obsproject.com/ и запустите BAT ещё раз."))?;
-    println!("Запускаю OBS: {}", obs.display());
-    let mut cmd = Command::new(&obs);
-    if let Some(parent) = obs.parent() {
-        cmd.current_dir(parent);
-    }
-    cmd.arg("--minimize-to-tray")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()?;
-    Ok(())
-}
-fn process_running(name: &str) -> bool {
-    Command::new("tasklist")
-        .args(["/FI", &format!("IMAGENAME eq {}", name)])
-        .output()
-        .map(|o| {
-            String::from_utf8_lossy(&o.stdout)
-                .to_ascii_lowercase()
-                .contains(&name.to_ascii_lowercase())
+    v.get("assets")
+        .and_then(|a| a.as_array())
+        .into_iter()
+        .flatten()
+        .find_map(|a| {
+            let name = a.get("name").and_then(|v| v.as_str())?.to_ascii_lowercase();
+            let is_windows_installer = name.contains("windows") && name.ends_with("installer.exe");
+            is_windows_installer.then(|| {
+                a.get("browser_download_url")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string)
+            })?
         })
-        .unwrap_or(false)
+        .ok_or_else(|| {
+            anyhow!(
+                "Не удалось найти установщик OBS для Windows в последнем релизе. \
+                 Установите OBS вручную с https://obsproject.com/download"
+            )
+        })
 }
+
 async fn wait_for_obs(cfg: &HostConfig, seconds: u64) {
     print!("Жду OBS WebSocket");
     io::stdout().flush().ok();
@@ -310,8 +382,9 @@ async fn wait_for_obs(cfg: &HostConfig, seconds: u64) {
         io::stdout().flush().ok();
         sleep(Duration::from_secs(1)).await;
     }
-    println!(" не дождался, панель покажет ошибку OBS");
+    println!(" не дождался — панель покажет ошибку OBS");
 }
+
 async fn ensure_host_agent_started() -> Result<()> {
     if process_running("host-agent.exe") {
         println!("Host Agent: уже запущен");
@@ -331,17 +404,18 @@ async fn ensure_host_agent_started() -> Result<()> {
     sleep(Duration::from_secs(2)).await;
     Ok(())
 }
+
 async fn wait_for_web(port: u16, seconds: u64) {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(1))
         .build()
-        .unwrap();
+        .expect("reqwest client");
     print!("Проверяю web-панель");
     io::stdout().flush().ok();
     let start = Instant::now();
-    let mut urls = vec![format!("http://127.0.0.1:{}/api/public/ping", port)];
-    if let Some(ip) = current_tailscale_ip() {
-        urls.push(format!("http://{}:{}/api/public/ping", ip, port));
+    let mut urls = vec![format!("http://127.0.0.1:{port}/api/public/ping")];
+    if let Some(ip) = tailscale_ip() {
+        urls.push(format!("http://{ip}:{port}/api/public/ping"));
     }
     while start.elapsed() < Duration::from_secs(seconds) {
         for url in &urls {
@@ -360,29 +434,22 @@ async fn wait_for_web(port: u16, seconds: u64) {
         io::stdout().flush().ok();
         sleep(Duration::from_secs(1)).await;
     }
-    println!(" не дождался, смотрите logs\\host.log");
-}
-fn current_tailscale_ip() -> Option<String> {
-    let exe = tailscale_exe()?;
-    let out = Command::new(exe).arg("ip").arg("-4").output().ok()?;
-    String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .next()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
+    println!(" не дождался — смотрите logs\\host.log");
 }
 
 fn ensure_pairing_secret() -> Result<String> {
-    if let Some(s) = load_secret("pairing_secret")? {
-        Ok(s)
-    } else {
-        let s = random_secret_b64(10);
-        save_secret("pairing_secret", &s)?;
-        Ok(s)
+    match load_secret("pairing_secret")? {
+        Some(s) => Ok(s),
+        None => {
+            let s = random_secret_b64(10);
+            save_secret("pairing_secret", &s)?;
+            Ok(s)
+        }
     }
 }
+
 fn pause_if_console() {
-    println!("Нажмите Enter, чтобы закрыть это окно, или просто сверните его.");
+    println!("Нажмите Enter, чтобы закрыть это окно.");
     let mut s = String::new();
     let _ = io::stdin().read_line(&mut s);
 }
@@ -394,6 +461,7 @@ fn installer_path(file_name: &str) -> PathBuf {
         .join(file_name)
 }
 
+/// Ищем установщик, положенный в архив release-скриптом, чтобы не качать заново.
 fn preferred_obs_installer_path() -> PathBuf {
     let installers = app_root().join("third_party").join("installers");
     if let Ok(entries) = fs::read_dir(&installers) {
@@ -410,4 +478,38 @@ fn preferred_obs_installer_path() -> PathBuf {
         }
     }
     installers.join("OBS-Studio-Windows-Installer.exe")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn controller_cfg(name: &str, fallback: &str) -> ControllerConfig {
+        ControllerConfig {
+            friend_machine_name: name.into(),
+            friend_tailscale_ip_fallback: fallback.into(),
+            web_port: 8787,
+            auto_open_browser: false,
+        }
+    }
+
+    #[test]
+    fn magicdns_name_gets_local_variant() {
+        let urls = candidate_urls(&controller_cfg("friend-pc", ""));
+        assert_eq!(urls[0], "http://friend-pc:8787");
+        assert_eq!(urls[1], "http://friend-pc.local:8787");
+    }
+
+    #[test]
+    fn full_ts_net_name_skips_local_variant() {
+        let urls = candidate_urls(&controller_cfg("friend-pc.tail1234.ts.net", ""));
+        assert_eq!(urls.len(), 1);
+        assert_eq!(urls[0], "http://friend-pc.tail1234.ts.net:8787");
+    }
+
+    #[test]
+    fn ip_fallback_is_appended_last() {
+        let urls = candidate_urls(&controller_cfg("friend-pc", " 100.64.0.5 "));
+        assert_eq!(urls.last().unwrap(), "http://100.64.0.5:8787");
+    }
 }

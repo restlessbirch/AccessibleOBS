@@ -1,84 +1,202 @@
 Remote Stream Control — technical notes
 ======================================
 
-Implemented binaries
---------------------
-- bin\bootstrap.exe
-  - --host: Tailscale check/install/login, OBS check/install/start, OBS WebSocket config, host-agent start, pairing code display.
-  - --controller: Tailscale check/login, host panel discovery by MagicDNS/IP, browser open.
-- bin\host-agent.exe
-  - HTTP API + static web panel.
-  - OBS WebSocket 5.x client with authentication handshake.
-  - DPAPI protected local secret storage.
-  - Pairing-code web panel auth, separate from OBS password.
+Бинарники
+---------
+bin\bootstrap.exe — первичная настройка, консольное приложение.
+  --host              Tailscale + OBS + пароль WebSocket + host-agent +
+                      регистрация автозапуска + вывод pairing-кода.
+  --controller        Tailscale + поиск агента в tailnet + открытие браузера.
+  --remove-autostart  удаление ярлыка из автозагрузки.
 
-Security model
+bin\host-agent.exe — фоновый агент, HTTP API и статика панели.
+  В release собран как windows_subsystem="windows", то есть без консольного
+  окна: он стартует при входе в Windows, и мигающая консоль была бы заметна.
+  В debug консоль остаётся, чтобы было видно вывод при разработке.
+
+
+Соединение с OBS
+----------------
+Одно постоянное WebSocket-соединение на весь процесс (src/obs.rs).
+
+Фоновая задача держит сокет, выполняет рукопожатие один раз и обслуживает
+запросы по requestId через oneshot-каналы. Раньше каждый HTTP-запрос открывал
+новое соединение и заново считал SHA256-аутентификацию; на списке аудио это
+давало 2N+1 подключений на одно обновление панели.
+
+Свойства:
+- переподключение с экспоненциальной задержкой 0,5 → 15 секунд;
+- пока связи нет, команды отклоняются сразу, а не висят до таймаута;
+- таймаут запроса 10 секунд;
+- WebSocket Ping каждые 20 секунд для обнаружения мёртвого канала;
+- RequestBatch (op8) для пакетных операций — список аудио теперь два
+  round-trip вместо 2N;
+- подписка на события (eventSubscriptions) и раздача их через broadcast;
+- код закрытия 4009 распознаётся как «неверный пароль» с понятным текстом.
+  В прежней версии op9 ошибочно трактовался как отказ авторизации, хотя это
+  RequestBatchResponse.
+
+
+Поток событий в панель
+----------------------
+GET /api/events — Server-Sent Events, требует авторизации.
+
+Типы сообщений:
+  {"type":"obs","event":{...}}                события OBS как есть
+  {"type":"obs_status","status":{...}}        появление/потеря связи с OBS
+  {"type":"donation","donation":{...}}        новый донат
+  {"type":"donationalerts_status","status":{}} состояние ленты донатов
+
+Панель по этим событиям перерисовывает нужные разделы с задержкой 250 мс,
+чтобы шквал событий не порождал шквал запросов.
+
+
+Сетевая модель
 --------------
-- No Tailscale auth keys.
-- No port forwarding.
-- host-agent tries to bind to Tailscale IPv4 when listen_mode=tailscale_only. If Tailscale IP cannot be detected, it binds localhost as fail-closed behavior.
-- Web panel requires pairing cookie.
-- OBS password, pairing secrets, OAuth tokens, DonationAlerts widget URL are stored in config\secrets\*.dpapi and never intentionally logged or returned to frontend.
+- Никаких Tailscale auth keys.
+- Никакого проброса портов.
+- Агент слушает одновременно адрес Tailscale и 127.0.0.1.
+  Localhost нужен не для удобства: redirect_uri OAuth DonationAlerts
+  указывает на 127.0.0.1, и без этого слушателя код авторизации не дошёл бы
+  до агента. Петлевой интерфейс снаружи недоступен.
+- Если IP Tailscale не определён, агент остаётся только на localhost
+  и пишет предупреждение в лог.
 
-OBS functions
--------------
-- Get version/status.
-- Dynamic scene list.
-- Switch scene.
-- List sources in selected scene.
-- Show/hide source.
-- Audio list, mute/unmute, dB volume.
-- Start/stop stream.
-- Start/stop/pause/resume record.
-- OBS statistics.
+
+Авторизация панели
+------------------
+- Pairing-код: 10 случайных байт в base64url, хранится через DPAPI.
+- Сравнение кода и токена сессии — constant-time (subtle::ConstantTimeEq).
+- Пять неудачных попыток подряд блокируют вход на 30 секунд.
+- Токен сессии кэшируется в памяти; расшифровка DPAPI на каждый запрос убрана.
+- Кука HttpOnly, SameSite=Lax. Флаг Secure намеренно не ставится: внутри
+  tailnet трафик идёт по http, а шифрует его WireGuard. С Secure куку
+  браузер бы отбросил.
+- Есть POST /api/auth/logout.
+- OAuth DonationAlerts использует одноразовый параметр state.
+
+
+Хранение секретов
+-----------------
+config\secrets\*.dpapi, Windows DPAPI, область CurrentUser:
+  obs_websocket_password, pairing_secret, session_token,
+  donationalerts_widget_url, donationalerts_tokens,
+  twitch_tokens, twitch_device_code.
+
+Пароль OBS WebSocket дополнительно попадает в конфиг самого OBS —
+иначе OBS его не примет. Это ограничение OBS, а не выбор проекта.
+Подробности пути — в разделе ниже.
+
+
+Настройка OBS на машине актёра
+------------------------------
+Путь к настройкам obs-websocket:
+  %APPDATA%\obs-studio\plugin_config\obs-websocket\config.json
+
+Это НЕ global.ini. Начиная с OBS 28 плагин obs-websocket встроен и хранит
+настройки здесь. Версии проекта до 0.2 писали секцию [OBSWebSocket] в
+global.ini, которую современный OBS игнорирует: пароль уходил в никуда,
+сервер оставался выключен, и агент молча не мог авторизоваться. Проверено
+на OBS 32.2.1 с obs-websocket 5.7.4.
+
+Ключи, которыми управляет проект: server_enabled, auth_required,
+server_port, server_password, first_load. Остальные (например
+alerts_enabled) сохраняются как есть — это настройки пользователя.
+
+Если в OBS уже задан пароль, он подхватывается вместо генерации нового:
+на этот пароль могут быть настроены Streamer.bot, Touch Portal и прочие
+пульты актёра, и смена пароля их сломала бы.
+
+Порядок в bootstrap: установить OBS -> записать config.json -> запустить.
+OBS читает настройки плагина при старте и перезаписывает файл при выходе,
+поэтому запись имеет смысл только пока OBS закрыт. Если OBS запущен и
+настройки нужно менять, bootstrap просит его закрыть и ждёт до 60 секунд.
+
+Маркеры аварийного завершения:
+  %APPDATA%\obs-studio\.sentinel\run_<uuid>
+
+OBS создаёт такой файл на каждый запуск и удаляет при штатном выходе.
+Уцелевший файл заставляет следующий запуск показать модальное окно
+безопасного режима, которое ждёт человека у клавиатуры. На машине актёра
+человека нет: одно падение OBS означало бы потерю управления до тех пор,
+пока кто-то физически не нажмёт кнопку. Поэтому маркеры снимаются перед
+запуском (clear_obs_crash_sentinel).
+
+Плата за это осознанная: плагин, роняющий OBS на старте, даст цикл падений
+вместо предложения безопасного режима. Чтобы факт падения не потерялся,
+он отдаётся владельцу в /api/health как obs_crashed_last_run и виден в
+панели.
+
+POST /api/obs/launch запускает OBS по команде владельца и сбрасывает паузу
+переподключения через ObsHandle::reconnect_now(). Без сброса панель ждала
+бы до 15 секунд, хотя OBS уже поднимается: замер до правки 31 секунда,
+после — 3.
+
 
 DonationAlerts
 --------------
-- Official Alerts Widget is the production alert path.
-- Owner enters Alerts Widget URL in web panel.
-- URL stored with DPAPI.
-- Reconcile creates/checks:
-  - scene RSC_OVERLAYS;
+Озвучка донатов выполняется официальным Alerts Widget, а не этим кодом.
+Reconcile приводит OBS к рабочему состоянию и идемпотентен:
+  - сцена RSC_OVERLAYS;
   - browser_source RSC_DonationAlerts;
-  - url, width/height from OBS canvas, reroute_audio=true, shutdown=false, restart_when_active=false;
-  - initial volume -8 dB on first creation;
-  - monitoring off where OBS accepts SetInputAudioMonitorType;
-  - nested RSC_OVERLAYS item in every user scene, not in itself.
-- Reconcile is idempotent and returns conflict if RSC_DonationAlerts exists with wrong input kind.
+  - url, width/height по канвасу OBS, reroute_audio=true,
+    shutdown=false, restart_when_active=false;
+  - при первом создании громкость -8 dB;
+  - мониторинг выключается (иначе актёр слышит алерт дважды);
+  - вложенный RSC_OVERLAYS в каждой пользовательской сцене, индекс 0;
+  - конфликт, если RSC_DonationAlerts занят источником другого типа.
+
+Widget URL принимается только по https: виджет всегда отдаётся по https,
+а http означал бы опечатку или подмену.
+
+Realtime-лента (src/donationalerts.rs) — Centrifugo:
+  GET /api/v1/user/oauth → socket_connection_token
+  wss://centrifugo.donationalerts.com/connection/websocket
+  POST /api/v1/centrifuge/subscribe → подпись канала $alerts:donation_<id>
+  автоматическое обновление токена по refresh_token.
+
 
 Twitch
 ------
-- Device Code OAuth endpoints.
-- Protected token storage.
-- Token validation endpoint usage.
-- Channel info get/modify.
-- Stream marker creation.
-- Requires config\host.json twitch.client_id from an official Twitch application.
+Device Code OAuth, хранение токенов через DPAPI, проверка через /oauth2/validate,
+чтение и изменение параметров канала, создание маркера.
+Требуется twitch.client_id в config\host.json.
 
-Known external-validation requirements
---------------------------------------
-These need real accounts/hardware and cannot be fully proven offline:
-- actual Twitch OAuth/client_id acceptance;
-- actual DonationAlerts OAuth app/client_secret exchange;
-- DonationAlerts Centrifugo realtime channel details for the specific account/app;
-- OBS browser_source availability on the actor PC's OBS build;
-- Tailscale tailnet/MagicDNS naming and Windows firewall policy.
 
-Acceptance testing checklist on actor PC
-----------------------------------------
-1. Start START_FRIEND.bat.
-2. Login Tailscale if asked.
-3. Let OBS install/start.
-4. Confirm web panel URL reachable from owner PC.
-5. Enter pairing code.
-6. Switch scene.
-7. Show/hide a source.
-8. Mute/unmute microphone.
-9. Start/stop recording.
-10. Start/stop streaming with test Twitch/OBS profile.
-11. Paste DonationAlerts widget URL.
-12. Run DonationAlerts reconcile.
-13. Confirm RSC_OVERLAYS and RSC_DonationAlerts exist in OBS.
-14. Confirm RSC_DonationAlerts is a separate audio source and not Desktop Audio.
-15. Trigger DonationAlerts test alert from DonationAlerts dashboard.
+Автозапуск
+----------
+Ярлык «Remote Stream Control.lnk» в папке автозагрузки пользователя
+(%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup), создаётся через
+WScript.Shell. Выбран ярлык, а не ключ реестра Run: он виден пользователю,
+удаляется вручную и не требует прав администратора.
 
+Агент при старте сам поднимает OBS, если auto_start_obs=true.
+
+
+Что нельзя проверить без реальных аккаунтов и оборудования
+----------------------------------------------------------
+- приём client_id Twitch реальным приложением;
+- обмен client_secret DonationAlerts на токены;
+- детали канала Centrifugo для конкретного аккаунта;
+- доступность browser_source в сборке OBS на машине актёра;
+- именование MagicDNS и политика брандмауэра Windows в конкретном tailnet.
+
+Эти участки написаны по документации и покрыты юнит-тестами на разбор
+ответов, но сетевого подтверждения на живых аккаунтах не имеют.
+
+
+Приёмочный тест на компьютере актёра
+------------------------------------
+1. Запустить START_FRIEND.bat, дождаться pairing-кода.
+2. Перезагрузить компьютер и убедиться, что панель доступна без запуска BAT.
+3. Открыть панель у владельца, ввести код.
+4. Переключить сцену.
+5. Показать и скрыть источник.
+6. Выключить и включить микрофон.
+7. Начать и остановить запись.
+8. Начать и остановить эфир на тестовом профиле.
+9. Вставить Alerts Widget URL.
+10. Убедиться, что RSC_OVERLAYS и RSC_DonationAlerts появились в OBS.
+11. Убедиться, что RSC_DonationAlerts — отдельный источник звука,
+    а не Desktop Audio.
+12. Отправить тестовый алерт и убедиться, что он виден и слышен в записи.

@@ -3,79 +3,139 @@ REMOTE STREAM CONTROL — README FIRST
 
 Что это
 -------
-Папка для удалённого управления OBS на компьютере актёра через Tailscale.
-Пользовательский интерфейс владельца — обычная web-панель в браузере, доступная с NVDA.
-Код проекта лицензирован MIT, издатель/автор проекта: restlessbirch.
+Удалённое управление OBS на компьютере актёра через Tailscale.
+Интерфейс владельца — обычная web-панель в браузере, пригодная для работы с NVDA.
+Код лицензирован MIT, автор проекта: restlessbirch.
+
+Главная идея: актёр запускает настройку один раз, дальше всё поднимается само,
+а сценами, звуком, эфиром и донатами управляет владелец из панели.
+
+
+Сначала прочитайте это
+----------------------
+Оба компьютера должны оказаться в ОДНОЙ сети Tailscale (tailnet).
+
+Если актёр войдёт в Tailscale под своим аккаунтом, а владелец под своим,
+они окажутся в разных сетях и не увидят друг друга. Установка при этом
+пройдёт успешно, панель не откроется, а причина будет неочевидной.
+
+Варианты:
+- актёр входит в Tailscale под аккаунтом владельца (проще всего);
+- либо актёр под своим, а затем в админке Tailscale делает Share своего
+  устройства владельцу.
+
+Проверить можно командой tailscale status с обеих сторон: машина второго
+компьютера должна быть в списке.
+
 
 Быстрый запуск
 --------------
 
-На компьютере актёра:
-1. Распаковать папку RemoteStreamControl.
-2. Запустить START_FRIEND.bat.
-3. Если Tailscale просит логин — пройти стандартную авторизацию Tailscale.
-4. Если OBS ещё не установлен — установщик OBS откроется/запустится автоматически; после установки снова запустить START_FRIEND.bat.
-5. В конце появится pairing-код. Его надо один раз сообщить владельцу.
+На компьютере актёра (один раз):
+1. Распаковать папку RemoteStreamControl в постоянное место.
+   Не во временную папку и не запускать из архива: программа будет
+   стартовать отсюда при каждом включении компьютера.
+2. Закрыть OBS, если он открыт. OBS перезаписывает свои настройки при
+   выходе, поэтому менять их можно только пока он закрыт. Если OBS
+   запущен, установщик попросит его закрыть и подождёт.
+3. Запустить START_FRIEND.bat.
+4. Если Tailscale просит логин — войти под нужным аккаунтом (см. выше).
+5. Если OBS не установлен — он установится сам.
+6. Если Windows спросит про брандмауэр для OBS — нажать «Отменить».
+   Разрешение не нужно: панель общается с OBS внутри одного компьютера,
+   а такой трафик брандмауэр не проверяет. «Разрешить» открыло бы OBS
+   всей локальной сети без всякой пользы.
+7. Записать pairing-код и сообщить его владельцу.
 
-Если архив собран release-скриптом, внутри уже есть официальные установщики:
-third_party\installers\tailscale-setup-latest-amd64.msi
-third_party\installers\OBS-Studio-*-Windows-Installer.exe
+После этого при каждом включении компьютера Tailscale, OBS и host-agent
+запускаются автоматически, без окон. Актёру больше ничего делать не нужно.
+
+Если архив собран release-скриптом, официальные установщики уже внутри:
+  third_party\installers\tailscale-setup-latest-amd64.msi
+  third_party\installers\OBS-Studio-*-Windows-Installer.exe
 
 На компьютере владельца:
-1. Распаковать эту же папку или минимум START_ME.bat/bin/config.
-2. Открыть config\controller.json и указать friend_machine_name — MagicDNS имя компьютера актёра в Tailscale. Можно указать friend_tailscale_ip_fallback.
+1. Распаковать эту же папку (минимум START_ME.bat, bin, config, web).
+2. В config\controller.json указать friend_machine_name — MagicDNS-имя
+   компьютера актёра. Можно задать friend_tailscale_ip_fallback.
 3. Запустить START_ME.bat.
-4. Если Tailscale просит логин — пройти стандартную авторизацию.
-5. В браузере откроется Remote Stream Control.
-6. Ввести pairing-код с компьютера актёра.
+4. Ввести pairing-код. Дальше панель помнит сессию.
 
-Обычный сценарий после первичной настройки
-------------------------------------------
-Актёр: START_FRIEND.bat
-Владелец: START_ME.bat
 
 Что умеет панель
 ----------------
-- состояние связи/Tailscale/OBS;
+- состояние связи, Tailscale, OBS, автозапуска;
+- запуск OBS у актёра, если тот его закрыл;
 - сцены OBS: список и переключение;
 - источники текущей сцены: показать/скрыть;
-- аудиоисточники: mute/unmute, +/-1 dB, точное dB;
-- Start/Stop Stream;
-- Start/Stop/Pause/Resume Recording;
-- OBS statistics;
-- DonationAlerts: сохранить Alerts Widget URL, автоматически создать RSC_OVERLAYS и RSC_DonationAlerts, включить reroute_audio=true, добавить overlay во все сцены;
-- DonationAlerts audio: mute/unmute/volume;
-- Twitch Device Code OAuth, изменение channel title/category/language, stream marker.
+- аудиоисточники: mute/unmute, +/-1 dB, точное значение dB;
+- старт/стоп эфира;
+- старт/стоп/пауза/продолжение записи;
+- статистика OBS;
+- DonationAlerts: сохранение Alerts Widget URL, автоматическое создание
+  RSC_OVERLAYS и RSC_DonationAlerts, reroute_audio, оверлей во всех сценах;
+- громкость и mute оповещений DonationAlerts;
+- лента донатов в реальном времени (нужен OAuth);
+- Twitch Device Code OAuth, изменение названия/категории/языка, stream marker.
+
+Панель обновляется сама: агент передаёт события OBS через поток /api/events,
+поэтому смена сцены или старт эфира видны сразу, без нажатия «Обновить».
+
+
+Донаты: что нужно для озвучки
+-----------------------------
+Озвучивает донаты сам DonationAlerts, а не эта программа.
+
+1. На donationalerts.com включить «Озвучка сообщений» в разделе Оповещения.
+2. Вставить ссылку Alerts Widget в панель и нажать «Сохранить и настроить OBS».
+
+Панель создаст browser_source с этим виджетом и включит reroute_audio,
+чтобы звук шёл в микшер OBS и попадал в эфир. Мониторинг выключается,
+иначе актёр слышал бы алерт дважды.
+
+OAuth DonationAlerts нужен отдельно и только для ленты донатов в панели.
+На озвучку в эфире он не влияет.
+
 
 Секреты
 -------
-Не храните секреты в BAT/JSON.
-Приложение хранит эти данные через Windows DPAPI в config\secrets\*.dpapi:
-- OBS WebSocket password;
-- pairing secret/session;
+Не храните секреты в BAT/JSON. Приложение хранит их через Windows DPAPI
+в config\secrets\*.dpapi:
+- пароль OBS WebSocket;
+- pairing secret и токен сессии;
 - DonationAlerts widget URL;
-- DonationAlerts OAuth tokens;
-- Twitch OAuth tokens.
+- OAuth-токены DonationAlerts;
+- OAuth-токены Twitch.
+
+Исключение — client_id и client_secret приложений Twitch и DonationAlerts:
+их нужно вписать в config\host.json вручную, потому что они требуются
+до первой авторизации.
+
 
 Настройка Twitch
 ----------------
-Для Twitch Device Code Flow нужен client_id приложения Twitch.
-Укажите его в config\host.json:
-  twitch.client_id
+Нужен client_id приложения Twitch с Device Code Flow.
+  config\host.json → twitch.client_id
 Scope: channel:manage:broadcast.
+
 
 Настройка DonationAlerts OAuth
 ------------------------------
-Официальный Alerts Widget работает после вставки URL в панели.
-OAuth DonationAlerts нужен отдельно для истории/realtime статуса донатов.
-Укажите в config\host.json:
-  donationalerts.client_id
-  donationalerts.client_secret
-  donationalerts.redirect_uri
+  config\host.json → donationalerts.client_id
+                     donationalerts.client_secret
+                     donationalerts.redirect_uri
+
+redirect_uri по умолчанию — http://127.0.0.1:8787/api/donationalerts/oauth/callback.
+Агент специально слушает и localhost, и адрес Tailscale, чтобы этот
+адрес возврата работал.
+
 
 Важно
 -----
-DonationAlerts Alerts Widget URL является секретом. После сохранения панель больше не показывает полный URL.
+DonationAlerts Alerts Widget URL является секретом: кто угодно с этой
+ссылкой может показать алерт у вас в эфире. После сохранения панель
+больше не показывает полный URL.
+
 
 Логи
 ----
@@ -83,9 +143,18 @@ logs\bootstrap.log
 logs\host.log
 Секреты в лог не пишутся.
 
+
 Если не открывается панель
 --------------------------
-1. Проверьте, что оба компьютера в одном Tailscale tailnet.
-2. На компьютере владельца проверьте config\controller.json.
-3. На компьютере актёра проверьте, что START_FRIEND.bat запущен.
+1. Проверьте, что оба компьютера в одном Tailscale tailnet (tailscale status).
+2. Проверьте config\controller.json на компьютере владельца.
+3. Проверьте, что компьютер актёра включён.
 4. Откройте logs\host.log и logs\bootstrap.log.
+5. Крайняя мера: попросите актёра запустить START_FRIEND.bat ещё раз —
+   это безопасно и ничего не ломает.
+
+
+Убрать автозапуск у актёра
+--------------------------
+  bin\bootstrap.exe --remove-autostart
+или удалить ярлык «Remote Stream Control» из папки shell:startup.

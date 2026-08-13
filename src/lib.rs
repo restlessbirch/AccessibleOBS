@@ -1,14 +1,20 @@
+pub mod donationalerts;
 pub mod obs;
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use base64::{Engine as _, engine::general_purpose};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
     fs,
+    net::IpAddr,
     path::{Path, PathBuf},
-    process::Command,
+    process::{Command, Stdio},
+    sync::{
+        OnceLock,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 use tokio::time::timeout;
@@ -167,8 +173,26 @@ fn default_monitoring() -> String {
     "off".into()
 }
 
+/// Корень установки: папка, содержащая `bin`, `config`, `web` и `logs`.
+///
+/// Берётся от пути к самому exe, а не от текущей директории, иначе запуск
+/// `bin\host-agent.exe` двойным кликом искал бы config рядом с exe и не нашёл.
+/// При `cargo run` exe лежит в `target\debug`, и мы честно падаем в cwd.
 pub fn app_root() -> PathBuf {
-    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+    static ROOT: OnceLock<PathBuf> = OnceLock::new();
+    ROOT.get_or_init(|| {
+        if let Ok(exe) = std::env::current_exe()
+            && let Some(dir) = exe.parent()
+            && dir
+                .file_name()
+                .is_some_and(|n| n.eq_ignore_ascii_case("bin"))
+            && let Some(root) = dir.parent()
+        {
+            return root.to_path_buf();
+        }
+        std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+    })
+    .clone()
 }
 pub fn config_dir() -> PathBuf {
     app_root().join("config")
@@ -257,12 +281,16 @@ pub fn random_secret_b64(bytes: usize) -> String {
     general_purpose::URL_SAFE_NO_PAD.encode(buf)
 }
 
+/// Режем по символам, а не по байтам: срез `&s[..4]` паникует, если четвёртый
+/// байт попадает в середину UTF-8 последовательности.
 pub fn redact(s: &str) -> String {
-    if s.len() <= 8 {
-        "***".into()
-    } else {
-        format!("{}...{}", &s[..4], &s[s.len() - 4..])
+    let chars: Vec<char> = s.chars().collect();
+    if chars.len() <= 8 {
+        return "***".into();
     }
+    let head: String = chars[..4].iter().collect();
+    let tail: String = chars[chars.len() - 4..].iter().collect();
+    format!("{head}...{tail}")
 }
 
 #[cfg(windows)]
@@ -368,17 +396,6 @@ pub fn delete_secret(name: &str) -> Result<()> {
 pub fn find_exe(name: &str) -> Option<PathBuf> {
     which::which(name).ok()
 }
-pub fn run_output(program: &str, args: &[&str], timeout_ms: u64) -> Result<String> {
-    let mut cmd = Command::new(program);
-    cmd.args(args);
-    let out = cmd
-        .output()
-        .with_context(|| format!("failed to run {program}"))?;
-    let s =
-        String::from_utf8_lossy(&out.stdout).to_string() + &String::from_utf8_lossy(&out.stderr);
-    let _ = timeout_ms;
-    Ok(s)
-}
 
 #[cfg(windows)]
 pub fn default_obs_paths() -> Vec<PathBuf> {
@@ -404,63 +421,317 @@ pub fn find_obs(configured: &str) -> Option<PathBuf> {
     find_exe("obs64.exe").or_else(|| find_exe("obs"))
 }
 
-pub fn ensure_obs_websocket_config(password: &str, port: u16) -> Result<()> {
-    #[cfg(windows)]
-    {
-        let appdata = std::env::var("APPDATA").context("APPDATA not set")?;
-        let path = PathBuf::from(appdata).join("obs-studio").join("global.ini");
-        fs::create_dir_all(path.parent().unwrap())?;
-        let mut text = if path.exists() {
-            fs::read_to_string(&path).unwrap_or_default()
-        } else {
-            String::new()
-        };
-        if !text.contains("[OBSWebSocket]") {
-            text.push_str("\n[OBSWebSocket]\n");
+pub fn process_running(name: &str) -> bool {
+    Command::new("tasklist")
+        .args(["/FI", &format!("IMAGENAME eq {name}"), "/NH"])
+        .output()
+        .map(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .to_ascii_lowercase()
+                .contains(&name.to_ascii_lowercase())
+        })
+        .unwrap_or(false)
+}
+
+pub fn tailscale_exe() -> Option<PathBuf> {
+    find_exe("tailscale.exe").or_else(|| {
+        let p = PathBuf::from(r"C:\Program Files\Tailscale\tailscale.exe");
+        p.exists().then_some(p)
+    })
+}
+
+/// IPv4-адрес машины в tailnet. `None`, если Tailscale не установлен или не поднят.
+pub fn tailscale_ip() -> Option<IpAddr> {
+    let exe = tailscale_exe()?;
+    let out = Command::new(exe).args(["ip", "-4"]).output().ok()?;
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .next()?
+        .trim()
+        .parse()
+        .ok()
+}
+
+pub fn tailscale_running() -> bool {
+    let Some(exe) = tailscale_exe() else {
+        return false;
+    };
+    Command::new(exe)
+        .args(["status", "--json"])
+        .output()
+        .map(|o| {
+            let txt = String::from_utf8_lossy(&o.stdout);
+            txt.contains("\"BackendState\":\"Running\"")
+                || txt.contains("\"BackendState\": \"Running\"")
+        })
+        .unwrap_or(false)
+}
+
+pub fn obs_is_running() -> bool {
+    process_running("obs64.exe") || process_running("obs.exe")
+}
+
+static OBS_CRASHED_LAST_RUN: AtomicBool = AtomicBool::new(false);
+
+/// Завершился ли прошлый сеанс OBS аварийно.
+pub fn obs_crashed_last_run() -> bool {
+    OBS_CRASHED_LAST_RUN.load(Ordering::Relaxed)
+}
+
+/// Убирает признак аварийного завершения OBS перед запуском.
+///
+/// OBS создаёт `.sentinel` при старте и удаляет при штатном выходе. Если файл
+/// уцелел, следующий запуск показывает модальное окно безопасного режима и ждёт
+/// человека у клавиатуры. У актёра человека нет: одно падение OBS означало бы
+/// потерю управления до тех пор, пока кто-то физически не нажмёт кнопку.
+///
+/// Плата за это осознанная: при плагине, роняющем OBS на старте, вместо
+/// предложения безопасного режима получится цикл падений. Поэтому факт падения
+/// не проглатываем, а показываем владельцу в панели.
+#[cfg(windows)]
+pub fn clear_obs_crash_sentinel() -> bool {
+    let Ok(appdata) = std::env::var("APPDATA") else {
+        return false;
+    };
+    // `.sentinel` — это папка: OBS кладёт туда файл `run_<uuid>` на каждый
+    // запуск и удаляет его при штатном выходе. Уцелевшие файлы означают
+    // аварийно завершённые сеансы.
+    let dir = PathBuf::from(appdata).join("obs-studio").join(".sentinel");
+    let Ok(entries) = fs::read_dir(&dir) else {
+        return false;
+    };
+    let mut crashed = false;
+    for entry in entries.flatten() {
+        let is_run_marker = entry
+            .file_name()
+            .to_str()
+            .is_some_and(|n| n.starts_with("run_"));
+        if is_run_marker && fs::remove_file(entry.path()).is_ok() {
+            crashed = true;
         }
-        text = set_ini_value(&text, "OBSWebSocket", "ServerEnabled", "true");
-        text = set_ini_value(&text, "OBSWebSocket", "ServerPort", &port.to_string());
-        text = set_ini_value(&text, "OBSWebSocket", "AuthRequired", "true");
-        text = set_ini_value(&text, "OBSWebSocket", "ServerPassword", password);
-        fs::write(path, text)?;
+    }
+    if crashed {
+        OBS_CRASHED_LAST_RUN.store(true, Ordering::Relaxed);
+    }
+    crashed
+}
+#[cfg(not(windows))]
+pub fn clear_obs_crash_sentinel() -> bool {
+    false
+}
+
+/// Запускает OBS, если он ещё не запущен. Свёрнутым в трей, чтобы у актёра
+/// не открывалось окно на весь экран при каждом входе в Windows.
+pub fn start_obs_if_needed(configured_path: &str) -> Result<bool> {
+    if obs_is_running() {
+        return Ok(false);
+    }
+    if clear_obs_crash_sentinel() {
+        tracing::warn!("Прошлый сеанс OBS завершился аварийно; окно безопасного режима подавлено");
+    }
+    let obs = find_obs(configured_path).ok_or_else(|| {
+        anyhow!("OBS Studio не найден. Установите OBS с https://obsproject.com/ и запустите START_FRIEND.bat.")
+    })?;
+    let mut cmd = Command::new(&obs);
+    if let Some(parent) = obs.parent() {
+        cmd.current_dir(parent);
+    }
+    cmd.arg("--minimize-to-tray")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .with_context(|| format!("не удалось запустить {}", obs.display()))?;
+    Ok(true)
+}
+
+#[cfg(windows)]
+pub fn startup_dir() -> Option<PathBuf> {
+    let appdata = std::env::var("APPDATA").ok()?;
+    Some(PathBuf::from(appdata).join(r"Microsoft\Windows\Start Menu\Programs\Startup"))
+}
+#[cfg(not(windows))]
+pub fn startup_dir() -> Option<PathBuf> {
+    None
+}
+
+pub fn autostart_shortcut() -> Option<PathBuf> {
+    Some(startup_dir()?.join("Remote Stream Control.lnk"))
+}
+
+pub fn autostart_registered() -> bool {
+    autostart_shortcut().is_some_and(|p| p.exists())
+}
+
+/// Прописывает host-agent в автозагрузку текущего пользователя.
+///
+/// Ярлык, а не ключ реестра Run: ярлык виден пользователю в папке
+/// «Автозагрузка», его легко удалить вручную, и он не требует прав администратора.
+/// Создаём через WScript.Shell — единственный способ собрать .lnk без COM-крейта.
+#[cfg(windows)]
+pub fn register_autostart() -> Result<PathBuf> {
+    let shortcut = autostart_shortcut().context("не удалось определить папку автозагрузки")?;
+    let target = bin_dir().join("host-agent.exe");
+    if !target.exists() {
+        bail!("{} не найден", target.display());
+    }
+    fs::create_dir_all(shortcut.parent().unwrap())?;
+
+    let script = format!(
+        "$s = (New-Object -ComObject WScript.Shell).CreateShortcut('{}'); \
+         $s.TargetPath = '{}'; \
+         $s.WorkingDirectory = '{}'; \
+         $s.Description = 'Remote Stream Control host agent'; \
+         $s.Save()",
+        ps_quote(&shortcut.to_string_lossy()),
+        ps_quote(&target.to_string_lossy()),
+        ps_quote(&app_root().to_string_lossy()),
+    );
+    let out = Command::new("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+        .output()
+        .context("не удалось запустить powershell для создания ярлыка")?;
+    if !shortcut.exists() {
+        bail!(
+            "ярлык автозагрузки не создан: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(shortcut)
+}
+#[cfg(not(windows))]
+pub fn register_autostart() -> Result<PathBuf> {
+    bail!("автозапуск поддерживается только на Windows")
+}
+
+pub fn unregister_autostart() -> Result<()> {
+    if let Some(p) = autostart_shortcut()
+        && p.exists()
+    {
+        fs::remove_file(p)?;
     }
     Ok(())
 }
-fn set_ini_value(text: &str, section: &str, key: &str, value: &str) -> String {
-    let mut out = Vec::<String>::new();
-    let mut in_sec = false;
-    let mut done = false;
-    for line in text.lines() {
-        let trimmed = line.trim();
-        if trimmed.starts_with('[') && trimmed.ends_with(']') {
-            if in_sec && !done {
-                out.push(format!("{}={}", key, value));
-                done = true;
-            }
-            in_sec = trimmed == format!("[{}]", section);
-            out.push(line.to_string());
-            continue;
-        }
-        if in_sec
-            && trimmed
-                .split('=')
-                .next()
-                .map(|k| k.eq_ignore_ascii_case(key))
-                .unwrap_or(false)
-        {
-            out.push(format!("{}={}", key, value));
-            done = true;
-        } else {
-            out.push(line.to_string());
+
+/// Экранирование для одинарных кавычек PowerShell: удвоение апострофа.
+fn ps_quote(s: &str) -> String {
+    s.replace('\'', "''")
+}
+
+/// Путь к настройкам obs-websocket.
+///
+/// Начиная с OBS 28 плагин obs-websocket встроен и хранит конфигурацию здесь,
+/// а НЕ в `global.ini`. Прежняя версия писала секцию `[OBSWebSocket]` в
+/// global.ini, которую современный OBS просто игнорирует, поэтому пароль
+/// никогда не применялся и агент не мог авторизоваться.
+#[cfg(windows)]
+pub fn obs_websocket_config_path() -> Result<PathBuf> {
+    let appdata = std::env::var("APPDATA").context("переменная APPDATA не задана")?;
+    Ok(PathBuf::from(appdata)
+        .join("obs-studio")
+        .join("plugin_config")
+        .join("obs-websocket")
+        .join("config.json"))
+}
+
+#[cfg(windows)]
+fn read_obs_websocket_config() -> Value {
+    let Ok(path) = obs_websocket_config_path() else {
+        return json!({});
+    };
+    let Ok(text) = fs::read_to_string(&path) else {
+        return json!({});
+    };
+    match serde_json::from_str::<Value>(&strip_bom(&text)) {
+        Ok(v) if v.is_object() => v,
+        _ => json!({}),
+    }
+}
+
+/// Вливает нужные ключи в существующий конфиг, не трогая чужие.
+/// Возвращает результат и признак того, что что-то поменялось.
+fn merge_config(mut current: Value, desired: &Value) -> (Value, bool) {
+    if !current.is_object() {
+        current = json!({});
+    }
+    let obj = current.as_object_mut().expect("объект гарантирован выше");
+    let mut changed = false;
+    for (key, value) in desired.as_object().expect("desired всегда объект") {
+        if obj.get(key) != Some(value) {
+            obj.insert(key.clone(), value.clone());
+            changed = true;
         }
     }
-    if !done {
-        if !in_sec && !text.contains(&format!("[{}]", section)) {
-            out.push(format!("[{}]", section));
-        }
-        out.push(format!("{}={}", key, value));
+    (current, changed)
+}
+
+/// Настройки, которые нам нужны от obs-websocket.
+fn desired_obs_websocket_config(password: &str, port: u16) -> Value {
+    json!({
+        "server_enabled": true,
+        "auth_required": true,
+        "server_port": port,
+        "server_password": password,
+        // Без этого ключа OBS показывает мастер первого запуска плагина.
+        "first_load": false,
+    })
+}
+
+/// Пароль, который OBS уже использует, если он там задан.
+///
+/// Подхватываем его вместо генерации нового: к WebSocket мог быть подключён
+/// Streamer.bot, Touch Portal или чужой пульт, и смена пароля их сломала бы.
+#[cfg(windows)]
+pub fn existing_obs_websocket_password() -> Option<String> {
+    read_obs_websocket_config()
+        .get("server_password")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+#[cfg(not(windows))]
+pub fn existing_obs_websocket_password() -> Option<String> {
+    None
+}
+
+/// Совпадают ли текущие настройки OBS с нужными.
+///
+/// Проверять отдельно важно: OBS перезаписывает config.json при выходе, поэтому
+/// менять файл имеет смысл только когда OBS закрыт.
+#[cfg(windows)]
+pub fn obs_websocket_config_matches(password: &str, port: u16) -> bool {
+    let current = read_obs_websocket_config();
+    desired_obs_websocket_config(password, port)
+        .as_object()
+        .expect("desired всегда объект")
+        .iter()
+        .all(|(k, v)| current.get(k) == Some(v))
+}
+#[cfg(not(windows))]
+pub fn obs_websocket_config_matches(_password: &str, _port: u16) -> bool {
+    true
+}
+
+/// Включает WebSocket-сервер OBS с нашим паролем. Возвращает `true`, если файл
+/// действительно менялся.
+///
+/// Остальные ключи (например `alerts_enabled`) сохраняем как есть — это
+/// пользовательские настройки, и затирать их незачем.
+#[cfg(windows)]
+pub fn ensure_obs_websocket_config(password: &str, port: u16) -> Result<bool> {
+    let path = obs_websocket_config_path()?;
+    fs::create_dir_all(path.parent().context("нет родительской папки")?)?;
+
+    let desired = desired_obs_websocket_config(password, port);
+    let (cfg, changed) = merge_config(read_obs_websocket_config(), &desired);
+    if changed {
+        fs::write(&path, serde_json::to_string_pretty(&cfg)?)?;
     }
-    out.join("\n") + "\n"
+    Ok(changed)
+}
+#[cfg(not(windows))]
+pub fn ensure_obs_websocket_config(_password: &str, _port: u16) -> Result<bool> {
+    Ok(false)
 }
 
 pub async fn tcp_ready(host: &str, port: u16, ms: u64) -> bool {
@@ -527,23 +798,50 @@ mod tests {
     }
 
     #[test]
-    fn ini_writer_updates_existing_section_without_duplicates() {
-        let original = "[General]\nName=Demo\n[OBSWebSocket]\nServerPort=4444\n";
-        let updated = set_ini_value(original, "OBSWebSocket", "ServerPort", "4455");
-        assert!(updated.contains("[OBSWebSocket]\nServerPort=4455\n"));
-        assert!(!updated.contains("ServerPort=4444"));
-        assert_eq!(updated.matches("ServerPort=").count(), 1);
+    fn websocket_config_enables_server_with_our_password() {
+        let desired = desired_obs_websocket_config("s3cret", 4455);
+        assert_eq!(desired["server_enabled"], true);
+        assert_eq!(desired["auth_required"], true);
+        assert_eq!(desired["server_port"], 4455);
+        assert_eq!(desired["server_password"], "s3cret");
+        // Без first_load=false OBS покажет мастер первого запуска плагина.
+        assert_eq!(desired["first_load"], false);
     }
 
     #[test]
-    fn ini_writer_creates_missing_section_and_key() {
-        let updated = set_ini_value(
-            "[General]\nName=Demo\n",
-            "OBSWebSocket",
-            "AuthRequired",
-            "true",
+    fn merge_keeps_unrelated_user_settings() {
+        // Реальный конфиг OBS 32 с выключенным сервером и чужим паролем.
+        let current = json!({
+            "alerts_enabled": true,
+            "auth_required": true,
+            "first_load": false,
+            "server_enabled": false,
+            "server_password": "их-пароль",
+            "server_port": 4455
+        });
+        let (merged, changed) = merge_config(current, &desired_obs_websocket_config("наш", 4455));
+        assert!(changed);
+        assert_eq!(merged["server_enabled"], true);
+        assert_eq!(merged["server_password"], "наш");
+        // Пользовательскую настройку не тронули.
+        assert_eq!(merged["alerts_enabled"], true);
+    }
+
+    #[test]
+    fn merge_reports_no_change_when_already_correct() {
+        let desired = desired_obs_websocket_config("pw", 4455);
+        let (_, changed) = merge_config(desired.clone(), &desired);
+        assert!(!changed);
+    }
+
+    #[test]
+    fn merge_recovers_from_corrupted_config() {
+        let (merged, changed) = merge_config(
+            json!("не объект"),
+            &desired_obs_websocket_config("pw", 4455),
         );
-        assert!(updated.contains("[OBSWebSocket]\nAuthRequired=true\n"));
+        assert!(changed);
+        assert_eq!(merged["server_password"], "pw");
     }
 
     #[test]
