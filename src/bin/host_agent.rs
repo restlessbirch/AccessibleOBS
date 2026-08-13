@@ -1129,9 +1129,64 @@ fn special_input_roles(special: &Value) -> HashMap<String, &'static str> {
     roles
 }
 
-/// Громкость и mute всех входов за два round-trip вместо 2N.
-async fn obs_audio(State(st): State<AppState>, headers: HeaderMap) -> ApiResult<Value> {
+fn scene_audio_names(items: &Value) -> Vec<(String, Value, Value, Value)> {
+    items
+        .get("sceneItems")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|item| {
+            let name = item.get("sourceName").and_then(Value::as_str)?.to_string();
+            Some((
+                name,
+                item.get("inputKind").cloned().unwrap_or(Value::Null),
+                item.get("sceneItemId").cloned().unwrap_or(Value::Null),
+                item.get("sceneItemEnabled").cloned().unwrap_or(Value::Null),
+            ))
+        })
+        .collect()
+}
+
+async fn scene_source_counts(obs: &ObsHandle) -> Result<HashMap<String, usize>> {
+    let scenes = obs.request("GetSceneList", json!({})).await?;
+    let names: Vec<String> = scenes
+        .get("scenes")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|scene| scene.get("sceneName").and_then(Value::as_str))
+        .map(str::to_string)
+        .collect();
+    let results = obs
+        .batch(
+            names
+                .iter()
+                .map(|scene| BatchItem::new("GetSceneItemList", json!({"sceneName": scene})))
+                .collect(),
+        )
+        .await?;
+    let mut counts = HashMap::new();
+    for result in results.iter().filter_map(response_data) {
+        for (name, _, _, _) in scene_audio_names(result) {
+            *counts.entry(name).or_insert(0) += 1;
+        }
+    }
+    Ok(counts)
+}
+
+/// Громкость и mute входов за два round-trip вместо 2N.
+async fn obs_audio(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<HashMap<String, String>>,
+) -> ApiResult<Value> {
     require_auth(&st, &headers).await?;
+    let scene = q
+        .get("scene")
+        .map(String::as_str)
+        .map(str::trim)
+        .filter(|v| !v.is_empty());
+
     // Список входов и их роли — за один round-trip.
     let head = st
         .obs
@@ -1152,25 +1207,57 @@ async fn obs_audio(State(st): State<AppState>, headers: HeaderMap) -> ApiResult<
         .map(special_input_roles)
         .unwrap_or_default();
 
-    let names: Vec<(String, Value)> = inputs
+    let input_kinds: HashMap<String, Value> = inputs
         .get("inputs")
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
         .filter_map(|i| {
-            let name = i.get("inputName").and_then(Value::as_str)?.to_string();
-            Some((name, i.get("inputKind").cloned().unwrap_or(Value::Null)))
+            Some((
+                i.get("inputName").and_then(Value::as_str)?.to_string(),
+                i.get("inputKind").cloned().unwrap_or(Value::Null),
+            ))
         })
         .collect();
+
+    let source_counts = if scene.is_some() {
+        scene_source_counts(&st.obs).await.unwrap_or_default()
+    } else {
+        HashMap::new()
+    };
+
+    let names: Vec<(String, Value, Value, Value)> = if let Some(scene) = scene {
+        let scene_items = st
+            .obs
+            .request("GetSceneItemList", json!({"sceneName": scene}))
+            .await
+            .map_err(|e| err("Не удалось получить источники выбранной сцены", e))?;
+        scene_audio_names(&scene_items)
+            .into_iter()
+            .map(|(name, kind, id, enabled)| {
+                let kind = if kind.is_null() {
+                    input_kinds.get(&name).cloned().unwrap_or(Value::Null)
+                } else {
+                    kind
+                };
+                (name, kind, id, enabled)
+            })
+            .collect()
+    } else {
+        input_kinds
+            .into_iter()
+            .map(|(name, kind)| (name, kind, Value::Null, Value::Null))
+            .collect()
+    };
 
     // Свежая установка OBS без источников — обычное состояние на первом
     // запуске у актёра. Пустой RequestBatch отправлять незачем.
     if names.is_empty() {
-        return Ok(Json(json!({"audio": []})));
+        return Ok(Json(json!({"audio": [], "scene": scene})));
     }
 
     let mut batch = Vec::with_capacity(names.len() * 2);
-    for (name, _) in &names {
+    for (name, _, _, _) in &names {
         batch.push(BatchItem::new("GetInputVolume", json!({"inputName": name})));
         batch.push(BatchItem::new("GetInputMute", json!({"inputName": name})));
     }
@@ -1181,7 +1268,7 @@ async fn obs_audio(State(st): State<AppState>, headers: HeaderMap) -> ApiResult<
         .map_err(|e| err("Не удалось получить состояние аудио", e))?;
 
     let mut rows = Vec::new();
-    for (i, (name, kind)) in names.iter().enumerate() {
+    for (i, (name, kind, scene_item_id, scene_item_enabled)) in names.iter().enumerate() {
         let volume = results.get(i * 2).and_then(response_data);
         let mute = results.get(i * 2 + 1).and_then(response_data);
         // Источники без аудио на эти запросы отвечают ошибкой — пропускаем их.
@@ -1205,9 +1292,12 @@ async fn obs_audio(State(st): State<AppState>, headers: HeaderMap) -> ApiResult<
             "muted": mute.and_then(|m| m.get("inputMuted")).cloned().unwrap_or(Value::Null),
             "volumeDb": db,
             "volumeMul": volume.and_then(|v| v.get("inputVolumeMul")).cloned().unwrap_or(Value::Null),
+            "sceneItemId": scene_item_id,
+            "sceneItemEnabled": scene_item_enabled,
+            "sceneUseCount": source_counts.get(name).copied().unwrap_or(0),
         }));
     }
-    Ok(Json(json!({"audio": rows})))
+    Ok(Json(json!({"audio": rows, "scene": scene})))
 }
 
 async fn obs_audio_mute(

@@ -299,6 +299,7 @@ function handleObsEvent(type, data) {
     case 'SceneItemCreated':
     case 'SceneItemRemoved':
       schedule('sources', refreshSources);
+      schedule('audio', refreshAudio);
       break;
     case 'InputMuteStateChanged':
       journal(`${data.inputName}: звук ${data.inputMuted ? 'выключен' : 'включён'}`);
@@ -641,8 +642,10 @@ async function refreshScenes() {
   try {
     const data = await api('/api/obs/scenes');
     const scenes = data.scenes || [];
-    currentScene = data.currentProgramSceneName || currentScene;
     sceneNames = scenes.map((s) => s.sceneName);
+    if (!currentScene || !sceneNames.includes(currentScene)) {
+      currentScene = data.currentProgramSceneName || currentScene;
+    }
 
     replace($('sceneSelect'), scenes.map((s) =>
       el('option', {
@@ -659,17 +662,26 @@ async function refreshScenes() {
       : el('li', { class: 'empty', text: 'сцен нет' }));
 
     await refreshSources();
+    await refreshAudio();
   } catch (e) {
     replace($('sceneList'), el('li', { text: e.message }));
   }
 }
+
+$('sceneSelect').onchange = async (event) => {
+  currentScene = event.target.value;
+  await refreshSources();
+  await refreshAudio();
+};
 
 $('setScene').onclick = async () => {
   const scene = $('sceneSelect').value;
   if (!scene) return;
   try {
     await post('/api/obs/scenes/current', { sceneName: scene });
+    currentScene = scene;
     say('Сцена переключена: ' + scene);
+    await refreshScenes();
   } catch (e) {
     fail(e);
   }
@@ -950,6 +962,8 @@ async function setSource(sceneItemId, sourceName, enabled) {
       enabled,
     });
     say(`${sourceName}: ${enabled ? 'показан' : 'скрыт'}`);
+    await refreshSources();
+    await refreshAudio();
   } catch (e) {
     fail(e);
   }
@@ -1172,15 +1186,23 @@ function renderMicSummary(rows) {
 
 async function refreshAudio() {
   try {
-    const data = await api('/api/obs/audio');
+    const globalData = await api('/api/obs/audio');
+    const scenePath = currentScene
+      ? '/api/obs/audio?scene=' + encodeURIComponent(currentScene)
+      : '/api/obs/audio';
+    const data = currentScene ? await api(scenePath) : globalData;
     const rows = data.audio || [];
     levelNodes.clear();
-    micName = (rows.find((a) => a.role === 'mic') || {}).inputName || null;
-    renderMicSummary(rows);
+    micName = ((globalData.audio || []).find((a) => a.role === 'mic') || {}).inputName || null;
+    renderMicSummary(globalData.audio || []);
     replace($('audio'), rows.length
       ? rows.map((a) => {
           const name = a.inputName;
           const db = Number(a.volumeDb || 0);
+          const sceneItemId = a.sceneItemId;
+          const inScene = sceneItemId !== null && sceneItemId !== undefined;
+          const sceneEnabled = a.sceneItemEnabled !== false;
+          const sharedAcrossScenes = inScene && Number(a.sceneUseCount || 0) > 1;
           const field = el('input', {
             type: 'number',
             step: '0.5',
@@ -1197,28 +1219,51 @@ async function refreshAudio() {
 
           const role = a.role === 'mic' ? ' — микрофон'
             : a.role === 'desktop' ? ' — звук системы' : '';
+          const volumeControls = sharedAcrossScenes
+            ? [el('p', {
+                class: 'hint',
+                text: 'Громкость общая: этот источник есть в нескольких сценах.',
+              })]
+            : [
+                button('−1 dB', () => audioVolume(name, db - 1), 'quiet'),
+                button('+1 dB', () => audioVolume(name, db + 1), 'quiet'),
+                field,
+                button('Применить', () => audioVolume(name, Number(field.value))),
+              ];
 
           return el('div', { class: 'audio-row' }, [
             el('h3', { text: name + role }),
             el('p', {
-              text: `Звук: ${a.muted ? 'выключен' : 'включён'}. Громкость: ${db.toFixed(1)} dB.`,
+              text: inScene
+                ? `В этой сцене: ${sceneEnabled ? 'включён' : 'выключен'}. Громкость: ${db.toFixed(1)} dB.`
+                : `Звук: ${a.muted ? 'выключен' : 'включён'}. Громкость: ${db.toFixed(1)} dB.`,
             }),
             el('p', { class: 'hint' }, [document.createTextNode('Уровень: '), level]),
             button('Проверить звук', () => announceLevel(name), 'quiet'),
-            stateActionButton(
-              !a.muted,
-              'Звук включён — выключить',
-              'Звук выключен — включить',
-              () => audioMute(name, !a.muted),
-              'quiet',
-            ),
-            button('−1 dB', () => audioVolume(name, db - 1), 'quiet'),
-            button('+1 dB', () => audioVolume(name, db + 1), 'quiet'),
-            field,
-            button('Применить', () => audioVolume(name, Number(field.value))),
+            inScene
+              ? stateActionButton(
+                  sceneEnabled,
+                  'В этой сцене включён — выключить здесь',
+                  'В этой сцене выключен — включить здесь',
+                  () => setSource(sceneItemId, name, !sceneEnabled),
+                  'quiet',
+                )
+              : stateActionButton(
+                  !a.muted,
+                  'Звук включён — выключить',
+                  'Звук выключен — включить',
+                  () => audioMute(name, !a.muted),
+                  'quiet',
+                ),
+            ...volumeControls,
           ]);
         })
-      : el('p', { class: 'empty', text: 'аудиоисточников нет' }));
+      : el('p', {
+          class: 'empty',
+          text: currentScene
+            ? 'в выбранной сцене нет аудиоисточников'
+            : 'аудиоисточников нет',
+        }));
   } catch (e) {
     replace($('micSummary'), el('p', { text: e.message }));
     replace($('audio'), el('p', { text: e.message }));
