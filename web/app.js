@@ -796,12 +796,34 @@ function handleLevels(levels) {
   }
 }
 
+function renderMicSummary(rows) {
+  const mic = rows.find((a) => a.role === 'mic');
+  if (!mic) {
+    replace($('micSummary'), el('p', {
+      class: 'notice',
+      text: 'Основной микрофон не определён. Клавиша M и тревога тишины ничего не изменят.',
+    }));
+    return;
+  }
+  const db = Number(mic.volumeDb || 0);
+  replace($('micSummary'), el('div', { class: 'audio-row' }, [
+    el('h3', { text: 'Основной микрофон: ' + mic.inputName }),
+    el('p', {
+      text: `Звук: ${mic.muted ? 'выключен' : 'включён'}. Громкость: ${db.toFixed(1)} dB.`,
+    }),
+    button('Проверить микрофон', () => announceLevel(mic.inputName), 'quiet'),
+    button('Выключить микрофон', () => audioMute(mic.inputName, true), 'quiet'),
+    button('Включить микрофон', () => audioMute(mic.inputName, false), 'quiet'),
+  ]));
+}
+
 async function refreshAudio() {
   try {
     const data = await api('/api/obs/audio');
     const rows = data.audio || [];
     levelNodes.clear();
     micName = (rows.find((a) => a.role === 'mic') || {}).inputName || null;
+    renderMicSummary(rows);
     replace($('audio'), rows.length
       ? rows.map((a) => {
           const name = a.inputName;
@@ -840,6 +862,7 @@ async function refreshAudio() {
         })
       : el('p', { class: 'empty', text: 'аудиоисточников нет' }));
   } catch (e) {
+    replace($('micSummary'), el('p', { text: e.message }));
     replace($('audio'), el('p', { text: e.message }));
   }
 }
