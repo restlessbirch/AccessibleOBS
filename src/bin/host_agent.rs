@@ -5,7 +5,7 @@
 use anyhow::{Result, anyhow};
 use axum::{
     Json, Router,
-    extract::{Query, State},
+    extract::{ConnectInfo, Query, State},
     http::{HeaderMap, HeaderValue, StatusCode},
     response::{
         Html, IntoResponse, Response,
@@ -19,13 +19,14 @@ use remote_stream_control::{
     obs::{BatchItem, ObsHandle, ObsStatus, db_to_mul, mul_to_db, response_data},
     *,
 };
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
     collections::HashMap,
     convert::Infallible,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     sync::Arc,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use subtle::ConstantTimeEq;
 use tokio::sync::{Mutex, RwLock, broadcast};
@@ -39,7 +40,10 @@ use tracing::{error, info, warn};
 const EVENT_CAPACITY: usize = 256;
 const MAX_LOGIN_FAILURES: u32 = 5;
 const LOGIN_BLOCK: Duration = Duration::from_secs(30);
+const SESSION_IDLE_TTL_SECS: u64 = 2 * 60 * 60;
+const SESSION_ABSOLUTE_TTL_SECS: u64 = 12 * 60 * 60;
 const STATUS_POLL: Duration = Duration::from_secs(3);
+const RAW_OBS_ALLOWLIST: &[&str] = &["GetStreamStatus", "GetRecordStatus"];
 /// Как часто уровни звука уходят в панель. OBS считает их ~50 раз в секунду;
 /// четырёх обновлений хватает, чтобы видеть, что звук идёт.
 const LEVELS_INTERVAL: Duration = Duration::from_millis(250);
@@ -53,10 +57,36 @@ struct AppState {
     events: broadcast::Sender<Value>,
     /// Токен сессии держим в памяти: расшифровывать DPAPI-файл на каждый
     /// запрос панели — лишний диск и лишняя криптография.
-    session: Arc<RwLock<Option<String>>>,
+    session: Arc<RwLock<Option<StoredSession>>>,
     /// Одноразовый state для OAuth DonationAlerts (защита от подмены кода).
     oauth_state: Arc<RwLock<Option<String>>>,
-    login_guard: Arc<Mutex<LoginGuard>>,
+    login_guards: Arc<Mutex<HashMap<IpAddr, LoginGuard>>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct StoredSession {
+    token: String,
+    created_at: u64,
+    last_seen: u64,
+}
+
+impl StoredSession {
+    fn new(token: String, now: u64) -> Self {
+        Self {
+            token,
+            created_at: now,
+            last_seen: now,
+        }
+    }
+
+    fn expired(&self, now: u64) -> bool {
+        now.saturating_sub(self.created_at) > SESSION_ABSOLUTE_TTL_SECS
+            || now.saturating_sub(self.last_seen) > SESSION_IDLE_TTL_SECS
+    }
+
+    fn touch(&mut self, now: u64) {
+        self.last_seen = now;
+    }
 }
 
 #[derive(Default)]
@@ -85,6 +115,55 @@ impl LoginGuard {
 
 type ApiResult<T> = Result<Json<T>, Response>;
 
+fn now_unix() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+fn load_session_secret() -> Result<Option<StoredSession>> {
+    let Some(raw) = load_secret("session_token")? else {
+        return Ok(None);
+    };
+    match serde_json::from_str::<StoredSession>(&raw) {
+        Ok(session) if !session.expired(now_unix()) => Ok(Some(session)),
+        Ok(_) => {
+            delete_secret("session_token").ok();
+            Ok(None)
+        }
+        Err(_) => {
+            // Old builds stored a bare token without timestamps. Do not keep it valid forever.
+            delete_secret("session_token").ok();
+            Ok(None)
+        }
+    }
+}
+
+fn save_session_secret(session: &StoredSession) -> Result<()> {
+    save_secret("session_token", &serde_json::to_string(session)?)
+}
+
+fn load_runtime_donationalerts_secret(mut cfg: HostConfig) -> Result<HostConfig> {
+    let json_secret = cfg.donationalerts.client_secret.trim().to_string();
+    if !json_secret.is_empty() {
+        save_secret("donationalerts_client_secret", &json_secret)?;
+        cfg.donationalerts.client_secret.clear();
+        save_json(&config_dir().join("host.json"), &cfg)?;
+        cfg.donationalerts.client_secret = json_secret;
+        info!("DonationAlerts client_secret migrated from host.json to DPAPI secret store");
+        return Ok(cfg);
+    }
+    if let Some(secret) = load_secret("donationalerts_client_secret")? {
+        cfg.donationalerts.client_secret = secret;
+    }
+    Ok(cfg)
+}
+
+fn raw_obs_allowed(request_type: &str) -> bool {
+    RAW_OBS_ALLOWLIST.contains(&request_type)
+}
+
 /// Два воркера вместо «по числу ядер».
 ///
 /// Агент почти всё время ждёт сокет: нагрузка на ввод-вывод, а не на счёт.
@@ -95,9 +174,9 @@ type ApiResult<T> = Result<Json<T>, Response>;
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
 async fn main() -> Result<()> {
     ensure_dirs()?;
-    init_logging()?;
+    let _log_guard = init_logging()?;
 
-    let mut cfg = load_host_config()?;
+    let mut cfg = load_runtime_donationalerts_secret(load_host_config()?)?;
     let obs_password = load_secret("obs_websocket_password")?
         .unwrap_or_else(|| cfg.obs_websocket_password.clone());
     // Пароль не должен остаться в памяти конфига, который сериализуется в ответы.
@@ -129,9 +208,9 @@ async fn main() -> Result<()> {
             .build()?,
         feed: feed.clone(),
         events: events.clone(),
-        session: Arc::new(RwLock::new(load_secret("session_token")?)),
+        session: Arc::new(RwLock::new(load_session_secret()?)),
         oauth_state: Arc::new(RwLock::new(None)),
-        login_guard: Arc::new(Mutex::new(LoginGuard::default())),
+        login_guards: Arc::new(Mutex::new(HashMap::new())),
     };
 
     forward_obs_events(obs.clone(), events.clone());
@@ -249,7 +328,8 @@ async fn serve(app: Router, cfg: &HostConfig) -> Result<()> {
                 println!("Remote Stream Control Host Agent: http://{addr}");
                 let app = app.clone();
                 servers.push(tokio::spawn(async move {
-                    if let Err(e) = axum::serve(listener, app).await {
+                    let service = app.into_make_service_with_connect_info::<SocketAddr>();
+                    if let Err(e) = axum::serve(listener, service).await {
                         error!("Сервер на {addr} остановлен: {e}");
                     }
                 }));
@@ -269,18 +349,17 @@ async fn serve(app: Router, cfg: &HostConfig) -> Result<()> {
     Ok(())
 }
 
-fn init_logging() -> Result<()> {
+fn init_logging() -> Result<tracing_appender::non_blocking::WorkerGuard> {
     let file = tracing_appender::rolling::never(logs_dir(), "host.log");
     let (writer, guard) = tracing_appender::non_blocking(file);
     // Guard должен жить всё время работы процесса, иначе логи перестанут писаться.
-    std::mem::forget(guard);
     tracing_subscriber::fmt()
         .with_writer(writer)
         .with_ansi(false)
         .with_target(false)
         .try_init()
         .ok();
-    Ok(())
+    Ok(guard)
 }
 
 /// События OBS уходят в общий поток панели.
@@ -430,10 +509,22 @@ async fn is_auth(st: &AppState, headers: &HeaderMap) -> bool {
     let Some(presented) = cookie(headers, "rsc_session") else {
         return false;
     };
-    let guard = st.session.read().await;
-    guard
-        .as_deref()
-        .is_some_and(|real| secret_eq(&presented, real))
+    let now = now_unix();
+    let mut guard = st.session.write().await;
+    let Some(session) = guard.as_mut() else {
+        return false;
+    };
+    if session.expired(now) {
+        *guard = None;
+        delete_secret("session_token").ok();
+        return false;
+    }
+    if secret_eq(&presented, &session.token) {
+        session.touch(now);
+        true
+    } else {
+        false
+    }
 }
 
 async fn require_auth(st: &AppState, headers: &HeaderMap) -> Result<(), Response> {
@@ -455,9 +546,15 @@ async fn auth_status(State(st): State<AppState>, headers: HeaderMap) -> Json<Val
     }))
 }
 
-async fn auth_login(State(st): State<AppState>, Json(body): Json<Value>) -> Response {
+async fn auth_login(
+    State(st): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    Json(body): Json<Value>,
+) -> Response {
+    let peer_ip = peer.ip();
     {
-        let guard = st.login_guard.lock().await;
+        let mut guards = st.login_guards.lock().await;
+        let guard = guards.entry(peer_ip).or_default();
         if let Some(left) = guard.blocked_for() {
             return (
                 StatusCode::TOO_MANY_REQUESTS,
@@ -482,7 +579,12 @@ async fn auth_login(State(st): State<AppState>, Json(body): Json<Value>) -> Resp
     };
 
     if !secret_eq(secret.trim(), &real) {
-        st.login_guard.lock().await.record_failure();
+        st.login_guards
+            .lock()
+            .await
+            .entry(peer_ip)
+            .or_default()
+            .record_failure();
         return (
             StatusCode::UNAUTHORIZED,
             Json(json!({"error": {"message": "Неверный pairing-код."}})),
@@ -490,15 +592,17 @@ async fn auth_login(State(st): State<AppState>, Json(body): Json<Value>) -> Resp
             .into_response();
     }
 
-    st.login_guard.lock().await.record_success();
-    let token = match st.session.read().await.clone() {
-        Some(t) => t,
-        None => random_secret_b64(32),
-    };
-    if let Err(e) = save_secret("session_token", &token) {
+    st.login_guards
+        .lock()
+        .await
+        .entry(peer_ip)
+        .or_default()
+        .record_success();
+    let session = StoredSession::new(random_secret_b64(32), now_unix());
+    if let Err(e) = save_session_secret(&session) {
         return err("Не удалось сохранить сессию", e);
     }
-    *st.session.write().await = Some(token.clone());
+    *st.session.write().await = Some(session.clone());
 
     let mut resp = Json(json!({"ok": true})).into_response();
     // Secure не ставим намеренно: связь идёт по http внутри tailnet, где
@@ -506,7 +610,8 @@ async fn auth_login(State(st): State<AppState>, Json(body): Json<Value>) -> Resp
     resp.headers_mut().insert(
         "set-cookie",
         HeaderValue::from_str(&format!(
-            "rsc_session={token}; Path=/; HttpOnly; SameSite=Lax"
+            "rsc_session={}; Path=/; HttpOnly; SameSite=Lax",
+            session.token
         ))
         .expect("токен из base64 всегда валиден для заголовка"),
     );
@@ -621,6 +726,13 @@ async fn obs_request(
         .get("requestType")
         .and_then(Value::as_str)
         .ok_or_else(|| bad("requestType обязателен"))?;
+    if !raw_obs_allowed(rt) {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(json!({"error": {"message": "Эта OBS-команда не разрешена через raw endpoint. Используйте специализированную API-ручку Remote Stream Control."}})),
+        )
+            .into_response());
+    }
     let data = body
         .get("requestData")
         .cloned()
@@ -1496,7 +1608,7 @@ async fn raise_scene_item_to_top(obs: &ObsHandle, scene: &str, item_id: i64) -> 
 async fn da_oauth_start(State(st): State<AppState>, headers: HeaderMap) -> ApiResult<Value> {
     require_auth(&st, &headers).await?;
     let c = &st.cfg.donationalerts;
-    if c.client_id.is_empty() || c.redirect_uri.is_empty() {
+    if c.client_id.is_empty() || c.client_secret.is_empty() || c.redirect_uri.is_empty() {
         return Err(bad(
             "Заполните donationalerts.client_id, client_secret и redirect_uri в config/host.json.",
         ));
@@ -1623,6 +1735,17 @@ async fn twitch_status_value(st: &AppState) -> Value {
             "message": "Укажите twitch.client_id в config/host.json",
         });
     }
+    if load_secret("twitch_tokens").ok().flatten().is_some() {
+        return match twitch_user_refreshed(st).await {
+            Ok(_) => json!({"enabled": true, "configured": true, "connected": true}),
+            Err(e) => json!({
+                "enabled": true,
+                "configured": true,
+                "connected": false,
+                "message": format!("{e:#}"),
+            }),
+        };
+    }
     match load_secret("twitch_tokens").ok().flatten() {
         None => json!({"enabled": true, "configured": true, "connected": false}),
         Some(tok) => {
@@ -1729,6 +1852,7 @@ async fn twitch_device_check(State(st): State<AppState>, headers: HeaderMap) -> 
         .into_response())
 }
 
+#[allow(dead_code)]
 async fn twitch_user(st: &AppState) -> Result<(String, String)> {
     let tok = load_secret("twitch_tokens")?.ok_or_else(|| anyhow!("Twitch не подключён"))?;
     let v: Value = serde_json::from_str(&tok)?;
@@ -1752,9 +1876,87 @@ async fn twitch_user(st: &AppState) -> Result<(String, String)> {
     Ok((access.to_string(), uid))
 }
 
+async fn twitch_user_refreshed(st: &AppState) -> Result<(String, String)> {
+    let tok = load_secret("twitch_tokens")?.ok_or_else(|| anyhow!("Twitch не подключён"))?;
+    let v: Value = serde_json::from_str(&tok)?;
+    let access = v
+        .get("access_token")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("access_token отсутствует"))?;
+    match validate_twitch_access(st, access).await {
+        Ok(uid) => Ok((access.to_string(), uid)),
+        Err(first_error) => {
+            let Some(refresh) = v.get("refresh_token").and_then(Value::as_str) else {
+                return Err(first_error);
+            };
+            let refreshed = refresh_twitch_tokens(st, refresh).await?;
+            let access = refreshed
+                .get("access_token")
+                .and_then(Value::as_str)
+                .ok_or_else(|| anyhow!("Twitch не вернул новый access_token"))?;
+            save_secret("twitch_tokens", &refreshed.to_string())?;
+            let uid = validate_twitch_access(st, access).await?;
+            Ok((access.to_string(), uid))
+        }
+    }
+}
+
+async fn validate_twitch_access(st: &AppState, access: &str) -> Result<String> {
+    let response = st
+        .http
+        .get("https://id.twitch.tv/oauth2/validate")
+        .bearer_auth(access)
+        .send()
+        .await?;
+    let status = response.status();
+    let body = response.text().await.unwrap_or_default();
+    let val: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
+    if !status.is_success() {
+        let detail = val
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or(body.trim());
+        return Err(anyhow!(
+            "Twitch token не прошёл validate: {status} {detail}"
+        ));
+    }
+    val.get("user_id")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .ok_or_else(|| anyhow!("Twitch не вернул user_id"))
+}
+
+async fn refresh_twitch_tokens(st: &AppState, refresh: &str) -> Result<Value> {
+    let form = [
+        ("client_id", st.cfg.twitch.client_id.as_str()),
+        ("grant_type", "refresh_token"),
+        ("refresh_token", refresh),
+    ];
+    let response = st
+        .http
+        .post("https://id.twitch.tv/oauth2/token")
+        .form(&form)
+        .send()
+        .await?;
+    let status = response.status();
+    let body = response.text().await.unwrap_or_default();
+    let val: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
+    if !status.is_success() {
+        let detail = val
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or(body.trim());
+        return Err(anyhow!("Twitch refresh_token отклонён: {status} {detail}"));
+    }
+    if val.get("access_token").is_none() {
+        return Err(anyhow!("Twitch не вернул access_token при обновлении"));
+    }
+    Ok(val)
+}
+
 async fn twitch_channel_get(State(st): State<AppState>, headers: HeaderMap) -> ApiResult<Value> {
     require_auth(&st, &headers).await?;
-    let (access, uid) = twitch_user(&st)
+    let (access, uid) = twitch_user_refreshed(&st)
         .await
         .map_err(|e| err("Twitch не подключён", e))?;
     let response = st
@@ -1777,7 +1979,7 @@ async fn twitch_channel_modify(
     Json(body): Json<Value>,
 ) -> ApiResult<Value> {
     require_auth(&st, &headers).await?;
-    let (access, uid) = twitch_user(&st)
+    let (access, uid) = twitch_user_refreshed(&st)
         .await
         .map_err(|e| err("Twitch не подключён", e))?;
     let response = st
@@ -1801,7 +2003,7 @@ async fn twitch_marker(
     Json(body): Json<Value>,
 ) -> ApiResult<Value> {
     require_auth(&st, &headers).await?;
-    let (access, uid) = twitch_user(&st)
+    let (access, uid) = twitch_user_refreshed(&st)
         .await
         .map_err(|e| err("Twitch не подключён", e))?;
     let description = body
@@ -1849,6 +2051,25 @@ mod tests {
         assert!(!secret_eq("abcdef", "abcdeg"));
         assert!(!secret_eq("abcdef", "abcde"));
         assert!(!secret_eq("", "x"));
+    }
+
+    #[test]
+    fn stored_session_expires_by_idle_and_absolute_ttl() {
+        let mut s = StoredSession::new("token".into(), 1_000);
+        assert!(!s.expired(1_000 + SESSION_IDLE_TTL_SECS - 1));
+        assert!(s.expired(1_000 + SESSION_IDLE_TTL_SECS + 1));
+
+        s.touch(2_000);
+        assert!(!s.expired(2_000 + SESSION_IDLE_TTL_SECS - 1));
+        assert!(s.expired(1_000 + SESSION_ABSOLUTE_TTL_SECS + 1));
+    }
+
+    #[test]
+    fn raw_obs_endpoint_is_allowlisted() {
+        assert!(raw_obs_allowed("GetStreamStatus"));
+        assert!(raw_obs_allowed("GetRecordStatus"));
+        assert!(!raw_obs_allowed("SetCurrentProgramScene"));
+        assert!(!raw_obs_allowed("SetStreamServiceSettings"));
     }
 
     #[test]

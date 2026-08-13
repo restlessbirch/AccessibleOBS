@@ -50,6 +50,10 @@ GET /api/events — Server-Sent Events, требует авторизации.
 Панель по этим событиям перерисовывает нужные разделы с задержкой 250 мс,
 чтобы шквал событий не порождал шквал запросов.
 
+/api/obs/request оставлен только как узкий compatibility endpoint для read-only запросов,
+которые ещё использует frontend: GetStreamStatus и GetRecordStatus. Остальные OBS-команды
+должны идти через специализированные API-ручки Remote Stream Control.
+
 
 Сетевая модель
 --------------
@@ -68,6 +72,10 @@ GET /api/events — Server-Sent Events, требует авторизации.
 - Pairing-код: 10 случайных байт в base64url, хранится через DPAPI.
 - Сравнение кода и токена сессии — constant-time (subtle::ConstantTimeEq).
 - Пять неудачных попыток подряд блокируют вход на 30 секунд.
+- Блокировка входа считается по IP-пиру, а не глобально на весь агент.
+- При каждом успешном логине создаётся новый токен сессии.
+- Токен сессии имеет idle TTL 2 часа и absolute TTL 12 часов; старый формат без TTL
+  при старте отбрасывается.
 - Токен сессии кэшируется в памяти; расшифровка DPAPI на каждый запрос убрана.
 - Кука HttpOnly, SameSite=Lax. Флаг Secure намеренно не ставится: внутри
   tailnet трафик идёт по http, а шифрует его WireGuard. С Secure куку
@@ -81,7 +89,10 @@ GET /api/events — Server-Sent Events, требует авторизации.
 config\secrets\*.dpapi, Windows DPAPI, область CurrentUser:
   obs_websocket_password, pairing_secret, session_token,
   donationalerts_widget_url, donationalerts_tokens,
-  twitch_tokens, twitch_device_code.
+  donationalerts_client_secret, twitch_tokens, twitch_device_code.
+
+Если donationalerts.client_secret временно внесён в config\host.json, host-agent при старте
+мигрирует его в donationalerts_client_secret.dpapi и перезаписывает host.json с пустым полем.
 
 Пароль OBS WebSocket дополнительно попадает в конфиг самого OBS —
 иначе OBS его не примет. Это ограничение OBS, а не выбор проекта.

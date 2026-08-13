@@ -107,9 +107,10 @@ OAuth DonationAlerts нужен отдельно и только для лент
 - OAuth-токены DonationAlerts;
 - OAuth-токены Twitch.
 
-Исключение — client_id и client_secret приложений Twitch и DonationAlerts:
-их нужно вписать в config\host.json вручную, потому что они требуются
-до первой авторизации.
+Исключение — client_id приложений Twitch и DonationAlerts. DonationAlerts client_secret
+можно один раз вписать в config\host.json вручную, потому что он требуется до первой
+авторизации; при следующем запуске host-agent перенесёт его в DPAPI-хранилище
+config\secrets\donationalerts_client_secret.dpapi и очистит поле в host.json.
 
 
 Настройка Twitch
@@ -124,6 +125,9 @@ Scope: channel:manage:broadcast.
   config\host.json → donationalerts.client_id
                      donationalerts.client_secret
                      donationalerts.redirect_uri
+
+После запуска host-agent client_secret в host.json должен снова стать пустым: это нормально,
+рабочая копия лежит в DPAPI secret store.
 
 redirect_uri по умолчанию — http://127.0.0.1:8787/api/donationalerts/oauth/callback.
 Агент специально слушает и localhost, и адрес Tailscale, чтобы этот

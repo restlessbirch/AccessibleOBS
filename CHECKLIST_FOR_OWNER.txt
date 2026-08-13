@@ -41,11 +41,13 @@
        donationalerts.client_id
        donationalerts.client_secret
        donationalerts.redirect_uri  (оставь http://127.0.0.1:8787/api/donationalerts/oauth/callback)
+     При следующем запуске host-agent автоматически перенесёт client_secret в DPAPI-хранилище
+     config\secrets\donationalerts_client_secret.dpapi и очистит поле в host.json.
   3. Перезапусти host-agent (или компьютер актёра).
   4. В панели нажми «Подключить DonationAlerts OAuth» и пройди авторизацию.
 
-Внимание: client_secret — это секрет. Он должен лежать только в host.json
-на компьютере актёра и никуда больше не передаваться.
+Внимание: client_secret — это секрет. Его можно один раз вписать в host.json для миграции,
+после чего он должен храниться только в DPAPI secret store на компьютере актёра.
 
 
 НАСТРОЙКА TWITCH

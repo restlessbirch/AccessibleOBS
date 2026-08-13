@@ -585,8 +585,11 @@ async function refreshSetups() {
 // ------------------------------------------------------------ кадр эфира
 
 let previewTimer = null;
+let previewInFlight = false;
 
 async function grabPreview() {
+  if (previewInFlight) return;
+  previewInFlight = true;
   try {
     const data = await api('/api/obs/preview?width=640');
     const img = el('img', { alt: 'Кадр сцены ' + (data.sceneName || '') });
@@ -597,11 +600,13 @@ async function grabPreview() {
     ]);
   } catch (e) {
     replace($('previewBox'), el('p', { text: e.message }));
+  } finally {
+    previewInFlight = false;
   }
 }
 
 function stopAutoPreview() {
-  clearInterval(previewTimer);
+  clearTimeout(previewTimer);
   previewTimer = null;
   $('autoPreview').checked = false;
 }
@@ -609,11 +614,15 @@ function stopAutoPreview() {
 $('grabPreview').onclick = grabPreview;
 
 $('autoPreview').onchange = (event) => {
-  clearInterval(previewTimer);
+  clearTimeout(previewTimer);
   previewTimer = null;
   if (event.target.checked) {
-    grabPreview();
-    previewTimer = setInterval(grabPreview, 2000);
+    const tick = async () => {
+      if (!previewTimer) return;
+      await grabPreview();
+      if (previewTimer) previewTimer = setTimeout(tick, 2000);
+    };
+    previewTimer = setTimeout(tick, 1);
     say('Автообновление кадра включено');
   } else {
     say('Автообновление кадра выключено');
@@ -628,12 +637,13 @@ async function refreshSources() {
     replace($('sources'), items.length
       ? items.map((item) => {
           const name = item.sourceName;
+          const sceneItemId = item.sceneItemId;
           const visible = !!item.sceneItemEnabled;
           return el('div', { class: 'source' }, [
             el('h3', { text: name }),
             el('p', { text: 'Состояние: ' + (visible ? 'виден' : 'скрыт') }),
-            button('Показать', () => setSource(name, true)),
-            button('Скрыть', () => setSource(name, false), 'quiet'),
+            button('Показать', () => setSource(sceneItemId, name, true)),
+            button('Скрыть', () => setSource(sceneItemId, name, false), 'quiet'),
           ]);
         })
       : el('p', { class: 'empty', text: 'в этой сцене нет источников' }));
@@ -642,11 +652,11 @@ async function refreshSources() {
   }
 }
 
-async function setSource(sourceName, enabled) {
+async function setSource(sceneItemId, sourceName, enabled) {
   try {
     await post('/api/obs/source/visibility', {
       sceneName: currentScene,
-      sourceName,
+      sceneItemId,
       enabled,
     });
     say(`${sourceName}: ${enabled ? 'показан' : 'скрыт'}`);
