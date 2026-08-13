@@ -1479,27 +1479,25 @@ async fn reconcile_donationalerts(st: &AppState) -> Result<Value> {
     // один раз заглушить источник — и reconcile будет успешно завершаться,
     // оставляя донаты беззвучными. Именно ради слышимости всё и затевалось.
     //
-    // Громкость, наоборот, ставим только при создании: initial_volume_db на то
-    // и «initial». Владелец мог осознанно сделать алерты тише, и затирать его
-    // выбор при каждой проверке было бы наглостью.
-    let mut audio = vec![
+    // Громкость тоже восстанавливаем всегда: reconcile здесь обещает вернуть
+    // DonationAlerts в рабочее эфирное состояние после ручной порчи настроек.
+    st.obs.batch(vec![
         BatchItem::new(
             "SetInputMute",
             json!({"inputName": cfg.input_name, "inputMuted": false}),
+        ),
+        BatchItem::new(
+            "SetInputVolume",
+            json!({"inputName": cfg.input_name, "inputVolumeMul": db_to_mul(cfg.initial_volume_db)}),
         ),
         // Мониторинг выключаем: иначе актёр слышит алерт в наушниках дважды.
         BatchItem::new(
             "SetInputAudioMonitorType",
             json!({"inputName": cfg.input_name, "monitorType": "OBS_MONITORING_TYPE_NONE"}),
         ),
-    ];
-    if created {
-        audio.push(BatchItem::new(
-            "SetInputVolume",
-            json!({"inputName": cfg.input_name, "inputVolumeMul": db_to_mul(cfg.initial_volume_db)}),
-        ));
-    }
-    st.obs.batch(audio).await.ok();
+    ])
+    .await
+    .ok();
 
     // Шаг 4: оверлей поверх каждой пользовательской сцены.
     let mut added = 0;
