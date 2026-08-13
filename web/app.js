@@ -1434,6 +1434,21 @@ function donationAlertsRegistrationBody() {
   };
 }
 
+function requireDaRegistrationForConnect() {
+  const body = donationAlertsRegistrationBody();
+  if (!body.clientId) {
+    $('daClientId').focus();
+    replace($('daOauthStatus'), el('p', { text: 'Введите DonationAlerts Client ID выше и нажмите «Подключить DonationAlerts» ещё раз.' }));
+    return false;
+  }
+  if (!body.clientSecret && !daSecretConfigured) {
+    $('daClientSecret').focus();
+    replace($('daOauthStatus'), el('p', { text: 'Введите DonationAlerts Client secret выше и нажмите «Подключить DonationAlerts» ещё раз.' }));
+    return false;
+  }
+  return true;
+}
+
 async function saveDaConfigFromForm() {
   const body = donationAlertsRegistrationBody();
   if (!body.clientId) throw new Error('Заполните DonationAlerts Client ID');
@@ -1539,6 +1554,7 @@ $('daSetVolume').onclick = async () => {
   } catch (e) { fail(e); }
 };
 $('daOauth').onclick = async () => {
+  if (!requireDaRegistrationForConnect()) return;
   const tab = openAuthTab();
   try {
     await saveDaConfigFromForm();
@@ -1629,10 +1645,10 @@ function twitchRegistrationBody() {
 function updateTwitchConnectButton() {
   const fieldClientId = $('twitchClientId').value.trim();
   const hasClientId = Boolean(fieldClientId || savedTwitchClientId);
-  $('twitchStart').disabled = !hasClientId;
   $('twitchStart').textContent = fieldClientId && fieldClientId !== savedTwitchClientId
-    ? 'Сохранить и подключить Twitch'
-    : hasClientId ? 'Подключить Twitch' : 'Заполните Client ID Twitch';
+    ? 'Подключить Twitch (сохранит Client ID)'
+    : 'Подключить Twitch';
+  $('twitchStart').dataset.toggleState = hasClientId ? 'active' : 'unknown';
 }
 
 async function refreshTwitchConfig() {
@@ -1728,14 +1744,14 @@ function startTwitchDevicePolling(intervalSeconds = 5) {
 }
 
 $('twitchStart').onclick = async () => {
+  if (!$('twitchClientId').value.trim() && !savedTwitchClientId) {
+    $('twitchClientId').focus();
+    replace($('twitchDevice'), el('p', { text: 'Введите Twitch Client ID выше и нажмите «Подключить Twitch» ещё раз.' }));
+    updateTwitchConnectButton();
+    return;
+  }
   const tab = openAuthTab();
   try {
-    if (!$('twitchClientId').value.trim() && !savedTwitchClientId) {
-      closeAuthTab(tab);
-      replace($('twitchDevice'), el('p', { text: 'Сначала заполните Twitch Client ID.' }));
-      updateTwitchConnectButton();
-      return;
-    }
     if ($('twitchClientId').value.trim() !== savedTwitchClientId) {
       await saveTwitchConfigFromForm();
     }
