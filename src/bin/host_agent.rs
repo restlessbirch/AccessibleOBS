@@ -924,6 +924,18 @@ async fn validate_input_kind(st: &AppState, input_kind: &str) -> Result<(), Resp
     }
 }
 
+async fn existing_input_kind(obs: &ObsHandle, input_name: &str) -> Result<Option<String>> {
+    let inputs = obs.request("GetInputList", json!({})).await?;
+    Ok(inputs
+        .get("inputs")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .find(|input| input.get("inputName").and_then(Value::as_str) == Some(input_name))
+        .and_then(|input| input.get("inputKind").and_then(Value::as_str))
+        .map(str::to_string))
+}
+
 async fn obs_source_create(
     State(st): State<AppState>,
     headers: HeaderMap,
@@ -937,6 +949,23 @@ async fn obs_source_create(
     let input_kind =
         required_trimmed(&body, "inputKind", "Тип источника обязателен").map_err(|e| bad(&e))?;
     validate_input_kind(&st, input_kind).await?;
+    if let Some(existing_kind) = existing_input_kind(&st.obs, source)
+        .await
+        .map_err(|e| err("Не удалось проверить существующие источники", e))?
+    {
+        let (scene_item_id, created_scene_item) =
+            ensure_scene_item(&st.obs, scene, source)
+                .await
+                .map_err(|e| err("Не удалось добавить существующий источник в сцену", e))?;
+        return Ok(Json(json!({
+            "inputKind": existing_kind,
+            "inputName": source,
+            "sceneItemId": scene_item_id,
+            "createdInput": false,
+            "createdSceneItem": created_scene_item,
+            "alreadyExisted": true,
+        })));
+    }
     st.obs
         .request(
             "CreateInput",
@@ -953,6 +982,10 @@ async fn obs_source_create(
             Json(json!({
                 "inputKind": input_kind,
                 "inputName": source,
+                "sceneItemId": response.get("sceneItemId").and_then(Value::as_i64),
+                "createdInput": true,
+                "createdSceneItem": true,
+                "alreadyExisted": false,
                 "obs": response,
             }))
         })

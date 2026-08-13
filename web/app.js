@@ -972,10 +972,16 @@ $('createSourceForm').onsubmit = async (event) => {
   event.preventDefault();
   try {
     const body = sourceCreateBody();
-    await post('/api/obs/sources', body);
+    const result = await post('/api/obs/sources', body);
     $('newSourceName').value = '';
     lastCreatedSourceName = body.sourceName;
-    say(`Источник добавлен в OBS: ${body.sourceName}. Теперь он появился в списке ниже.`);
+    if (result.createdInput) {
+      say(`Источник создан и добавлен: ${body.sourceName}`);
+    } else if (result.createdSceneItem) {
+      say(`Существующий источник добавлен в эту сцену: ${body.sourceName}`);
+    } else {
+      say(`Источник уже есть в этой сцене: ${body.sourceName}`);
+    }
     await refreshSources();
   } catch (e) {
     fail(e);
