@@ -27,7 +27,9 @@ if (-not (Test-Path -LiteralPath $tailscale)) {
   Invoke-WebRequest "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi" -OutFile $tailscale
 }
 
-$obsInstaller = Get-ChildItem -LiteralPath $Installers -Filter "OBS-Studio-*-Windows-Installer.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
+$obsInstaller = Get-ChildItem -LiteralPath $Installers -Filter "OBS-Studio-*-Windows*Installer.exe" -ErrorAction SilentlyContinue |
+  Where-Object { $_.Length -gt 100MB } |
+  Select-Object -First 1
 if (-not $obsInstaller) {
   $release = Invoke-RestMethod -Headers @{ "User-Agent" = "RemoteStreamControl/1.1" } "https://api.github.com/repos/obsproject/obs-studio/releases/latest"
   $asset = $release.assets | Where-Object { $_.name -like "*Windows*Installer.exe" } | Select-Object -First 1
