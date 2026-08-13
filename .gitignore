@@ -4,5 +4,11 @@
 /logs/*.log
 /config/secrets/
 /third_party/installers/
+.env
+.env.*
+/config/*.local.json
+*.dpapi
+*.key
+*.pem
 *.pdb
 *.zip
