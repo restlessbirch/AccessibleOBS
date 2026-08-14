@@ -40,4 +40,4 @@ path = "src/bin/bootstrap.rs"
 
 [[bin]]
 name = "host-agent"
-path = "src/bin/host_agent.rs"
+path = "src/bin/host_agent/main.rs"
