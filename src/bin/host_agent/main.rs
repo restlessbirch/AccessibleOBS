@@ -699,15 +699,21 @@ async fn preflight(State(st): State<AppState>, headers: HeaderMap) -> ApiResult<
     });
 
     let roles = at(2).map(special_input_roles).unwrap_or_default();
-    let input_names: Vec<String> = at(1)
+    // Вид входа нужен наравне с именем: роль desktop OBS присваивает только
+    // своим слотам, а обычный «Захват выходного аудиопотока» пишет системный
+    // звук без всякой роли — и утащил бы в эфир речь экранного диктора.
+    let inputs: Vec<(String, Option<String>)> = at(1)
         .and_then(|v| v.get("inputs"))
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
         .filter_map(|i| {
-            i.get("inputName")
-                .and_then(Value::as_str)
-                .map(str::to_string)
+            Some((
+                i.get("inputName").and_then(Value::as_str)?.to_string(),
+                i.get("inputKind")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+            ))
         })
         .collect();
 
@@ -715,19 +721,19 @@ async fn preflight(State(st): State<AppState>, headers: HeaderMap) -> ApiResult<
     let mutes = st
         .obs
         .batch(
-            input_names
+            inputs
                 .iter()
-                .map(|name| BatchItem::new("GetInputMute", json!({"inputName": name})))
+                .map(|(name, _)| BatchItem::new("GetInputMute", json!({"inputName": name})))
                 .collect(),
         )
         .await
         .unwrap_or_default();
     let levels = st.levels.read().await.clone();
 
-    let audio: Vec<preflight::AudioInput> = input_names
+    let audio: Vec<preflight::AudioInput> = inputs
         .iter()
         .enumerate()
-        .filter_map(|(i, name)| {
+        .filter_map(|(i, (name, kind))| {
             // Источники без звука на GetInputMute отвечают ошибкой — они
             // к проверке готовности отношения не имеют.
             let muted = mutes
@@ -738,6 +744,7 @@ async fn preflight(State(st): State<AppState>, headers: HeaderMap) -> ApiResult<
             Some(preflight::AudioInput {
                 name: name.clone(),
                 role: roles.get(name.as_str()).map(|r| (*r).to_string()),
+                kind: kind.clone(),
                 muted,
                 level_db: levels.get(name).copied(),
             })
@@ -760,6 +767,15 @@ async fn preflight(State(st): State<AppState>, headers: HeaderMap) -> ApiResult<
                         .get("sceneItemEnabled")
                         .and_then(Value::as_bool)
                         .unwrap_or(true),
+                    kind: i
+                        .get("inputKind")
+                        .and_then(Value::as_str)
+                        .map(str::to_string),
+                    // Вложенная сцена и группа картинку дают, но вида входа
+                    // не имеют — по одному лишь kind их не отличить от звука.
+                    is_scene_or_group: i.get("isGroup").and_then(Value::as_bool) == Some(true)
+                        || i.get("sourceType").and_then(Value::as_str)
+                            == Some("OBS_SOURCE_TYPE_SCENE"),
                 })
             })
             .collect(),
@@ -802,12 +818,15 @@ async fn preflight(State(st): State<AppState>, headers: HeaderMap) -> ApiResult<
 /// Состояние оверлея донатов, если DonationAlerts вообще настраивался.
 async fn donation_overlay_state(st: &AppState) -> Option<preflight::OverlayState> {
     load_secret("donationalerts_widget_url").ok().flatten()?;
-    let cfg = &st.cfg.donationalerts;
-    let problems = verify_donationalerts(st, cfg).await;
+    let verified = verify_donationalerts(st, &st.cfg.donationalerts).await;
+    // Берём вердикты как есть. Прежде здесь разбирались тексты проблем
+    // подстрокой, и сообщение «не удалось проверить сцену» не содержало
+    // слова «нет оверлея» — то есть сбой проверки превращался в «всё на
+    // месте», и панель уверенно сообщала, что донаты идут в эфир.
     Some(preflight::OverlayState {
-        present_in_scenes: !problems.iter().any(|p| p.contains("нет оверлея")),
-        on_top: !problems.iter().any(|p| p.contains("не верхним слоем")),
-        muted: problems.iter().any(|p| p.contains("заглушен")),
+        present_in_scenes: verified.in_overlay_scene,
+        on_top: verified.on_top_everywhere,
+        audible: verified.audible,
     })
 }
 

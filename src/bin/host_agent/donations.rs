@@ -398,11 +398,13 @@ pub(crate) async fn reconcile_donationalerts(st: &AppState) -> Result<Value> {
     // .ok(), а внутри пакета у каждого запроса свой requestStatus. Без
     // перечитывания «ready: true» означало бы всего лишь «мы отправили
     // команды» — тот же ложный успех, от которого избавлялись в остальном.
-    let problems = verify_donationalerts(st, cfg).await;
+    let verified = verify_donationalerts(st, cfg).await;
 
     Ok(json!({
-        "ready": problems.is_empty(),
-        "problems": problems,
+        // ready только когда всё проверено и всё в порядке: непроверенное
+        // за исправное здесь не выдаётся.
+        "ready": verified.is_ready(),
+        "problems": verified.problems,
         "overlay_scene": cfg.overlay_scene_name,
         "input_name": cfg.input_name,
         "widget_url": "configured",
@@ -414,97 +416,188 @@ pub(crate) async fn reconcile_donationalerts(st: &AppState) -> Result<Value> {
     }))
 }
 
-/// Перечитывает состояние OBS и возвращает невыполненные обещания.
+/// Перечитывает состояние OBS и говорит, что удалось установить.
 ///
-/// Пустой список означает, что донаты действительно попадут в эфир: источник
-/// на месте, включён, не заглушен, лежит в оверлейной сцене и оверлей поверх
-/// остальных слоёв. Всё, что сюда попало, — то, чего reconcile добиться
-/// не смог, и о чём владелец обязан узнать.
+/// Возвращает вердикты, а не строки. Прежде результат был списком текстов, и
+/// вызывающий разбирал их подстрокой: сообщение «не удалось проверить сцену»
+/// не содержало слова «нет оверлея», поэтому ошибка проверки превращалась в
+/// «оверлей на месте». Теперь неудача проверки — отдельный исход.
+pub(crate) struct DonationVerification {
+    /// Не заглушен ли источник.
+    pub audible: preflight::Verdict,
+    /// Есть ли он в оверлейной сцене и виден ли там.
+    pub in_overlay_scene: preflight::Verdict,
+    /// Лежит ли оверлей верхним слоем во всех пользовательских сценах.
+    pub on_top_everywhere: preflight::Verdict,
+    /// Человеческие формулировки для панели и лога.
+    pub problems: Vec<String>,
+}
+
+impl DonationVerification {
+    /// Донаты дойдут до зрителей только если проверено всё и всё в порядке.
+    pub fn is_ready(&self) -> bool {
+        use preflight::Verdict::Ok;
+        self.audible == Ok && self.in_overlay_scene == Ok && self.on_top_everywhere == Ok
+    }
+}
+
 pub(crate) async fn verify_donationalerts(
     st: &AppState,
     cfg: &DonationAlertsConfig,
-) -> Vec<String> {
+) -> DonationVerification {
+    use preflight::Verdict;
     let mut problems = Vec::new();
 
-    match st
+    let audible = match st
         .obs
         .request("GetInputMute", json!({"inputName": cfg.input_name}))
         .await
     {
-        Ok(v) if v.get("inputMuted").and_then(Value::as_bool) == Some(true) => {
-            problems.push(format!(
-                "{} заглушен — донатов не будет слышно",
-                cfg.input_name
-            ));
-        }
-        Ok(_) => {}
-        Err(e) => problems.push(format!("не удалось проверить звук {}: {e}", cfg.input_name)),
-    }
-
-    match ensure_scene_item_present(&st.obs, &cfg.overlay_scene_name, &cfg.input_name).await {
-        Ok(Some(id)) => {
-            if let Ok(v) = st
-                .obs
-                .request(
-                    "GetSceneItemEnabled",
-                    json!({"sceneName": cfg.overlay_scene_name, "sceneItemId": id}),
-                )
-                .await
-                && v.get("sceneItemEnabled").and_then(Value::as_bool) == Some(false)
-            {
-                problems.push(format!("{} скрыт в сцене оверлея", cfg.input_name));
+        Ok(v) => match v.get("inputMuted").and_then(Value::as_bool) {
+            Some(true) => {
+                problems.push(format!(
+                    "{} заглушен — донатов не будет слышно",
+                    cfg.input_name
+                ));
+                Verdict::Broken
             }
+            Some(false) => Verdict::Ok,
+            None => {
+                problems.push(format!("OBS не сообщил состояние звука {}", cfg.input_name));
+                Verdict::Unknown
+            }
+        },
+        Err(e) => {
+            problems.push(format!("не удалось проверить звук {}: {e}", cfg.input_name));
+            Verdict::Unknown
         }
-        Ok(None) => problems.push(format!(
-            "{} отсутствует в сцене {}",
-            cfg.input_name, cfg.overlay_scene_name
-        )),
-        Err(e) => problems.push(format!("не удалось проверить сцену оверлея: {e}")),
-    }
+    };
 
-    if cfg.enforce_overlays
-        && let Ok(list) = st.obs.request("GetSceneList", json!({})).await
-    {
-        let scenes: Vec<String> = list
-            .get("scenes")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .filter_map(|s| {
-                s.get("sceneName")
-                    .and_then(Value::as_str)
-                    .map(str::to_string)
-            })
-            .filter(|s| s != &cfg.overlay_scene_name)
-            .collect();
-        for scene in scenes {
-            let Ok(items) = st
-                .obs
-                .request("GetSceneItemList", json!({"sceneName": scene}))
-                .await
-            else {
-                continue;
-            };
-            let list = items.get("sceneItems").and_then(Value::as_array);
-            let Some(list) = list else { continue };
-            let overlay = list.iter().find(|i| {
-                i.get("sourceName").and_then(Value::as_str) == Some(&cfg.overlay_scene_name)
-            });
-            match overlay {
-                None => problems.push(format!("в сцене «{scene}» нет оверлея донатов")),
-                Some(item) => {
-                    let index = item.get("sceneItemIndex").and_then(Value::as_i64);
-                    let top = top_scene_item_index(list.len());
-                    if index != Some(top) {
-                        problems.push(format!(
-                            "в сцене «{scene}» оверлей не верхним слоем — его перекроют"
-                        ));
+    let in_overlay_scene =
+        match ensure_scene_item_present(&st.obs, &cfg.overlay_scene_name, &cfg.input_name).await {
+            Ok(Some(id)) => {
+                match st
+                    .obs
+                    .request(
+                        "GetSceneItemEnabled",
+                        json!({"sceneName": cfg.overlay_scene_name, "sceneItemId": id}),
+                    )
+                    .await
+                {
+                    Ok(v) => match v.get("sceneItemEnabled").and_then(Value::as_bool) {
+                        Some(true) => Verdict::Ok,
+                        Some(false) => {
+                            problems.push(format!("{} скрыт в сцене оверлея", cfg.input_name));
+                            Verdict::Broken
+                        }
+                        None => {
+                            problems.push("OBS не сообщил, виден ли оверлей".into());
+                            Verdict::Unknown
+                        }
+                    },
+                    Err(e) => {
+                        problems.push(format!("не удалось проверить видимость оверлея: {e}"));
+                        Verdict::Unknown
                     }
+                }
+            }
+            Ok(None) => {
+                problems.push(format!(
+                    "{} отсутствует в сцене {}",
+                    cfg.input_name, cfg.overlay_scene_name
+                ));
+                Verdict::Broken
+            }
+            Err(e) => {
+                problems.push(format!("не удалось проверить сцену оверлея: {e}"));
+                Verdict::Unknown
+            }
+        };
+
+    let on_top_everywhere = if cfg.enforce_overlays {
+        verify_overlay_on_top(st, cfg, &mut problems).await
+    } else {
+        Verdict::Ok
+    };
+
+    DonationVerification {
+        audible,
+        in_overlay_scene,
+        on_top_everywhere,
+        problems,
+    }
+}
+
+/// Проверяет, что оверлей лежит верхним слоем в каждой пользовательской сцене.
+///
+/// Любая неудача опроса — Unknown, а не молчаливый пропуск: раньше сбой
+/// GetSceneList выключал всю эту проверку целиком, и панель об этом не знала.
+async fn verify_overlay_on_top(
+    st: &AppState,
+    cfg: &DonationAlertsConfig,
+    problems: &mut Vec<String>,
+) -> preflight::Verdict {
+    use preflight::Verdict;
+
+    let list = match st.obs.request("GetSceneList", json!({})).await {
+        Ok(list) => list,
+        Err(e) => {
+            problems.push(format!("не удалось получить список сцен: {e}"));
+            return Verdict::Unknown;
+        }
+    };
+    let scenes: Vec<String> = list
+        .get("scenes")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|s| {
+            s.get("sceneName")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .filter(|s| s != &cfg.overlay_scene_name)
+        .collect();
+
+    let mut verdict = Verdict::Ok;
+    for scene in scenes {
+        let items = match st
+            .obs
+            .request("GetSceneItemList", json!({"sceneName": scene}))
+            .await
+        {
+            Ok(items) => items,
+            Err(e) => {
+                problems.push(format!("не удалось прочитать сцену «{scene}»: {e}"));
+                verdict = verdict.min_known(Verdict::Unknown);
+                continue;
+            }
+        };
+        let Some(list) = items.get("sceneItems").and_then(Value::as_array) else {
+            problems.push(format!("OBS не вернул содержимое сцены «{scene}»"));
+            verdict = verdict.min_known(Verdict::Unknown);
+            continue;
+        };
+        let overlay = list
+            .iter()
+            .find(|i| i.get("sourceName").and_then(Value::as_str) == Some(&cfg.overlay_scene_name));
+        match overlay {
+            None => {
+                problems.push(format!("в сцене «{scene}» нет оверлея донатов"));
+                verdict = Verdict::Broken;
+            }
+            Some(item) => {
+                let index = item.get("sceneItemIndex").and_then(Value::as_i64);
+                if index != Some(top_scene_item_index(list.len())) {
+                    problems.push(format!(
+                        "в сцене «{scene}» оверлей не верхним слоем — его перекроют"
+                    ));
+                    verdict = Verdict::Broken;
                 }
             }
         }
     }
-    problems
+    verdict
 }
 
 /// Ищет элемент сцены, ничего не создавая.

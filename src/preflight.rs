@@ -68,6 +68,13 @@ pub struct AudioInput {
     pub name: String,
     /// Роль по версии самого OBS: "mic" или "desktop".
     pub role: Option<String>,
+    /// Вид входа OBS, например wasapi_output_capture.
+    ///
+    /// Роль назначается только слотам desktop1/2 и mic1..4. Обычный
+    /// «Захват выходного аудиопотока», добавленный источником в сцену, роли
+    /// не получает, но системный звук пишет ровно так же — а значит и речь
+    /// экранного диктора. По одной роли такой источник не разглядеть.
+    pub kind: Option<String>,
     pub muted: bool,
     /// Последний измеренный пик, dB. None — измерений ещё не было.
     pub level_db: Option<f64>,
@@ -77,13 +84,106 @@ pub struct AudioInput {
 pub struct SceneSource {
     pub name: String,
     pub enabled: bool,
+    /// Вид источника. None у вложенных сцен и групп.
+    pub kind: Option<String>,
+    /// Вложенная сцена или группа: картинку даёт, вида входа не имеет.
+    pub is_scene_or_group: bool,
+}
+
+/// Виды входов, которые дают только звук и никакой картинки.
+///
+/// Всё остальное считаем видимым: список закрытый и короткий, а ошибиться
+/// в сторону «это видео» безопаснее — иначе проверка начнёт кричать о
+/// чёрном экране там, где его нет, и ей перестанут верить.
+const AUDIO_ONLY_KINDS: &[&str] = &[
+    "wasapi_input_capture",
+    "wasapi_output_capture",
+    "wasapi_process_output_capture",
+    "coreaudio_input_capture",
+    "coreaudio_output_capture",
+    "pulse_input_capture",
+    "pulse_output_capture",
+    "alsa_input_capture",
+    "jack_output_capture",
+    "sndio_output_capture",
+    "audio_line",
+];
+
+/// Виды, которые тянут в эфир весь системный звук, а значит и экранный диктор.
+///
+/// Захват звука отдельного приложения сюда намеренно не входит: он берёт
+/// только выбранную программу, и диктор в него не попадает.
+const SYSTEM_AUDIO_KINDS: &[&str] = &[
+    "wasapi_output_capture",
+    "coreaudio_output_capture",
+    "pulse_output_capture",
+];
+
+impl SceneSource {
+    /// Даёт ли источник картинку.
+    fn produces_video(&self) -> bool {
+        if self.is_scene_or_group {
+            return true;
+        }
+        match self.kind.as_deref() {
+            Some(kind) => !AUDIO_ONLY_KINDS.contains(&kind),
+            // Вид неизвестен — считаем видимым, чтобы не пугать зря.
+            None => true,
+        }
+    }
+}
+
+impl AudioInput {
+    /// Тянет ли вход весь системный звук.
+    fn captures_system_audio(&self) -> bool {
+        if self.role.as_deref() == Some("desktop") {
+            return true;
+        }
+        self.kind
+            .as_deref()
+            .is_some_and(|kind| SYSTEM_AUDIO_KINDS.contains(&kind))
+    }
+}
+
+/// Результат проверки, у которого есть третий исход.
+///
+/// Логическое «да/нет» здесь врёт: запрос к OBS мог не выполниться, и это
+/// не то же самое, что «всё хорошо». Прежде такая ошибка молча превращалась
+/// в успех, и панель заявляла «оверлей на месте, звук идёт в эфир», ничего
+/// на самом деле не проверив.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Verdict {
+    /// Проверено, всё в порядке.
+    Ok,
+    /// Проверено, не в порядке.
+    Broken,
+    /// Проверить не удалось.
+    #[default]
+    Unknown,
+}
+
+impl Verdict {
+    /// Худший из двух исходов при обходе нескольких объектов.
+    ///
+    /// Сломанное перевешивает неизвестное: про него есть что сказать точно,
+    /// и чинить надо в первую очередь его. Неизвестное перевешивает успех,
+    /// потому что непроверенное не должно выдаваться за исправное.
+    pub fn min_known(self, other: Verdict) -> Verdict {
+        match (self, other) {
+            (Verdict::Broken, _) | (_, Verdict::Broken) => Verdict::Broken,
+            (Verdict::Unknown, _) | (_, Verdict::Unknown) => Verdict::Unknown,
+            _ => Verdict::Ok,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct OverlayState {
-    pub present_in_scenes: bool,
-    pub on_top: bool,
-    pub muted: bool,
+    pub present_in_scenes: Verdict,
+    pub on_top: Verdict,
+    /// Слышен ли оверлей: Ok — не заглушен.
+    pub audible: Verdict,
 }
 
 /// Снимок состояния, по которому выносится вердикт.
@@ -179,20 +279,35 @@ fn scene_content_check(sources: &[SceneSource]) -> Check {
             "Добавьте источник: захват игры, экрана или камеру.",
         );
     }
-    let visible = sources.iter().filter(|s| s.enabled).count();
-    if visible == 0 {
+    // Считаем только источники с картинкой. Сцена, где включён один
+    // микрофон, формально непустая, но в эфир из неё идёт чёрный экран —
+    // прежняя проверка на такой конфигурации сообщала «видимых 1 из 1».
+    let visual: Vec<&SceneSource> = sources.iter().filter(|s| s.produces_video()).collect();
+    if visual.is_empty() {
         return Check::critical(
             "Содержимое сцены",
             format!(
-                "Все {} источников скрыты — в эфир пойдёт чёрный экран",
+                "В сцене только звуковые источники ({}) — зрители увидят чёрный экран",
                 sources.len()
+            ),
+            "Добавьте захват игры, экрана или камеру.",
+        );
+    }
+
+    let shown = visual.iter().filter(|s| s.enabled).count();
+    if shown == 0 {
+        return Check::critical(
+            "Содержимое сцены",
+            format!(
+                "Все источники с картинкой скрыты ({}) — в эфир пойдёт чёрный экран",
+                visual.len()
             ),
             "Включите нужный источник в разделе «Источники».",
         );
     }
     Check::ok(
         "Содержимое сцены",
-        format!("Видимых источников: {visible} из {}", sources.len()),
+        format!("Источников с картинкой: {shown} из {}", visual.len()),
     )
 }
 
@@ -242,10 +357,7 @@ fn microphone_checks(audio: &[AudioInput]) -> Vec<Check> {
 /// речь экранного диктора. Зрители слышат, как программа зачитывает
 /// интерфейс. Сам OBS такого предупреждения не делает.
 fn desktop_audio_check(audio: &[AudioInput]) -> Check {
-    let desktop: Vec<&AudioInput> = audio
-        .iter()
-        .filter(|a| a.role.as_deref() == Some("desktop"))
-        .collect();
+    let desktop: Vec<&AudioInput> = audio.iter().filter(|a| a.captures_system_audio()).collect();
 
     // Три разных случая, и путать их нельзя: «нет источника» и «источник
     // заглушен» одинаково безопасны, но чинятся по-разному, а оператор
@@ -279,25 +391,48 @@ fn desktop_audio_check(audio: &[AudioInput]) -> Check {
 }
 
 fn donation_check(overlay: &OverlayState) -> Check {
-    if !overlay.present_in_scenes {
+    const FIX: &str = "Нажмите «Проверить и восстановить в OBS».";
+
+    // Сломанное важнее неизвестного: о нём есть что сказать точно.
+    if overlay.present_in_scenes == Verdict::Broken {
         return Check::warn(
             "DonationAlerts",
             "Оверлей отсутствует в сценах — донаты не покажутся",
-            "Нажмите «Проверить и восстановить в OBS».",
+            FIX,
         );
     }
-    if overlay.muted {
+    if overlay.audible == Verdict::Broken {
         return Check::warn(
             "DonationAlerts",
             "Оверлей заглушен — донаты не будет слышно",
-            "Нажмите «Проверить и восстановить в OBS».",
+            FIX,
         );
     }
-    if !overlay.on_top {
+    if overlay.on_top == Verdict::Broken {
         return Check::warn(
             "DonationAlerts",
             "Оверлей не верхним слоем — его перекроет игра",
-            "Нажмите «Проверить и восстановить в OBS».",
+            FIX,
+        );
+    }
+
+    // Непроверенное не выдаём за исправное: молчание тут означало бы, что
+    // оператор считает донаты работающими, ничего о них не зная.
+    let unknown = [
+        ("наличие в сценах", overlay.present_in_scenes),
+        ("звук", overlay.audible),
+        ("порядок слоёв", overlay.on_top),
+    ]
+    .into_iter()
+    .filter(|(_, v)| *v == Verdict::Unknown)
+    .map(|(name, _)| name)
+    .collect::<Vec<_>>();
+
+    if !unknown.is_empty() {
+        return Check::warn(
+            "DonationAlerts",
+            format!("Не удалось проверить: {}", unknown.join(", ")),
+            "OBS не ответил на часть запросов. Повторите проверку.",
         );
     }
     Check::ok("DonationAlerts", "Оверлей на месте, звук идёт в эфир")
@@ -353,6 +488,7 @@ mod tests {
         AudioInput {
             name: "Микрофон".into(),
             role: Some("mic".into()),
+            kind: Some("wasapi_input_capture".into()),
             muted,
             level_db: level,
         }
@@ -362,6 +498,7 @@ mod tests {
         AudioInput {
             name: "Звук раб. стола".into(),
             role: Some("desktop".into()),
+            kind: Some("wasapi_output_capture".into()),
             muted,
             level_db: None,
         }
@@ -375,6 +512,8 @@ mod tests {
             sources: vec![SceneSource {
                 name: "Захват игры".into(),
                 enabled: true,
+                kind: Some("game_capture".into()),
+                is_scene_or_group: false,
             }],
             audio: vec![mic(false, Some(-20.0)), desktop(true)],
             free_disk_mb: 80_000.0,
@@ -382,9 +521,9 @@ mod tests {
             recording: false,
             stream_service_configured: true,
             donation_overlay: Some(OverlayState {
-                present_in_scenes: true,
-                on_top: true,
-                muted: false,
+                present_in_scenes: Verdict::Ok,
+                on_top: Verdict::Ok,
+                audible: Verdict::Ok,
             }),
             twitch_connected: true,
         }
@@ -492,6 +631,121 @@ mod tests {
     }
 
     #[test]
+    fn scene_with_only_audio_sources_is_a_black_screen() {
+        // Самый коварный случай: сцена «непустая», всё включено, а зрители
+        // смотрят в черноту. Прежняя проверка отвечала «видимых 1 из 1».
+        let mut s = healthy();
+        s.sources = vec![
+            SceneSource {
+                name: "Микрофон".into(),
+                enabled: true,
+                kind: Some("wasapi_input_capture".into()),
+                is_scene_or_group: false,
+            },
+            SceneSource {
+                name: "Звук игры".into(),
+                enabled: true,
+                kind: Some("wasapi_process_output_capture".into()),
+                is_scene_or_group: false,
+            },
+        ];
+        let checks = evaluate(&s);
+        let check = find(&checks, "Содержимое сцены");
+        assert_eq!(check.severity, Severity::Critical);
+        assert!(check.detail.contains("чёрный экран"), "{}", check.detail);
+        assert!(summary(&checks).starts_with("Начинать нельзя"));
+    }
+
+    #[test]
+    fn audio_sources_do_not_pad_the_visible_count() {
+        // Один захват игры плюс два звуковых входа — это «1 из 1», а не «3 из 3».
+        let mut s = healthy();
+        s.sources = vec![
+            SceneSource {
+                name: "Захват игры".into(),
+                enabled: true,
+                kind: Some("game_capture".into()),
+                is_scene_or_group: false,
+            },
+            SceneSource {
+                name: "Микрофон".into(),
+                enabled: true,
+                kind: Some("wasapi_input_capture".into()),
+                is_scene_or_group: false,
+            },
+            SceneSource {
+                name: "Звук приложения".into(),
+                enabled: true,
+                kind: Some("wasapi_process_output_capture".into()),
+                is_scene_or_group: false,
+            },
+        ];
+        let checks = evaluate(&s);
+        let check = find(&checks, "Содержимое сцены");
+        assert_eq!(check.severity, Severity::Ok);
+        assert!(check.detail.contains("1 из 1"), "{}", check.detail);
+    }
+
+    #[test]
+    fn nested_scene_counts_as_picture() {
+        // Вложенная сцена вида не имеет, но картинку даёт.
+        let mut s = healthy();
+        s.sources = vec![SceneSource {
+            name: "RSC_OVERLAYS".into(),
+            enabled: true,
+            kind: None,
+            is_scene_or_group: true,
+        }];
+        assert_eq!(
+            find(&evaluate(&s), "Содержимое сцены").severity,
+            Severity::Ok
+        );
+    }
+
+    #[test]
+    fn system_audio_capture_without_role_still_warns() {
+        // Обычный «Захват выходного аудиопотока» роли desktop не получает,
+        // но пишет весь системный звук — вместе с речью экранного диктора.
+        // Прежняя проверка отвечала «источник не настроен» и успокаивала.
+        let mut s = healthy();
+        s.audio = vec![
+            mic(false, Some(-20.0)),
+            AudioInput {
+                name: "Захват выходного аудиопотока".into(),
+                role: None,
+                kind: Some("wasapi_output_capture".into()),
+                muted: false,
+                level_db: None,
+            },
+        ];
+        let check_owner = evaluate(&s);
+        let check = find(&check_owner, "Звук рабочего стола");
+        assert_eq!(check.severity, Severity::Warning);
+        assert!(check.detail.contains("диктора"), "{}", check.detail);
+    }
+
+    #[test]
+    fn application_audio_capture_is_not_a_screen_reader_risk() {
+        // Захват звука отдельного приложения берёт только его, диктор туда
+        // не попадает. Ругаться на него — плодить ложные тревоги.
+        let mut s = healthy();
+        s.audio = vec![
+            mic(false, Some(-20.0)),
+            AudioInput {
+                name: "Звук игры".into(),
+                role: None,
+                kind: Some("wasapi_process_output_capture".into()),
+                muted: false,
+                level_db: None,
+            },
+        ];
+        assert_eq!(
+            find(&evaluate(&s), "Звук рабочего стола").severity,
+            Severity::Ok
+        );
+    }
+
+    #[test]
     fn empty_scene_means_black_screen() {
         let mut s = healthy();
         s.sources = vec![];
@@ -508,10 +762,14 @@ mod tests {
             SceneSource {
                 name: "Захват игры".into(),
                 enabled: false,
+                kind: Some("game_capture".into()),
+                is_scene_or_group: false,
             },
             SceneSource {
                 name: "Камера".into(),
                 enabled: false,
+                kind: Some("dshow_input".into()),
+                is_scene_or_group: false,
             },
         ];
         let checks = evaluate(&s);
@@ -550,14 +808,58 @@ mod tests {
     fn donation_overlay_problems_are_reported_separately() {
         let mut s = healthy();
         s.donation_overlay = Some(OverlayState {
-            present_in_scenes: true,
-            on_top: false,
-            muted: false,
+            present_in_scenes: Verdict::Ok,
+            on_top: Verdict::Broken,
+            audible: Verdict::Ok,
         });
         let checks = evaluate(&s);
         let check = find(&checks, "DonationAlerts");
         assert_eq!(check.severity, Severity::Warning);
         assert!(check.detail.contains("перекроет"));
+    }
+
+    #[test]
+    fn unverified_overlay_is_not_reported_as_working() {
+        // OBS не ответил на часть запросов. Прежде это давало «оверлей на
+        // месте, звук идёт в эфир»: панель уверяла, что донаты работают,
+        // не проверив о них ровно ничего.
+        let mut s = healthy();
+        s.donation_overlay = Some(OverlayState {
+            present_in_scenes: Verdict::Unknown,
+            on_top: Verdict::Unknown,
+            audible: Verdict::Ok,
+        });
+        let checks = evaluate(&s);
+        let check = find(&checks, "DonationAlerts");
+        assert_eq!(check.severity, Severity::Warning);
+        assert!(
+            check.detail.contains("Не удалось проверить"),
+            "{}",
+            check.detail
+        );
+    }
+
+    #[test]
+    fn broken_overlay_outweighs_unverified_parts() {
+        // Про сломанное есть что сказать точно — его и показываем первым.
+        let mut s = healthy();
+        s.donation_overlay = Some(OverlayState {
+            present_in_scenes: Verdict::Unknown,
+            on_top: Verdict::Broken,
+            audible: Verdict::Unknown,
+        });
+        let checks = evaluate(&s);
+        assert!(find(&checks, "DonationAlerts").detail.contains("перекроет"));
+    }
+
+    #[test]
+    fn verdict_combination_never_upgrades_to_ok() {
+        use Verdict::*;
+        assert_eq!(Ok.min_known(Unknown), Unknown);
+        assert_eq!(Unknown.min_known(Ok), Unknown);
+        assert_eq!(Unknown.min_known(Broken), Broken);
+        assert_eq!(Broken.min_known(Ok), Broken);
+        assert_eq!(Ok.min_known(Ok), Ok);
     }
 
     #[test]
