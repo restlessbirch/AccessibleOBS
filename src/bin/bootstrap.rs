@@ -21,7 +21,8 @@ use tokio::time::sleep;
 #[tokio::main]
 async fn main() -> Result<()> {
     ensure_dirs()?;
-    init_logging()?;
+    // Держим страж до конца main: он живёт столько же, сколько процесс.
+    let _log_guard = init_logging()?;
     match std::env::args()
         .nth(1)
         .unwrap_or_else(|| "--help".into())
@@ -48,17 +49,22 @@ async fn main() -> Result<()> {
     }
 }
 
-fn init_logging() -> Result<()> {
+/// Возвращает страж записи логов: пока он жив, фоновый поток дописывает файл.
+///
+/// Раньше страж намеренно «терялся» через mem::forget. Работало, но управление
+/// временем жизни превращалось в скрытую утечку, а читатель кода не мог понять,
+/// почему объект просто выбрасывают. Теперь его держит вызывающая сторона.
+#[must_use = "пока страж жив, пишутся логи; если его уронить, записи пропадут"]
+fn init_logging() -> Result<tracing_appender::non_blocking::WorkerGuard> {
     let file = tracing_appender::rolling::never(logs_dir(), "bootstrap.log");
     let (writer, guard) = tracing_appender::non_blocking(file);
-    std::mem::forget(guard);
     tracing_subscriber::fmt()
         .with_writer(writer)
         .with_ansi(false)
         .with_target(false)
         .try_init()
         .ok();
-    Ok(())
+    Ok(guard)
 }
 
 async fn host_flow() -> Result<()> {

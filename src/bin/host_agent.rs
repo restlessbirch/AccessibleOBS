@@ -248,7 +248,15 @@ async fn main() -> Result<()> {
     watch_obs_status(obs.clone(), events.clone());
     watch_stream_health(obs.clone(), events.clone());
     if cfg.donationalerts.enabled && cfg.donationalerts.oauth_enabled {
-        donationalerts::spawn(cfg.donationalerts.clone(), state.http.clone(), feed.clone());
+        // Не снимок, а способ перечитать: владелец может сменить client_id и
+        // client_secret из панели, и воркер обязан узнать об этом до того,
+        // как полезет обновлять токен.
+        let base = cfg.donationalerts.clone();
+        donationalerts::spawn(
+            Arc::new(move || resolve_donationalerts_config(&base)),
+            state.http.clone(),
+            feed.clone(),
+        );
     }
     if load_secret("donationalerts_widget_url")?.is_some() {
         let s = state.clone();
@@ -538,8 +546,19 @@ fn watch_stream_health(obs: ObsHandle, events: broadcast::Sender<Value>) {
     });
 }
 
-async fn public_ping() -> Json<Value> {
-    Json(json!({"ok": true, "app": APP_NAME}))
+/// Отклик для скриптов запуска. Обязан сообщать режим.
+///
+/// Раньше отдавался только `ok`, и START_LOCAL.bat не мог отличить локальный
+/// агент от удалённого. А удалённый агент прописан в автозагрузке и слушает
+/// тот же 127.0.0.1:8787 — то есть в самом обычном случае START_LOCAL видел
+/// успешный отклик, решал, что делать нечего, и открывал браузер. Человек
+/// вместо локального режима получал удалённый с требованием pairing-кода.
+async fn public_ping(State(st): State<AppState>) -> Json<Value> {
+    Json(json!({
+        "ok": true,
+        "app": APP_NAME,
+        "mode": if st.cfg.runtime_mode == RuntimeMode::Local { "local" } else { "remote" },
+    }))
 }
 
 async fn runtime_info(State(st): State<AppState>) -> Json<Value> {
@@ -569,9 +588,56 @@ fn secret_eq(a: &str, b: &str) -> bool {
     a.as_bytes().ct_eq(b.as_bytes()).into()
 }
 
+/// Пришёл ли запрос со страницы самой панели, а не с чужого сайта.
+///
+/// В локальном режиме pairing-кода нет, поэтому единственное, что отделяет
+/// панель от постороннего, — происхождение запроса. Без этой проверки любая
+/// открытая в браузере страница могла бы слать POST на 127.0.0.1:8787 и
+/// управлять чужим эфиром: браузер сам приложит куки, а подтверждения
+/// незрячий оператор не увидит.
+///
+/// Заодно отсекается перепривязка DNS: браузер обратится по чужому имени,
+/// и Host не совпадёт с петлевым адресом.
+fn origin_is_trusted(headers: &HeaderMap) -> bool {
+    // Локальный режим слушает только петлевой интерфейс, поэтому и доверяем
+    // только ему. Имя localhost допускаем: браузеры часто подставляют его.
+    let host_allowed = |value: &str| {
+        let host = value.rsplit_once(':').map_or(value, |(h, _)| h);
+        let host = host.trim_start_matches('[').trim_end_matches(']');
+        host == "localhost" || host.parse::<IpAddr>().is_ok_and(|ip| ip.is_loopback())
+    };
+
+    // Origin присылают браузеры при запросах, меняющих состояние.
+    if let Some(origin) = headers.get("origin") {
+        // Заголовок есть, но прочитать его не выходит — доверять нечему.
+        // Раньше здесь был провал в следующую ветку, и запрос с нечитаемым
+        // Origin проходил как доверенный.
+        let Ok(origin) = origin.to_str() else {
+            return false;
+        };
+        return match origin
+            .strip_prefix("http://")
+            .or_else(|| origin.strip_prefix("https://"))
+        {
+            Some(rest) => host_allowed(rest),
+            // "null" и прочее нестандартное происхождение доверия не заслуживают.
+            None => false,
+        };
+    }
+
+    // Origin нет — проверяем адрес, по которому к нам обратились.
+    // Отсутствие Host тоже считаем недоверенным: в HTTP/1.1 он обязателен,
+    // и запрос без него приходит не от панели.
+    headers
+        .get("host")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(host_allowed)
+}
+
 async fn is_auth(st: &AppState, headers: &HeaderMap) -> bool {
     if st.cfg.runtime_mode == RuntimeMode::Local {
-        return true;
+        // Пароля нет, поэтому доверие держится на происхождении запроса.
+        return origin_is_trusted(headers);
     }
     let Some(presented) = cookie(headers, "rsc_session") else {
         return false;
@@ -764,7 +830,11 @@ async fn health(State(st): State<AppState>, headers: HeaderMap) -> ApiResult<Val
         "obs_crashed_last_run": obs_crashed_last_run(),
         "donationalerts": donationalerts_status_value(&st).await,
         "twitch": twitch_status_value(&st).await,
-        "ready_to_stream": ready,
+        // Намеренно НЕ «готов к эфиру»: связь с OBS не означает, что эфир
+        // получится. Сцена может быть пустой, микрофон заглушен, сервис
+        // вещания не настроен. Обещать готовность по одному признаку —
+        // ровно тот ложный успех, которого проект избегает.
+        "obs_controllable": ready,
     })))
 }
 
@@ -953,6 +1023,21 @@ async fn obs_source_create(
         .await
         .map_err(|e| err("Не удалось проверить существующие источники", e))?
     {
+        // Тип обязан совпасть. Иначе человек просит «Захват окна», получает
+        // молча переиспользованный browser_source с тем же именем и слышит
+        // «Существующий источник добавлен». Незрячий мастер настройки такую
+        // подмену не увидит и будет искать причину в другом месте.
+        if existing_kind != input_kind {
+            return Err((
+                StatusCode::CONFLICT,
+                Json(json!({"error": {"message": format!(
+                    "Имя «{source}» уже занято источником типа {existing_kind}, \
+                     а вы создаёте {input_kind}. Выберите другое имя или добавьте \
+                     существующий источник в сцену.",
+                )}})),
+            )
+                .into_response());
+        }
         let (scene_item_id, created_scene_item) =
             ensure_scene_item(&st.obs, scene, source)
                 .await
@@ -1984,8 +2069,17 @@ async fn reconcile_donationalerts(st: &AppState) -> Result<Value> {
         }
     }
 
+    // Проверяем, а не верим на слово.
+    //
+    // Все команды выше отправлены, но их результат частично гасился через
+    // .ok(), а внутри пакета у каждого запроса свой requestStatus. Без
+    // перечитывания «ready: true» означало бы всего лишь «мы отправили
+    // команды» — тот же ложный успех, от которого избавлялись в остальном.
+    let problems = verify_donationalerts(st, cfg).await;
+
     Ok(json!({
-        "ready": true,
+        "ready": problems.is_empty(),
+        "problems": problems,
         "overlay_scene": cfg.overlay_scene_name,
         "input_name": cfg.input_name,
         "widget_url": "configured",
@@ -1995,6 +2089,114 @@ async fn reconcile_donationalerts(st: &AppState) -> Result<Value> {
         "scenes_already_had_overlay": present,
         "scenes_added_overlay": added,
     }))
+}
+
+/// Перечитывает состояние OBS и возвращает невыполненные обещания.
+///
+/// Пустой список означает, что донаты действительно попадут в эфир: источник
+/// на месте, включён, не заглушен, лежит в оверлейной сцене и оверлей поверх
+/// остальных слоёв. Всё, что сюда попало, — то, чего reconcile добиться
+/// не смог, и о чём владелец обязан узнать.
+async fn verify_donationalerts(st: &AppState, cfg: &DonationAlertsConfig) -> Vec<String> {
+    let mut problems = Vec::new();
+
+    match st
+        .obs
+        .request("GetInputMute", json!({"inputName": cfg.input_name}))
+        .await
+    {
+        Ok(v) if v.get("inputMuted").and_then(Value::as_bool) == Some(true) => {
+            problems.push(format!(
+                "{} заглушен — донатов не будет слышно",
+                cfg.input_name
+            ));
+        }
+        Ok(_) => {}
+        Err(e) => problems.push(format!("не удалось проверить звук {}: {e}", cfg.input_name)),
+    }
+
+    match ensure_scene_item_present(&st.obs, &cfg.overlay_scene_name, &cfg.input_name).await {
+        Ok(Some(id)) => {
+            if let Ok(v) = st
+                .obs
+                .request(
+                    "GetSceneItemEnabled",
+                    json!({"sceneName": cfg.overlay_scene_name, "sceneItemId": id}),
+                )
+                .await
+                && v.get("sceneItemEnabled").and_then(Value::as_bool) == Some(false)
+            {
+                problems.push(format!("{} скрыт в сцене оверлея", cfg.input_name));
+            }
+        }
+        Ok(None) => problems.push(format!(
+            "{} отсутствует в сцене {}",
+            cfg.input_name, cfg.overlay_scene_name
+        )),
+        Err(e) => problems.push(format!("не удалось проверить сцену оверлея: {e}")),
+    }
+
+    if cfg.enforce_overlays
+        && let Ok(list) = st.obs.request("GetSceneList", json!({})).await
+    {
+        let scenes: Vec<String> = list
+            .get("scenes")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|s| {
+                s.get("sceneName")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            })
+            .filter(|s| s != &cfg.overlay_scene_name)
+            .collect();
+        for scene in scenes {
+            let Ok(items) = st
+                .obs
+                .request("GetSceneItemList", json!({"sceneName": scene}))
+                .await
+            else {
+                continue;
+            };
+            let list = items.get("sceneItems").and_then(Value::as_array);
+            let Some(list) = list else { continue };
+            let overlay = list.iter().find(|i| {
+                i.get("sourceName").and_then(Value::as_str) == Some(&cfg.overlay_scene_name)
+            });
+            match overlay {
+                None => problems.push(format!("в сцене «{scene}» нет оверлея донатов")),
+                Some(item) => {
+                    let index = item.get("sceneItemIndex").and_then(Value::as_i64);
+                    let top = top_scene_item_index(list.len());
+                    if index != Some(top) {
+                        problems.push(format!(
+                            "в сцене «{scene}» оверлей не верхним слоем — его перекроют"
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    problems
+}
+
+/// Ищет элемент сцены, ничего не создавая.
+async fn ensure_scene_item_present(
+    obs: &ObsHandle,
+    scene: &str,
+    source: &str,
+) -> Result<Option<i64>> {
+    let items = obs
+        .request("GetSceneItemList", json!({"sceneName": scene}))
+        .await?;
+    Ok(items
+        .get("sceneItems")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .find(|i| i.get("sourceName").and_then(Value::as_str) == Some(source))
+        .and_then(|i| i.get("sceneItemId").and_then(Value::as_i64)))
 }
 
 /// Возвращает id элемента сцены, создавая его при отсутствии.
@@ -2111,7 +2313,14 @@ fn effective_twitch_config(st: &AppState) -> TwitchConfig {
 }
 
 fn effective_donationalerts_config(st: &AppState) -> DonationAlertsConfig {
-    let mut cfg = st.cfg.donationalerts.clone();
+    resolve_donationalerts_config(&st.cfg.donationalerts)
+}
+
+/// Накладывает сохранённые в хранилище секретов значения поверх host.json.
+/// Вынесено из [`effective_donationalerts_config`], чтобы этим же путём мог
+/// пользоваться фоновый воркер, у которого нет доступа к AppState.
+fn resolve_donationalerts_config(base: &DonationAlertsConfig) -> DonationAlertsConfig {
+    let mut cfg = base.clone();
     if let Some(client_id) = secret_string("donationalerts_client_id") {
         cfg.client_id = client_id;
     }
@@ -2666,6 +2875,66 @@ mod tests {
         g.record_failure();
         let left = g.blocked_for().expect("блокировка включилась");
         assert!(left <= LOGIN_BLOCK);
+    }
+
+    fn with_header(name: &'static str, value: &str) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert(name, HeaderValue::from_str(value).unwrap());
+        h
+    }
+
+    #[test]
+    fn panel_origin_is_trusted() {
+        assert!(origin_is_trusted(&with_header(
+            "origin",
+            "http://127.0.0.1:8787"
+        )));
+        assert!(origin_is_trusted(&with_header(
+            "origin",
+            "http://localhost:8787"
+        )));
+        assert!(origin_is_trusted(&with_header(
+            "origin",
+            "http://[::1]:8787"
+        )));
+    }
+
+    #[test]
+    fn foreign_site_cannot_drive_local_mode() {
+        // В локальном режиме pairing-кода нет, поэтому чужая страница,
+        // открытая в том же браузере, иначе управляла бы эфиром: браузер сам
+        // приложил бы куки, а незрячий оператор ничего бы не заметил.
+        assert!(!origin_is_trusted(&with_header(
+            "origin",
+            "https://evil.example"
+        )));
+        assert!(!origin_is_trusted(&with_header(
+            "origin",
+            "http://192.168.1.50"
+        )));
+        assert!(!origin_is_trusted(&with_header("origin", "null")));
+        // Похожее имя не должно проходить как localhost.
+        assert!(!origin_is_trusted(&with_header(
+            "origin",
+            "http://localhost.evil.example"
+        )));
+    }
+
+    #[test]
+    fn dns_rebinding_is_rejected_by_host() {
+        // Браузер обращается по чужому имени, которое указывает на 127.0.0.1.
+        // Origin при простых запросах может отсутствовать, но Host выдаёт подмену.
+        assert!(!origin_is_trusted(&with_header(
+            "host",
+            "evil.example:8787"
+        )));
+        assert!(origin_is_trusted(&with_header("host", "127.0.0.1:8787")));
+    }
+
+    #[test]
+    fn request_without_recognisable_origin_is_refused() {
+        // Fail-closed: пустые заголовки не должны означать «свой».
+        assert!(!origin_is_trusted(&HeaderMap::new()));
     }
 
     #[test]

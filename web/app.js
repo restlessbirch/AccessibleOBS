@@ -524,9 +524,19 @@ async function refreshAll() {
   // Сцены обновляем первыми и дожидаемся: от их списка зависит выбор сцены
   // предпросмотра в Studio Mode. Запуск всего скопом оставлял бы этот
   // список пустым при первой загрузке — кто успел, тот и прав.
+  // Каждая функция обновления возвращает признак успеха и сама рисует свою
+  // ошибку. Полагаться на исключения тут нельзя: раньше они ловились внутри и
+  // наружу не выходили, поэтому Promise.allSettled считал такие вызовы
+  // успешными — раздел показывал ошибку, а шапка бодро сообщала «данные
+  // актуальны». Для оператора, который не видит экран, это ровно та ложь,
+  // ради устранения которой всё и затевалось.
   const failed = [];
+  const note = (name, ok) => {
+    if (ok === false) failed.push(name);
+  };
+
   try {
-    await refreshScenes();
+    note('Сцены', await refreshScenes());
   } catch {
     failed.push('Сцены');
   }
@@ -549,6 +559,7 @@ async function refreshAll() {
   const results = await Promise.allSettled(rest.map(([, fn]) => fn()));
   results.forEach((r, i) => {
     if (r.status === 'rejected') failed.push(rest[i][0]);
+    else note(rest[i][0], r.value);
   });
 
   lastRefresh = { at: new Date(), failed };
@@ -596,14 +607,16 @@ async function refreshHealth() {
       'OBS процесс': health.obs_process_running ? 'запущен' : 'не запущен',
       'OBS WebSocket': health.obs?.connected ? 'подключён' : (health.obs?.error || 'нет связи'),
       'Автозапуск у актёра': health.autostart ? 'настроен' : 'не настроен',
-      'Готов к эфиру': health.ready_to_stream ? 'да' : 'нет',
+      'OBS готов к управлению': health.obs_controllable ? 'да' : 'нет',
       ...(health.obs_crashed_last_run
         ? { 'Внимание': 'прошлый сеанс OBS завершился аварийно' }
         : {}),
     });
   } catch (e) {
     renderDl($('health'), { 'Ошибка': e.message });
+    return false;
   }
+  return true;
 }
 
 function formatDuration(ms) {
@@ -644,6 +657,7 @@ function renderStreamHealth(stream) {
 }
 
 async function refreshOutputs() {
+  let ok = true;
   try {
     const stream = await obsRequest('GetStreamStatus');
     renderOutputState($('streamState'), 'Эфир', {
@@ -651,7 +665,11 @@ async function refreshOutputs() {
       outputState: stream.outputReconnecting ? 'RECONNECTING' : '',
     });
     renderStreamHealth(stream);
-  } catch { /* индикатор останется в состоянии «неизвестно» */ }
+  } catch {
+    // Индикатор останется в состоянии «неизвестно», но молчать об этом
+    // нельзя: сверху не должно появиться «данные актуальны».
+    ok = false;
+  }
   try {
     const record = await obsRequest('GetRecordStatus');
     renderOutputState($('recordState'), 'Запись', {
@@ -659,7 +677,10 @@ async function refreshOutputs() {
       outputState: record.outputPaused ? 'PAUSED' : '',
       outputDuration: record.outputDuration,
     });
-  } catch { /* см. выше */ }
+  } catch {
+    ok = false;
+  }
+  return ok;
 }
 
 async function refreshScenes() {
@@ -689,7 +710,9 @@ async function refreshScenes() {
     await refreshAudio();
   } catch (e) {
     replace($('sceneList'), el('li', { text: e.message }));
+    return false;
   }
+  return true;
 }
 
 $('sceneSelect').onchange = async (event) => {
@@ -754,7 +777,9 @@ async function refreshStudio() {
     updateActionButtons();
   } catch (e) {
     setState($('studioState'), 'warn', e.message);
+    return false;
   }
+  return true;
 }
 
 async function refreshVcam() {
@@ -769,7 +794,9 @@ async function refreshVcam() {
     updateActionButtons();
   } catch (e) {
     setState($('vcamState'), 'warn', e.message);
+    return false;
   }
+  return true;
 }
 
 async function refreshReplay() {
@@ -789,7 +816,9 @@ async function refreshReplay() {
     updateActionButtons();
   } catch (e) {
     setState($('replayState'), 'warn', e.message);
+    return false;
   }
+  return true;
 }
 
 /// Профили, коллекции сцен и переходы — три одинаковых по форме списка.
@@ -799,6 +828,7 @@ async function refreshSetups() {
     ['/api/obs/collections', 'collectionSelect', 'sceneCollections', 'currentSceneCollectionName'],
     ['/api/obs/transitions', 'transitionSelect', 'transitions', 'currentSceneTransitionName'],
   ];
+  let ok = true;
   for (const [path, nodeId, listKey, currentKey] of lists) {
     try {
       const data = await api(path);
@@ -808,8 +838,10 @@ async function refreshSetups() {
       fillSelect($(nodeId), names, data[currentKey]);
     } catch {
       replace($(nodeId), el('option', { text: 'недоступно' }));
+      ok = false;
     }
   }
+  return ok;
 }
 
 // ------------------------------------------------------------ кадр эфира
@@ -893,7 +925,9 @@ async function refreshInputKinds() {
       : el('option', { value: '', text: 'OBS не вернул типы источников' }));
   } catch (e) {
     replace($('newSourceKind'), el('option', { value: '', text: e.message }));
+    return false;
   }
+  return true;
 }
 
 function settingsCacheKey(sourceName) {
@@ -1291,7 +1325,9 @@ async function refreshAudio() {
   } catch (e) {
     replace($('micSummary'), el('p', { text: e.message }));
     replace($('audio'), el('p', { text: e.message }));
+    return false;
   }
+  return true;
 }
 
 async function audioMute(inputName, muted) {
@@ -1473,7 +1509,9 @@ async function refreshDaConfig() {
     $('daScopes').value = (c.oauth_scopes || []).join(' ');
   } catch (e) {
     fail(e);
+    return false;
   }
+  return true;
 }
 
 $('daConfigForm').onsubmit = async (e) => {
@@ -1512,7 +1550,9 @@ async function refreshDa() {
   } catch (e) {
     renderDl($('daStatus'), { 'Ошибка': e.message });
     throw e;
+    return false;
   }
+  return true;
 }
 
 $('daUrlForm').onsubmit = async (e) => {
@@ -1627,7 +1667,10 @@ async function refreshDonations() {
     replace($('donations'), donations.length
       ? donations.map((d) => el('li', { text: donationText(d) }))
       : el('li', { class: 'empty', text: 'донатов пока нет' }));
-  } catch { /* лента необязательна, молчим */ }
+  } catch {
+    return false;
+  }
+  return true;
 }
 
 // -------------------------------------------------------------- Twitch
@@ -1660,7 +1703,9 @@ async function refreshTwitchConfig() {
     updateTwitchConnectButton();
   } catch (e) {
     fail(e);
+    return false;
   }
+  return true;
 }
 
 async function saveTwitchConfigFromForm() {
@@ -1698,7 +1743,9 @@ async function refreshTwitch() {
     });
   } catch (e) {
     renderDl($('twitchStatus'), { 'Ошибка': e.message });
+    return false;
   }
+  return true;
 }
 
 function twitchDeviceText(r) {

@@ -53,4 +53,10 @@ jobs:
           Copy-Item target\release\bootstrap.exe bin\ -Force
           Copy-Item target\release\host-agent.exe bin\ -Force
           .\scripts\smoke_test.ps1
+
+      - name: Smoke test (local mode)
         shell: pwsh
+        run: |
+          # Отдельный прогон: локальный режим написан для v1.1, но в CI не
+          # выполнялся вовсе, хотя проверяет и loopback-only, и обход входа.
+          .\scripts\smoke_test.ps1 -Local

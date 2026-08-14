@@ -102,11 +102,20 @@ impl DonationFeed {
     }
 }
 
+/// Способ получить актуальные настройки перед каждой попыткой подключения.
+///
+/// Именно функция, а не готовая структура: владелец может сменить client_id и
+/// client_secret прямо из панели. Со снимком, взятым при запуске процесса,
+/// воркер продолжал бы жить со старыми данными — и подвох вылез бы не сразу,
+/// а в момент обновления токена, когда текущий access_token истечёт.
+pub type ConfigSource = Arc<dyn Fn() -> DonationAlertsConfig + Send + Sync>;
+
 /// Держит подписку живой, переподключаясь при обрывах и ожидая появления токенов.
-pub fn spawn(cfg: DonationAlertsConfig, http: reqwest::Client, feed: DonationFeed) {
+pub fn spawn(config: ConfigSource, http: reqwest::Client, feed: DonationFeed) {
     tokio::spawn(async move {
         let mut backoff = RETRY_MIN;
         loop {
+            let cfg = config();
             if load_secret("donationalerts_tokens")
                 .ok()
                 .flatten()

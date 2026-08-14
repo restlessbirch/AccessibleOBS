@@ -12,7 +12,11 @@ use futures_util::{SinkExt, Stream, StreamExt};
 use serde::Serialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 use tokio::sync::{Notify, RwLock, broadcast, mpsc, oneshot};
 use tokio_tungstenite::{
     connect_async,
@@ -51,6 +55,13 @@ const EVENT_SUBSCRIPTIONS: u32 = SUB_GENERAL
     | SUB_INPUT_VOLUME_METERS;
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+/// Запас перед удалением записи из очереди ожидания.
+const PENDING_GRACE: Duration = Duration::from_secs(5);
+/// Как часто чистить очередь от просроченных записей.
+const PENDING_SWEEP: Duration = Duration::from_secs(15);
+/// Предел очереди. Достигается только при потоке команд в мёртвый сокет;
+/// без предела память росла бы неограниченно.
+const PENDING_MAX: usize = 512;
 const RECONNECT_MIN: Duration = Duration::from_millis(500);
 const RECONNECT_MAX: Duration = Duration::from_secs(15);
 const KEEPALIVE: Duration = Duration::from_secs(20);
@@ -98,9 +109,30 @@ enum Command {
     },
 }
 
-enum Pending {
+enum Reply {
     Single(oneshot::Sender<Result<Value>>),
     Batch(oneshot::Sender<Result<Vec<Value>>>),
+}
+
+/// Ожидающий ответа запрос вместе с моментом, после которого он бессмыслен.
+///
+/// Таймаут вызывающей стороны освобождает только её саму: запись в очереди
+/// оставалась навсегда, если OBS завис, но сокет не оборвался. За долгий эфир
+/// такие «мёртвые» записи копятся и растят память.
+struct Pending {
+    reply: Reply,
+    deadline: Instant,
+}
+
+impl Pending {
+    fn new(reply: Reply) -> Self {
+        Self {
+            reply,
+            // Небольшой запас поверх таймаута вызывающей стороны: сначала
+            // ответ получает шанс дойти, и только потом запись убирается.
+            deadline: Instant::now() + REQUEST_TIMEOUT + PENDING_GRACE,
+        }
+    }
 }
 
 /// Дескриптор соединения. Клонируется свободно, живёт в AppState.
@@ -340,6 +372,8 @@ async fn session(
     // срабатывает мгновенно, дальше — попытки раз в VERSION_RETRY.
     let mut version_probe = tokio::time::interval(VERSION_RETRY);
     let mut version_tries: u8 = 0;
+    let mut pending_sweep = tokio::time::interval(PENDING_SWEEP);
+    pending_sweep.tick().await; // первый тик мгновенный, чистить пока нечего
 
     let outcome = loop {
         tokio::select! {
@@ -364,6 +398,18 @@ async fn session(
                     request_obs_version(&mut sink, &mut pending, status.clone()).await?;
                 }
             }
+            _ = pending_sweep.tick() => {
+                // Если OBS завис, но сокет цел, ответы не придут никогда.
+                // Вызывающая сторона уже ушла по таймауту; убираем и запись,
+                // иначе за долгий эфир очередь растёт без предела.
+                let now = Instant::now();
+                let before = pending.len();
+                pending.retain(|_, p| p.deadline > now);
+                let dropped = before - pending.len();
+                if dropped > 0 {
+                    warn!("OBS не ответил на {dropped} запросов, очередь очищена");
+                }
+            }
             _ = keepalive.tick() => {
                 sink.send(Message::Ping(Vec::new().into())).await?;
             }
@@ -372,11 +418,11 @@ async fn session(
 
     // Разрыв соединения не должен оставлять зависшие запросы.
     for (_, p) in pending.drain() {
-        match p {
-            Pending::Single(tx) => {
+        match p.reply {
+            Reply::Single(tx) => {
                 let _ = tx.send(Err(anyhow!("Соединение с OBS закрыто")));
             }
-            Pending::Batch(tx) => {
+            Reply::Batch(tx) => {
                 let _ = tx.send(Err(anyhow!("Соединение с OBS закрыто")));
             }
         }
@@ -393,6 +439,17 @@ where
     S: SinkExt<Message> + Unpin,
     <S as futures_util::Sink<Message>>::Error: std::error::Error + Send + Sync + 'static,
 {
+    // Предохранитель от неограниченного роста: срабатывает только если OBS
+    // перестал отвечать, а команды продолжают идти потоком.
+    if pending.len() >= PENDING_MAX {
+        let now = Instant::now();
+        pending.retain(|_, p| p.deadline > now);
+        if pending.len() >= PENDING_MAX {
+            reject(cmd, "OBS не отвечает: слишком много запросов в очереди");
+            return Ok(());
+        }
+    }
+
     let id = Uuid::new_v4().to_string();
     let (frame, slot) = match cmd {
         Command::Request {
@@ -405,7 +462,7 @@ where
                 "requestId": id,
                 "requestData": request_data,
             }}),
-            Pending::Single(reply),
+            Pending::new(Reply::Single(reply)),
         ),
         Command::Batch { requests, reply } => {
             let items: Vec<Value> = requests
@@ -426,7 +483,7 @@ where
                     "executionType": 0,
                     "requests": items,
                 }}),
-                Pending::Batch(reply),
+                Pending::new(Reply::Batch(reply)),
             )
         }
     };
@@ -449,7 +506,11 @@ fn dispatch(text: &str, pending: &mut HashMap<String, Pending>, events: &broadca
             let Some(id) = v.pointer("/d/requestId").and_then(Value::as_str) else {
                 return;
             };
-            if let Some(Pending::Single(tx)) = pending.remove(id) {
+            if let Some(Pending {
+                reply: Reply::Single(tx),
+                ..
+            }) = pending.remove(id)
+            {
                 let _ = tx.send(parse_response(v.pointer("/d").unwrap_or(&Value::Null)));
             }
         }
@@ -458,7 +519,11 @@ fn dispatch(text: &str, pending: &mut HashMap<String, Pending>, events: &broadca
             let Some(id) = v.pointer("/d/requestId").and_then(Value::as_str) else {
                 return;
             };
-            if let Some(Pending::Batch(tx)) = pending.remove(id) {
+            if let Some(Pending {
+                reply: Reply::Batch(tx),
+                ..
+            }) = pending.remove(id)
+            {
                 let results = v
                     .pointer("/d/results")
                     .and_then(Value::as_array)
@@ -550,7 +615,7 @@ where
 {
     let id = Uuid::new_v4().to_string();
     let (tx, rx) = oneshot::channel();
-    pending.insert(id.clone(), Pending::Single(tx));
+    pending.insert(id.clone(), Pending::new(Reply::Single(tx)));
     sink.send(Message::Text(
         json!({"op": 6, "d": {
             "requestType": "GetVersion",
@@ -720,7 +785,7 @@ mod tests {
         let events = test_channel();
         let mut pending = HashMap::new();
         let (tx, mut rx) = oneshot::channel();
-        pending.insert("req-1".to_string(), Pending::Single(tx));
+        pending.insert("req-1".to_string(), Pending::new(Reply::Single(tx)));
 
         dispatch(
             &json!({"op": 7, "d": {
@@ -743,7 +808,7 @@ mod tests {
         let events = test_channel();
         let mut pending = HashMap::new();
         let (tx, mut rx) = oneshot::channel();
-        pending.insert("req-2".to_string(), Pending::Single(tx));
+        pending.insert("req-2".to_string(), Pending::new(Reply::Single(tx)));
 
         dispatch(
             &json!({"op": 7, "d": {
@@ -785,7 +850,7 @@ mod tests {
         let events = test_channel();
         let mut pending = HashMap::new();
         let (tx, mut rx) = oneshot::channel();
-        pending.insert("batch-1".to_string(), Pending::Batch(tx));
+        pending.insert("batch-1".to_string(), Pending::new(Reply::Batch(tx)));
 
         dispatch(
             &json!({"op": 9, "d": {
@@ -821,6 +886,36 @@ mod tests {
             &events,
         );
         assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn stale_pending_entries_are_swept() {
+        // OBS завис, но сокет цел: ответы не придут никогда. Вызывающая
+        // сторона уже ушла по таймауту, и запись обязана исчезнуть — иначе
+        // за долгий эфир очередь растёт без предела.
+        let mut pending = HashMap::new();
+        let (tx, _rx) = oneshot::channel();
+        let mut entry = Pending::new(Reply::Single(tx));
+        entry.deadline = Instant::now() - Duration::from_secs(1);
+        pending.insert("протухший".to_string(), entry);
+
+        let (tx2, _rx2) = oneshot::channel();
+        pending.insert("свежий".to_string(), Pending::new(Reply::Single(tx2)));
+
+        let now = Instant::now();
+        pending.retain(|_, p| p.deadline > now);
+
+        assert_eq!(pending.len(), 1);
+        assert!(pending.contains_key("свежий"));
+    }
+
+    #[test]
+    fn pending_deadline_outlives_caller_timeout() {
+        // Запас нужен, чтобы дошедший в последний момент ответ ещё нашёл
+        // своего получателя, а не был выброшен уборкой.
+        let (tx, _rx) = oneshot::channel();
+        let entry = Pending::new(Reply::Single(tx));
+        assert!(entry.deadline > Instant::now() + REQUEST_TIMEOUT);
     }
 
     #[test]

@@ -467,6 +467,24 @@ pub fn tailscale_ip() -> Option<IpAddr> {
         .ok()
 }
 
+/// Разбирает `tailscale status --json`.
+///
+/// Раньше состояние искали подстрокой в тексте вывода, причём двумя вариантами
+/// сразу — с пробелом после двоеточия и без. Форматирование JSON не является
+/// контрактом: смена отступов или порядка полей в Tailscale молча сломала бы
+/// проверку, и агент решил бы, что сети нет.
+fn parse_backend_running(json: &str) -> bool {
+    #[derive(Deserialize)]
+    struct Status {
+        #[serde(rename = "BackendState")]
+        backend_state: Option<String>,
+    }
+    serde_json::from_str::<Status>(json)
+        .ok()
+        .and_then(|s| s.backend_state)
+        .is_some_and(|state| state == "Running")
+}
+
 pub fn tailscale_running() -> bool {
     let Some(exe) = tailscale_exe() else {
         return false;
@@ -474,11 +492,7 @@ pub fn tailscale_running() -> bool {
     Command::new(exe)
         .args(["status", "--json"])
         .output()
-        .map(|o| {
-            let txt = String::from_utf8_lossy(&o.stdout);
-            txt.contains("\"BackendState\":\"Running\"")
-                || txt.contains("\"BackendState\": \"Running\"")
-        })
+        .map(|o| parse_backend_running(&String::from_utf8_lossy(&o.stdout)))
         .unwrap_or(false)
 }
 
@@ -811,6 +825,25 @@ mod tests {
         };
         assert_eq!(cfg.friend_machine_name, "friend-pc");
         assert_eq!(cfg.web_port, 8787);
+    }
+
+    #[test]
+    fn tailscale_state_is_parsed_not_matched_as_text() {
+        // Форматирование JSON не контракт: пробелы и порядок полей могут
+        // измениться, а проверка подстрокой молча решила бы, что сети нет.
+        assert!(parse_backend_running(r#"{"BackendState":"Running"}"#));
+        assert!(parse_backend_running(
+            "{\n  \"Version\": \"1.0\",\n  \"BackendState\" : \"Running\"\n}"
+        ));
+        assert!(!parse_backend_running(r#"{"BackendState":"Stopped"}"#));
+        assert!(!parse_backend_running(r#"{"BackendState":"NeedsLogin"}"#));
+    }
+
+    #[test]
+    fn tailscale_garbage_output_means_not_running() {
+        assert!(!parse_backend_running(""));
+        assert!(!parse_backend_running("tailscale: command failed"));
+        assert!(!parse_backend_running("{}"));
     }
 
     #[test]
