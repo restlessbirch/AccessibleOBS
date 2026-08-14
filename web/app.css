@@ -369,6 +369,33 @@ li {
   font-style: italic;
 }
 
+/* Проверка готовности: слева полоса по важности, но смысл несёт текст. */
+.checks {
+  list-style: none;
+  margin: var(--gap) 0 0;
+  padding: 0;
+}
+.check-row {
+  padding: 0.5rem 0.75rem;
+  margin-bottom: 0.4rem;
+  border: 1px solid var(--border);
+  border-left-width: 4px;
+  border-radius: var(--radius);
+  background: var(--bg);
+}
+.check-row[data-severity="ok"] {
+  border-left-color: var(--ok);
+}
+.check-row[data-severity="warning"] {
+  border-left-color: var(--warn);
+}
+.check-row[data-severity="critical"] {
+  border-left-color: var(--danger);
+}
+.check-row .hint {
+  margin: 0.3rem 0 0;
+}
+
 /* Журнал: время моноширинным, чтобы отметки выстраивались в столбик. */
 .journal {
   list-style: none;

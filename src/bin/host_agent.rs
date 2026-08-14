@@ -61,6 +61,11 @@ struct AppState {
     /// Одноразовый state для OAuth DonationAlerts (защита от подмены кода).
     oauth_state: Arc<RwLock<Option<String>>>,
     login_guards: Arc<Mutex<HashMap<IpAddr, LoginGuard>>>,
+    /// Последние измеренные уровни звука по источникам, dB.
+    ///
+    /// Нужны проверке готовности: включённый микрофон и звучащий микрофон —
+    /// разные вещи, а отошедший кабель OBS показывает как исправный вход.
+    levels: Arc<RwLock<HashMap<String, f64>>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -242,9 +247,10 @@ async fn main() -> Result<()> {
         session: Arc::new(RwLock::new(load_session_secret()?)),
         oauth_state: Arc::new(RwLock::new(None)),
         login_guards: Arc::new(Mutex::new(HashMap::new())),
+        levels: Arc::new(RwLock::new(HashMap::new())),
     };
 
-    forward_obs_events(obs.clone(), events.clone());
+    forward_obs_events(obs.clone(), events.clone(), state.levels.clone());
     watch_obs_status(obs.clone(), events.clone());
     watch_stream_health(obs.clone(), events.clone());
     if cfg.donationalerts.enabled && cfg.donationalerts.oauth_enabled {
@@ -275,6 +281,7 @@ async fn main() -> Result<()> {
         .route("/api/auth/logout", post(auth_logout))
         .route("/api/events", get(sse_events))
         .route("/api/health", get(health))
+        .route("/api/preflight", get(preflight))
         .route("/api/obs", get(obs_status))
         .route("/api/obs/launch", post(obs_launch))
         .route("/api/obs/request", post(obs_request))
@@ -430,7 +437,11 @@ fn init_logging() -> Result<tracing_appender::non_blocking::WorkerGuard> {
 /// Уровни звука обрабатываются отдельно: OBS шлёт их около 50 раз в секунду, и
 /// пересылать это в браузер как есть — значит завалить и канал, и отрисовку.
 /// Отдаём сводку не чаще LEVELS_INTERVAL, чего глазу достаточно.
-fn forward_obs_events(obs: ObsHandle, events: broadcast::Sender<Value>) {
+fn forward_obs_events(
+    obs: ObsHandle,
+    events: broadcast::Sender<Value>,
+    levels_store: Arc<RwLock<HashMap<String, f64>>>,
+) {
     tokio::spawn(async move {
         let mut rx = obs.subscribe();
         let mut levels_sent = Instant::now() - LEVELS_INTERVAL;
@@ -443,11 +454,20 @@ fn forward_obs_events(obs: ObsHandle, events: broadcast::Sender<Value>) {
                             continue;
                         }
                         levels_sent = Instant::now();
-                        let levels: serde_json::Map<String, Value> =
-                            obs::meter_levels(event.get("eventData").unwrap_or(&Value::Null))
-                                .into_iter()
-                                .map(|(name, db)| (name, json!((db * 10.0).round() / 10.0)))
-                                .collect();
+                        let measured =
+                            obs::meter_levels(event.get("eventData").unwrap_or(&Value::Null));
+                        // Храним последние уровни: проверка готовности спросит
+                        // их разом, а не будет ждать очередного события.
+                        {
+                            let mut store = levels_store.write().await;
+                            for (name, db) in &measured {
+                                store.insert(name.clone(), *db);
+                            }
+                        }
+                        let levels: serde_json::Map<String, Value> = measured
+                            .into_iter()
+                            .map(|(name, db)| (name, json!((db * 10.0).round() / 10.0)))
+                            .collect();
                         if !levels.is_empty() {
                             let _ = events.send(json!({"type": "levels", "levels": levels}));
                         }
@@ -836,6 +856,160 @@ async fn health(State(st): State<AppState>, headers: HeaderMap) -> ApiResult<Val
         // ровно тот ложный успех, которого проект избегает.
         "obs_controllable": ready,
     })))
+}
+
+/// Собирает состояние OBS и отвечает, можно ли начинать эфир.
+///
+/// В отличие от /api/health это не «агент жив», а связная проверка по смыслу:
+/// есть ли что показывать, слышно ли оператора, не уедет ли запись в полный
+/// диск, не утечёт ли в эфир речь экранного диктора вместе со звуком системы.
+async fn preflight(State(st): State<AppState>, headers: HeaderMap) -> ApiResult<Value> {
+    require_auth(&st, &headers).await?;
+
+    let obs_status = st.obs.status().await;
+    if !obs_status.connected {
+        let checks = preflight::evaluate(&preflight::Snapshot::default());
+        return Ok(Json(json!({
+            "summary": preflight::summary(&checks),
+            "checks": checks,
+        })));
+    }
+
+    // Всё, что можно, — одним пакетом: проверка должна быть быстрой, иначе
+    // ею не станут пользоваться перед каждым эфиром.
+    let head = st
+        .obs
+        .batch(vec![
+            BatchItem::new("GetCurrentProgramScene", json!({})),
+            BatchItem::new("GetInputList", json!({})),
+            BatchItem::new("GetSpecialInputs", json!({})),
+            BatchItem::new("GetStats", json!({})),
+            BatchItem::new("GetStreamStatus", json!({})),
+            BatchItem::new("GetRecordStatus", json!({})),
+            BatchItem::new("GetStreamServiceSettings", json!({})),
+        ])
+        .await
+        .map_err(|e| err("Не удалось опросить OBS", e))?;
+    let at = |i: usize| head.get(i).and_then(response_data);
+
+    let current_scene = at(0).and_then(|v| {
+        v.get("currentProgramSceneName")
+            .or_else(|| v.get("sceneName"))
+            .and_then(Value::as_str)
+            .map(str::to_string)
+    });
+
+    let roles = at(2).map(special_input_roles).unwrap_or_default();
+    let input_names: Vec<String> = at(1)
+        .and_then(|v| v.get("inputs"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|i| {
+            i.get("inputName")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .collect();
+
+    // Состояние заглушения — отдельным пакетом, по одному запросу на источник.
+    let mutes = st
+        .obs
+        .batch(
+            input_names
+                .iter()
+                .map(|name| BatchItem::new("GetInputMute", json!({"inputName": name})))
+                .collect(),
+        )
+        .await
+        .unwrap_or_default();
+    let levels = st.levels.read().await.clone();
+
+    let audio: Vec<preflight::AudioInput> = input_names
+        .iter()
+        .enumerate()
+        .filter_map(|(i, name)| {
+            // Источники без звука на GetInputMute отвечают ошибкой — они
+            // к проверке готовности отношения не имеют.
+            let muted = mutes
+                .get(i)
+                .and_then(response_data)?
+                .get("inputMuted")
+                .and_then(Value::as_bool)?;
+            Some(preflight::AudioInput {
+                name: name.clone(),
+                role: roles.get(name.as_str()).map(|r| (*r).to_string()),
+                muted,
+                level_db: levels.get(name).copied(),
+            })
+        })
+        .collect();
+
+    let sources = match &current_scene {
+        Some(scene) => st
+            .obs
+            .request("GetSceneItemList", json!({"sceneName": scene}))
+            .await
+            .ok()
+            .and_then(|v| v.get("sceneItems").and_then(Value::as_array).cloned())
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|i| {
+                Some(preflight::SceneSource {
+                    name: i.get("sourceName").and_then(Value::as_str)?.to_string(),
+                    enabled: i
+                        .get("sceneItemEnabled")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(true),
+                })
+            })
+            .collect(),
+        None => Vec::new(),
+    };
+
+    let snapshot = preflight::Snapshot {
+        obs_connected: true,
+        obs_version: obs_status.obs_version.clone(),
+        current_scene,
+        sources,
+        audio,
+        free_disk_mb: at(3)
+            .and_then(|v| v.get("availableDiskSpace"))
+            .and_then(Value::as_f64)
+            .unwrap_or(0.0),
+        streaming: at(4)
+            .and_then(|v| v.get("outputActive"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        recording: at(5)
+            .and_then(|v| v.get("outputActive"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        stream_service_configured: at(6)
+            .and_then(|v| v.pointer("/streamServiceSettings/key"))
+            .and_then(Value::as_str)
+            .is_some_and(|key| !key.trim().is_empty()),
+        donation_overlay: donation_overlay_state(&st).await,
+        twitch_connected: load_secret("twitch_tokens").ok().flatten().is_some(),
+    };
+
+    let checks = preflight::evaluate(&snapshot);
+    Ok(Json(json!({
+        "summary": preflight::summary(&checks),
+        "checks": checks,
+    })))
+}
+
+/// Состояние оверлея донатов, если DonationAlerts вообще настраивался.
+async fn donation_overlay_state(st: &AppState) -> Option<preflight::OverlayState> {
+    load_secret("donationalerts_widget_url").ok().flatten()?;
+    let cfg = &st.cfg.donationalerts;
+    let problems = verify_donationalerts(st, cfg).await;
+    Some(preflight::OverlayState {
+        present_in_scenes: !problems.iter().any(|p| p.contains("нет оверлея")),
+        on_top: !problems.iter().any(|p| p.contains("не верхним слоем")),
+        muted: problems.iter().any(|p| p.contains("заглушен")),
+    })
 }
 
 async fn obs_status(State(st): State<AppState>, headers: HeaderMap) -> ApiResult<ObsStatus> {

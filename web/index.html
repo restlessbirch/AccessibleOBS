@@ -188,6 +188,18 @@
       </section>
 
       <section class="card">
+        <h2>Готовность к эфиру</h2>
+        <p class="hint">
+          Связная проверка перед началом: есть ли что показывать, слышно ли вас,
+          хватит ли места на диске. Отдельно предупреждает, если звук системы
+          может унести в эфир речь экранного диктора.
+        </p>
+        <button id="runPreflight" type="button">Проверить готовность</button>
+        <p><span class="state" id="preflightSummary" data-state="warn">Проверка не запускалась</span></p>
+        <ul id="preflightChecks" class="checks"></ul>
+      </section>
+
+      <section class="card">
         <h2>Журнал эфира</h2>
         <p class="hint">
           Что и когда произошло за сеанс. Агент следит за потерей кадров и местом

@@ -214,10 +214,17 @@ async fn ensure_tailscale() -> Result<()> {
         return Ok(());
     }
     println!("Tailscale не найден. Устанавливаю официальный MSI...");
-    let msi = installer_path("tailscale-setup-latest-amd64.msi");
-    if !msi.exists() {
-        download_tailscale(&msi).await?;
-    }
+    // Имя файла в архиве содержит версию, потому что версии теперь
+    // зафиксированы манифестом. Искать точное имя нельзя — оно меняется
+    // при каждом обновлении зависимости.
+    let msi = match find_installer("tailscale-setup", ".msi") {
+        Some(path) => path,
+        None => {
+            let path = installer_path("tailscale-setup-amd64.msi");
+            download_tailscale(&path).await?;
+            path
+        }
+    };
     let status = Command::new("msiexec")
         .args([
             "/i",
@@ -460,6 +467,22 @@ fn pause_if_console() {
     let _ = io::stdin().read_line(&mut s);
 }
 
+/// Ищет вложенный установщик по началу и концу имени.
+///
+/// Имена содержат версию (`tailscale-setup-1.90.6-amd64.msi`), поскольку
+/// версии зафиксированы в third_party\installers.json. Искать точное имя
+/// значило бы ломать установку при каждом обновлении зависимости.
+fn find_installer(prefix: &str, suffix: &str) -> Option<PathBuf> {
+    let dir = app_root().join("third_party").join("installers");
+    fs::read_dir(dir).ok()?.flatten().find_map(|entry| {
+        let path = entry.path();
+        let name = path.file_name()?.to_str()?.to_ascii_lowercase();
+        (name.starts_with(&prefix.to_ascii_lowercase())
+            && name.ends_with(&suffix.to_ascii_lowercase()))
+        .then_some(path)
+    })
+}
+
 fn installer_path(file_name: &str) -> PathBuf {
     app_root()
         .join("third_party")
@@ -468,17 +491,27 @@ fn installer_path(file_name: &str) -> PathBuf {
 }
 
 /// Ищем установщик, положенный в архив release-скриптом, чтобы не качать заново.
+/// Подходит ли имя файла под установщик OBS для Windows.
+///
+/// Окончание проверяется как «...installer.exe», а не «-windows-installer.exe»:
+/// OBS выпускает файлы вида OBS-Studio-32.2.1-Windows-x64-Installer.exe, и
+/// строгая проверка их не находила — вложенный в архив установщик молча
+/// игнорировался, а на машине актёра начиналась загрузка из интернета.
+fn is_obs_installer(file_name: &str) -> bool {
+    let name = file_name.to_ascii_lowercase();
+    name.starts_with("obs-studio-") && name.contains("windows") && name.ends_with("installer.exe")
+}
+
 fn preferred_obs_installer_path() -> PathBuf {
     let installers = app_root().join("third_party").join("installers");
     if let Ok(entries) = fs::read_dir(&installers) {
         for entry in entries.flatten() {
             let path = entry.path();
-            let name = path
+            let matches = path
                 .file_name()
                 .and_then(|n| n.to_str())
-                .unwrap_or("")
-                .to_ascii_lowercase();
-            if name.starts_with("obs-studio-") && name.ends_with("-windows-installer.exe") {
+                .is_some_and(is_obs_installer);
+            if matches {
                 return path;
             }
         }
@@ -497,6 +530,29 @@ mod tests {
             web_port: 8787,
             auto_open_browser: false,
         }
+    }
+
+    #[test]
+    fn obs_installer_is_recognised_including_x64_names() {
+        // Именно на этом прежняя проверка спотыкалась: OBS давно выпускает
+        // файлы с -x64- в имени, и вложенный в архив установщик молча
+        // игнорировался, а у актёра начиналась загрузка из интернета.
+        assert!(is_obs_installer(
+            "OBS-Studio-32.2.1-Windows-x64-Installer.exe"
+        ));
+        assert!(is_obs_installer("OBS-Studio-30.0.0-Windows-Installer.exe"));
+        assert!(is_obs_installer(
+            "obs-studio-31.1-windows-x64-installer.exe"
+        ));
+    }
+
+    #[test]
+    fn other_files_are_not_mistaken_for_obs_installer() {
+        assert!(!is_obs_installer("tailscale-setup-1.90.6-amd64.msi"));
+        assert!(!is_obs_installer("OBS-Studio-32.2.1-macOS.dmg"));
+        assert!(!is_obs_installer("README.txt"));
+        // Архив с исходниками — не установщик.
+        assert!(!is_obs_installer("OBS-Studio-32.2.1-Windows.zip"));
     }
 
     #[test]

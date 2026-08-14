@@ -1,6 +1,7 @@
 pub mod donationalerts;
 pub mod health;
 pub mod obs;
+pub mod preflight;
 
 use anyhow::{Context, Result, anyhow, bail};
 use base64::{Engine as _, engine::general_purpose};

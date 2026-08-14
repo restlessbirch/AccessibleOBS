@@ -1877,6 +1877,50 @@ $('launchObs').onclick = async () => {
   }
 };
 
+// ------------------------------------------------- готовность к эфиру
+
+const SEVERITY_WORD = {
+  ok: 'в порядке',
+  warning: 'предупреждение',
+  critical: 'критично',
+};
+
+/// Показывает результат проверки готовности.
+///
+/// Каждая строка начинается со слова, а не только с цвета: экранный диктор
+/// цвет не читает, а именно им пользуется владелец панели.
+async function runPreflight() {
+  setState($('preflightSummary'), 'warn', 'Проверяю…');
+  replace($('preflightChecks'), []);
+  try {
+    const r = await api('/api/preflight');
+    const checks = r.checks || [];
+    const worst = checks.some((c) => c.severity === 'critical') ? 'bad'
+      : checks.some((c) => c.severity === 'warning') ? 'warn' : 'ok';
+    setState($('preflightSummary'), worst, r.summary);
+
+    replace($('preflightChecks'), checks.map((c) => el('li', {
+      class: 'check-row',
+      'data-severity': c.severity,
+    }, [
+      el('strong', { text: `${c.title}: ${SEVERITY_WORD[c.severity] || c.severity}. ` }),
+      document.createTextNode(c.detail + '.'),
+      ...(c.fix ? [el('p', { class: 'hint', text: c.fix })] : []),
+    ])));
+
+    // Критичное перебивает речь: если начинать нельзя, узнать об этом надо
+    // сразу, а не дочитав список до конца.
+    if (worst === 'bad') announce(r.summary);
+    else say(r.summary);
+    journal(r.summary, worst === 'bad' ? 'bad' : 'ok');
+  } catch (e) {
+    setState($('preflightSummary'), 'bad', e.message);
+    fail(e);
+  }
+}
+
+$('runPreflight').onclick = runPreflight;
+
 $('clearJournal').onclick = () => {
   replace($('journal'), []);
   say('Журнал очищен');

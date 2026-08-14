@@ -22,23 +22,57 @@ if (-not $SkipBuild) {
 Copy-Item (Join-Path $Root "target\release\bootstrap.exe") (Join-Path $Bin "bootstrap.exe") -Force
 Copy-Item (Join-Path $Root "target\release\host-agent.exe") (Join-Path $Bin "host-agent.exe") -Force
 
-$tailscale = Join-Path $Installers "tailscale-setup-latest-amd64.msi"
-if (-not (Test-Path -LiteralPath $tailscale)) {
-  Invoke-WebRequest "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi" -OutFile $tailscale
+# Версии стороннего ПО берём из манифеста, а не из "latest".
+#
+# Прежде скрипт качал последнюю версию на момент сборки, поэтому один и тот же
+# релиз, собранный в разные дни, зависел от разных бинарников. Это не только
+# невоспроизводимость: подменённый установщик уехал бы к актёру внутри нашего
+# архива и с нашей репутацией.
+$manifestPath = Join-Path $Root "third_party\installers.json"
+if (-not (Test-Path -LiteralPath $manifestPath)) {
+  throw "Не найден манифест $manifestPath"
+}
+$manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
+
+function Get-PinnedInstaller {
+  param($Entry, [string]$Name)
+
+  $path = Join-Path $Installers $Entry.file
+  if (-not (Test-Path -LiteralPath $path)) {
+    Write-Host "Скачиваю $Name $($Entry.version)..."
+    Invoke-WebRequest $Entry.url -OutFile $path
+  }
+
+  $actual = (Get-FileHash -Algorithm SHA256 -LiteralPath $path).Hash.ToLowerInvariant()
+  $expected = "$($Entry.sha256)".Trim().ToLowerInvariant()
+
+  if ([string]::IsNullOrEmpty($expected)) {
+    # Останавливаемся намеренно: подставить посчитанную сумму автоматически
+    # значило бы «доверяем чему угодно, что скачалось» — ровно то, от чего
+    # контрольная сумма и защищает.
+    throw @"
+Для $Name не зафиксирована контрольная сумма.
+Файл: $path
+Посчитано: $actual
+Проверьте происхождение файла и впишите это значение в поле sha256
+для «$Name» в third_party\installers.json.
+"@
+  }
+  if ($actual -ne $expected) {
+    throw @"
+Контрольная сумма $Name не совпала.
+Файл:     $path
+Ожидали:  $expected
+Получили: $actual
+Файл повреждён или подменён. В архив он не попадёт.
+"@
+  }
+  Write-Host "$Name $($Entry.version): контрольная сумма совпала"
+  return $path
 }
 
-$obsInstaller = Get-ChildItem -LiteralPath $Installers -Filter "OBS-Studio-*-Windows*Installer.exe" -ErrorAction SilentlyContinue |
-  Where-Object { $_.Length -gt 100MB } |
-  Select-Object -First 1
-if (-not $obsInstaller) {
-  $release = Invoke-RestMethod -Headers @{ "User-Agent" = "RemoteStreamControl/1.1" } "https://api.github.com/repos/obsproject/obs-studio/releases/latest"
-  $asset = $release.assets | Where-Object { $_.name -like "*Windows*Installer.exe" } | Select-Object -First 1
-  if (-not $asset) { throw "OBS Windows installer asset was not found in latest release." }
-  $obsPath = Join-Path $Installers $asset.name
-  Invoke-WebRequest $asset.browser_download_url -OutFile $obsPath
-} else {
-  $obsPath = $obsInstaller.FullName
-}
+$tailscale = Get-PinnedInstaller -Entry $manifest.tailscale -Name "Tailscale"
+$obsPath = Get-PinnedInstaller -Entry $manifest.obs -Name "OBS Studio"
 
 if (Test-Path -LiteralPath $StageRoot) { Remove-Item -LiteralPath $StageRoot -Recurse -Force }
 New-Item -ItemType Directory -Force -Path $Stage | Out-Null
