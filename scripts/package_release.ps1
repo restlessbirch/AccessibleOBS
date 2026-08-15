@@ -1,4 +1,4 @@
-param(
+﻿param(
   [string]$Version = "v1.1",
   [switch]$SkipBuild
 )
@@ -19,8 +19,17 @@ if (-not $SkipBuild) {
   Pop-Location
 }
 
-Copy-Item (Join-Path $Root "target\release\bootstrap.exe") (Join-Path $Bin "bootstrap.exe") -Force
-Copy-Item (Join-Path $Root "target\release\host-agent.exe") (Join-Path $Bin "host-agent.exe") -Force
+# В bin складываем свежие бинарники для локального запуска, но не считаем это
+# обязательным: там же лежит агент, который может работать прямо сейчас, и
+# Windows не даст перезаписать занятый файл. Сборку релиза это ронять не
+# должно — в архив всё идёт напрямую из target\release.
+foreach ($exe in @("bootstrap.exe", "host-agent.exe")) {
+  try {
+    Copy-Item (Join-Path $Root "target\release\$exe") (Join-Path $Bin $exe) -Force -ErrorAction Stop
+  } catch {
+    Write-Warning "bin\$($exe) занят запущенной программой, пропускаю. На архив не влияет."
+  }
+}
 
 # Версии стороннего ПО берём из манифеста, а не из "latest".
 #
@@ -93,7 +102,17 @@ $items = @(
 foreach ($item in $items) {
   Copy-Item -LiteralPath (Join-Path $Root $item) -Destination $Stage -Recurse -Force
 }
-Copy-Item -LiteralPath (Join-Path $Bin "bootstrap.exe") -Destination (Join-Path $Stage "RemoteStreamControl.exe") -Force
+# Бинарники в стадию кладём напрямую из target\release, поверх скопированной
+# папки bin.
+#
+# Иначе в архив уезжает то, что лежало в bin, а оно могло не обновиться:
+# запущенный агент держит свой файл, и Windows не даёт его перезаписать.
+# Проверено на живой сборке — в bin оставался агент суточной давности, и
+# архив собрался бы со старым кодом, ничем этого не показав.
+Copy-Item -LiteralPath (Join-Path $Root "target\release\bootstrap.exe") -Destination (Join-Path $Stage "RemoteStreamControl.exe") -Force
+foreach ($exe in @("bootstrap.exe", "host-agent.exe")) {
+  Copy-Item -LiteralPath (Join-Path $Root "target\release\$exe") -Destination (Join-Path $Stage "bin\$exe") -Force
+}
 
 $StageConfig = Join-Path $Stage "config"
 New-Item -ItemType Directory -Force -Path $StageConfig | Out-Null
