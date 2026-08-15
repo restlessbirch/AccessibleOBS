@@ -300,6 +300,8 @@ async fn main() -> Result<()> {
     let app = Router::new()
         .route("/api/public/ping", get(public_ping))
         .route("/api/runtime", get(runtime_info))
+        .route("/api/client-error", post(client_error))
+        .route("/api/diagnostics", get(diagnostics))
         .route("/api/auth/status", get(auth_status))
         .route("/api/auth/login", post(auth_login))
         .route("/api/auth/logout", post(auth_logout))
@@ -621,6 +623,85 @@ async fn public_ping(State(st): State<AppState>) -> Json<Value> {
         "app": APP_NAME,
         "mode": if st.cfg.runtime_mode == RuntimeMode::Local { "local" } else { "remote" },
     }))
+}
+
+/// Принимает ошибку, случившуюся в браузере, и кладёт её в общий лог.
+///
+/// Без этого половина отказов пропадала бесследно: ошибка в панели видна
+/// только в консоли браузера, куда незрячий оператор не заглянет, а зрячий
+/// не догадается. Теперь всё оказывается в одном файле рядом с ошибками
+/// агента, и разбирать поломку можно по одному источнику.
+async fn client_error(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> ApiResult<Value> {
+    require_auth(&st, &headers).await?;
+    let text = |key: &str| body.get(key).and_then(Value::as_str).unwrap_or("");
+    let message = text("message");
+    if message.trim().is_empty() {
+        return Err(bad("message обязателен"));
+    }
+    // Обрезаем: длинный стек в логе только мешает читать, а причина всегда
+    // в первых строках.
+    let truncate = |s: &str, limit: usize| s.chars().take(limit).collect::<String>();
+    warn!(
+        "Ошибка в панели [{}]: {} | {}",
+        truncate(text("where"), 60),
+        truncate(message, 300),
+        truncate(text("stack"), 400),
+    );
+    Ok(Json(json!({"ok": true})))
+}
+
+/// Сводка для разбора поломки: версии, состояние, настройки без секретов.
+///
+/// Когда у актёра что-то не заводится, без неё начинается переписка на сутки:
+/// какая версия, что в конфиге, что в логе. Секреты сюда не попадают — только
+/// признаки того, настроены они или нет.
+async fn diagnostics(State(st): State<AppState>, headers: HeaderMap) -> ApiResult<Value> {
+    require_auth(&st, &headers).await?;
+    let obs = st.obs.status().await;
+    let log_tail = std::fs::read_to_string(logs_dir().join("host.log"))
+        .map(|text| {
+            let lines: Vec<&str> = text.lines().collect();
+            lines
+                .iter()
+                .rev()
+                .take(200)
+                .rev()
+                .copied()
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .unwrap_or_else(|e| format!("лог недоступен: {e}"));
+
+    Ok(Json(json!({
+        "app": {
+            "name": APP_NAME,
+            "version": env!("CARGO_PKG_VERSION"),
+            "runtime_mode": if st.cfg.runtime_mode == RuntimeMode::Local { "local" } else { "remote" },
+            "interface_mode": st.cfg.interface_mode,
+        },
+        "obs": obs,
+        "obs_process_running": obs_is_running(),
+        "obs_crashed_last_run": obs_crashed_last_run(),
+        "tailscale": {
+            "ip": tailscale_ip().map(|i| i.to_string()),
+            "running": tailscale_running(),
+        },
+        "autostart": autostart_registered(),
+        "roles": load_source_roles(),
+        // Не значения, а факт наличия: сами секреты в диагностику не идут.
+        "secrets_present": {
+            "obs_websocket_password": load_secret("obs_websocket_password").ok().flatten().is_some(),
+            "pairing_secret": load_secret("pairing_secret").ok().flatten().is_some(),
+            "twitch_tokens": load_secret("twitch_tokens").ok().flatten().is_some(),
+            "donationalerts_tokens": load_secret("donationalerts_tokens").ok().flatten().is_some(),
+            "donationalerts_widget_url": load_secret("donationalerts_widget_url").ok().flatten().is_some(),
+        },
+        "log_tail": log_tail,
+    })))
 }
 
 async fn runtime_info(State(st): State<AppState>) -> Json<Value> {

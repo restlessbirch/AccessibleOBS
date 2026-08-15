@@ -1,5 +1,36 @@
 'use strict';
 
+// ------------------------------------------------- отправка ошибок в лог
+//
+// Ошибка в панели видна только в консоли браузера: незрячий оператор туда не
+// заглянет, зрячий не догадается. Отправляем их агенту, чтобы всё лежало в
+// одном файле рядом с его собственными ошибками.
+
+let reportedErrors = 0;
+/// Предел на сеанс: зациклившаяся ошибка иначе зальёт лог и вытеснит из него
+/// всё полезное.
+const MAX_REPORTS = 20;
+
+function reportError(where, message, stack) {
+  if (reportedErrors >= MAX_REPORTS) return;
+  reportedErrors += 1;
+  // Намеренно без await и без обработки отказа: если агент недоступен,
+  // сообщать об этом некому и незачем.
+  fetch('/api/client-error', {
+    method: 'POST',
+    credentials: 'same-origin',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ where, message: String(message || ''), stack: String(stack || '') }),
+  }).catch(() => {});
+}
+
+window.addEventListener('error', (e) => {
+  reportError(`${e.filename || 'страница'}:${e.lineno || 0}`, e.message, e.error?.stack);
+});
+window.addEventListener('unhandledrejection', (e) => {
+  reportError('промис', e.reason?.message || e.reason, e.reason?.stack);
+});
+
 const $ = (id) => document.getElementById(id);
 
 function el(tag, props = {}, children = []) {

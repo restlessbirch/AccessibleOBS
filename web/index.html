@@ -262,6 +262,19 @@
       </section>
 
       <section class="card">
+        <h2>Диагностика</h2>
+        <p class="hint">
+          Собирает версии, состояние и последние строки лога в один текст.
+          Секретов внутри нет — только отметки, настроены они или нет.
+          Пригодится, когда что-то не заводится и нужно показать это со стороны.
+        </p>
+        <button id="collectDiagnostics" type="button">Собрать диагностику</button>
+        <button id="copyDiagnostics" type="button" data-variant="quiet" hidden>Скопировать</button>
+        <p id="diagnosticsStatus" class="notice" hidden></p>
+        <textarea id="diagnosticsText" hidden readonly aria-label="Текст диагностики"></textarea>
+      </section>
+
+      <section class="card">
         <h2>Роли источников</h2>
         <p class="hint">
           OBS знает роли только для своих слотов. Микрофон, добавленный обычным

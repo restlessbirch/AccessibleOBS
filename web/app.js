@@ -1,5 +1,36 @@
 'use strict';
 
+// ------------------------------------------------- отправка ошибок в лог
+//
+// Ошибка в панели видна только в консоли браузера: незрячий оператор туда не
+// заглянет, зрячий не догадается. Отправляем их агенту, чтобы всё лежало в
+// одном файле рядом с его собственными ошибками.
+
+let reportedErrors = 0;
+/// Предел на сеанс: зациклившаяся ошибка иначе зальёт лог и вытеснит из него
+/// всё полезное.
+const MAX_REPORTS = 20;
+
+function reportError(where, message, stack) {
+  if (reportedErrors >= MAX_REPORTS) return;
+  reportedErrors += 1;
+  // Намеренно без await и без обработки отказа: если агент недоступен,
+  // сообщать об этом некому и незачем.
+  fetch('/api/client-error', {
+    method: 'POST',
+    credentials: 'same-origin',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ where, message: String(message || ''), stack: String(stack || '') }),
+  }).catch(() => {});
+}
+
+window.addEventListener('error', (e) => {
+  reportError(`${e.filename || 'страница'}:${e.lineno || 0}`, e.message, e.error?.stack);
+});
+window.addEventListener('unhandledrejection', (e) => {
+  reportError('промис', e.reason?.message || e.reason, e.reason?.stack);
+});
+
 /*
  * Панель Remote Stream Control.
  *
@@ -2073,6 +2104,37 @@ async function runPreflight() {
 }
 
 $('runPreflight').onclick = runPreflight;
+
+$('collectDiagnostics').onclick = async () => {
+  const status = $('diagnosticsStatus');
+  try {
+    const data = await api('/api/diagnostics');
+    const text = JSON.stringify(data, null, 2);
+    const box = $('diagnosticsText');
+    box.value = text;
+    box.hidden = false;
+    $('copyDiagnostics').hidden = false;
+    status.textContent = `Собрано, ${text.length} символов. Скопируйте и пришлите этот текст.`;
+    status.hidden = false;
+    say('Диагностика собрана');
+  } catch (e) {
+    status.textContent = e.message;
+    status.hidden = false;
+    fail(e);
+  }
+};
+
+$('copyDiagnostics').onclick = async () => {
+  try {
+    await navigator.clipboard.writeText($('diagnosticsText').value);
+    say('Диагностика скопирована в буфер обмена');
+  } catch {
+    // Буфер может быть недоступен без явного разрешения — тогда текст
+    // выделяем, и его можно скопировать клавишами.
+    $('diagnosticsText').select();
+    say('Текст выделен, скопируйте клавишами Ctrl плюс C');
+  }
+};
 
 $('clearJournal').onclick = () => {
   replace($('journal'), []);
