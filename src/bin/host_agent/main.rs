@@ -67,6 +67,11 @@ struct AppState {
     /// Нужны проверке готовности: включённый микрофон и звучащий микрофон —
     /// разные вещи, а отошедший кабель OBS показывает как исправный вход.
     levels: Arc<RwLock<HashMap<String, f64>>>,
+    /// Подтверждённый токен Twitch с моментом проверки.
+    ///
+    /// Без него каждый показ состояния упирался в сетевой запрос к Twitch, а
+    /// панель спрашивает состояние после каждой команды оператора.
+    twitch_identity: Arc<RwLock<Option<TwitchIdentity>>>,
     /// Канал Twitch, к чату которого подключён клиент.
     ///
     /// Отдельным кэшем, потому что имя канала узнаётся сетевым запросом, а
@@ -199,6 +204,23 @@ fn raw_obs_allowed(request_type: &str) -> bool {
     RAW_OBS_ALLOWLIST.contains(&request_type)
 }
 
+/// Режим интерфейса — с диска, а не из снимка конфига, снятого при старте.
+///
+/// Режим переключают на начальной странице, а она правит host.json в своём
+/// процессе. Агент прописан в автозагрузке и почти всегда уже работает, то есть
+/// в самом обычном случае человек нажимал «Обычный режим», получал бодрое
+/// «Режим сохранён: доступен вывод на второй монитор» — и не получал ничего:
+/// панель продолжала отдавать старый режим до перезапуска агента. Проверено
+/// на живом агенте: host.json менялся, /api/runtime отвечал по-прежнему.
+///
+/// Файл крошечный и читается только на запрос настроек, поэтому чтение с диска
+/// здесь дешевле любого способа уведомить агента о правке извне.
+fn current_interface_mode(st: &AppState) -> InterfaceMode {
+    load_host_config()
+        .map(|cfg| cfg.interface_mode)
+        .unwrap_or(st.cfg.interface_mode)
+}
+
 fn arg_present(name: &str) -> bool {
     std::env::args().skip(1).any(|arg| arg == name)
 }
@@ -261,6 +283,7 @@ async fn main() -> Result<()> {
         oauth_state: Arc::new(RwLock::new(None)),
         login_guards: Arc::new(Mutex::new(HashMap::new())),
         levels: Arc::new(RwLock::new(HashMap::new())),
+        twitch_identity: Arc::new(RwLock::new(None)),
         chat_channel: Arc::new(std::sync::RwLock::new(None)),
     };
 
@@ -681,7 +704,7 @@ async fn diagnostics(State(st): State<AppState>, headers: HeaderMap) -> ApiResul
             "name": APP_NAME,
             "version": env!("CARGO_PKG_VERSION"),
             "runtime_mode": if st.cfg.runtime_mode == RuntimeMode::Local { "local" } else { "remote" },
-            "interface_mode": st.cfg.interface_mode,
+            "interface_mode": current_interface_mode(&st),
         },
         "obs": obs,
         "obs_process_running": obs_is_running(),
@@ -706,14 +729,15 @@ async fn diagnostics(State(st): State<AppState>, headers: HeaderMap) -> ApiResul
 
 async fn runtime_info(State(st): State<AppState>) -> Json<Value> {
     let local = st.cfg.runtime_mode == RuntimeMode::Local;
+    // Режим интерфейса задаётся на начальной странице и решает, что панель
+    // показывает и что произносит вслух.
+    let interface_mode = current_interface_mode(&st);
     Json(json!({
         "mode": if local { "local" } else { "remote" },
         "loopback_only": local,
         "tailscale_required": !local && st.cfg.listen_mode == "tailscale_only",
-        // Режим интерфейса задаётся на начальной странице и решает, что
-        // панель показывает и что произносит вслух.
-        "interface_mode": st.cfg.interface_mode,
-        "accessible": st.cfg.interface_mode == InterfaceMode::Accessible,
+        "interface_mode": interface_mode,
+        "accessible": interface_mode == InterfaceMode::Accessible,
     }))
 }
 
@@ -749,11 +773,12 @@ fn actor_display_panel(value: Option<&str>) -> &'static str {
 
 /// Адрес экрана актёра.
 ///
-/// Именно localhost, а не 127.0.0.1: страница встраивает официальный виджет
-/// чата Twitch, а тот требует параметр `parent` с именем узла. Для IP-адреса
-/// вместо доменного имени встраивание может быть отклонено, и вместо чата
-/// актёр увидел бы ошибку. Слушаем мы тот же петлевой интерфейс, так что
-/// смена ничего не меняет для сети.
+/// Именно localhost, а не 127.0.0.1: имя узла нужно встраиваемым виджетам
+/// стриминговых сервисов, которые сверяют его с параметром `parent` и для
+/// голого IP-адреса отказываются грузиться. Свой чат мы рисуем сами и в этом
+/// не нуждаемся, но страница задумана как место для таких виджетов, и менять
+/// адрес обратно значит наступить на те же грабли. Слушаем мы тот же петлевой
+/// интерфейс, так что для сети выбор имени ничего не меняет.
 fn actor_display_url(port: u16, panels: &str) -> String {
     format!(
         "http://localhost:{port}/display.html?panels={}",
@@ -761,15 +786,87 @@ fn actor_display_url(port: u16, panels: &str) -> String {
     )
 }
 
+/// Экран актёра открывается на машине актёра, где сессии панели нет и быть не
+/// может: pairing-код вводит владелец у себя. Поэтому петлевому запросу здесь
+/// доверяем без сессии — но только вместе с проверкой происхождения.
+///
+/// Одного «пришло с петлевого адреса» мало: запрос чужой страницы, открытой в
+/// браузере актёра, тоже приходит с петлевого адреса. Читать ответ браузер ей
+/// не даст, заголовков CORS мы не отдаём (проверено), однако полагаться на это
+/// как на единственную преграду не стоит — остальные ручки проверяют
+/// происхождение, и эта не должна быть исключением.
+///
+/// Сама страница экрана проверку проходит: запрос к своему же адресу браузер
+/// шлёт без заголовка Origin, и остаётся Host вида localhost:8787.
+fn actor_display_allowed_without_session(peer: IpAddr, headers: &HeaderMap) -> bool {
+    peer.is_loopback() && origin_is_trusted(headers)
+}
+
 async fn require_actor_display_access(
     st: &AppState,
     headers: &HeaderMap,
     peer: SocketAddr,
 ) -> Result<(), Response> {
-    if peer.ip().is_loopback() {
+    if actor_display_allowed_without_session(peer.ip(), headers) {
         Ok(())
     } else {
         require_auth(st, headers).await
+    }
+}
+
+#[cfg(test)]
+mod actor_display_tests {
+    use super::*;
+
+    fn header(name: &'static str, value: &str) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert(name, HeaderValue::from_str(value).unwrap());
+        h
+    }
+
+    const LOOPBACK: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
+
+    #[test]
+    fn display_page_reaches_its_own_data() {
+        // Запрос страницы к своему же адресу браузер шлёт без Origin, так что
+        // решает Host. Оба вида адреса законны: проектор OBS открывает
+        // localhost, а человек может открыть 127.0.0.1 руками.
+        for host in ["localhost:8787", "127.0.0.1:8787"] {
+            assert!(
+                actor_display_allowed_without_session(LOOPBACK, &header("host", host)),
+                "host: {host}"
+            );
+        }
+    }
+
+    #[test]
+    fn foreign_page_in_actor_browser_is_refused() {
+        // Чужая страница, открытая у актёра, приходит с того же петлевого
+        // адреса, что и наша: одного адреса для доверия мало.
+        for origin in [
+            "https://evil.example",
+            "null",
+            "http://localhost.evil.example",
+        ] {
+            assert!(
+                !actor_display_allowed_without_session(LOOPBACK, &header("origin", origin)),
+                "origin: {origin}"
+            );
+        }
+        assert!(!actor_display_allowed_without_session(
+            LOOPBACK,
+            &header("host", "evil.example:8787")
+        ));
+    }
+
+    #[test]
+    fn remote_peer_never_skips_the_session() {
+        // Из tailnet — только с сессией панели, даже с правдоподобным Host.
+        let remote = IpAddr::V4(Ipv4Addr::new(100, 64, 0, 5));
+        assert!(!actor_display_allowed_without_session(
+            remote,
+            &header("host", "127.0.0.1:8787")
+        ));
     }
 }
 
@@ -790,7 +887,7 @@ async fn actor_display_state(
         "runtime": {
             "mode": if st.cfg.runtime_mode == RuntimeMode::Local { "local" } else { "remote" },
             // Экран актёра зачитывает чат вслух только в доступном режиме.
-            "accessible": st.cfg.interface_mode == InterfaceMode::Accessible,
+            "accessible": current_interface_mode(&st) == InterfaceMode::Accessible,
         },
         "twitch": {
             "connected": twitch_login.is_some(),

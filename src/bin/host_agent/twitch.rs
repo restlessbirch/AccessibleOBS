@@ -94,6 +94,9 @@ pub(crate) async fn twitch_config_set(
     if current.client_id != client_id {
         delete_secret("twitch_tokens").ok();
         delete_secret("twitch_device_code").ok();
+        // Токен снят — подтверждение по нему больше не действует, иначе панель
+        // ещё минуту показывала бы «подключено» для стёртого доступа.
+        forget_twitch_identity(&st).await;
     }
     save_host_config_update(|cfg| {
         cfg.twitch.client_id = client_id.clone();
@@ -117,40 +120,21 @@ pub(crate) async fn twitch_status_value(st: &AppState) -> Value {
             "message": "Сохраните Twitch client_id в веб-панели",
         });
     }
-    if load_secret("twitch_tokens").ok().flatten().is_some() {
-        return match twitch_user_refreshed(st).await {
-            Ok(_) => json!({"enabled": true, "configured": true, "connected": true}),
-            Err(e) => json!({
-                "enabled": true,
-                "configured": true,
-                "connected": false,
-                "message": format!("{e:#}"),
-            }),
-        };
+    if load_secret("twitch_tokens").ok().flatten().is_none() {
+        return json!({"enabled": true, "configured": true, "connected": false});
     }
-    match load_secret("twitch_tokens").ok().flatten() {
-        None => json!({"enabled": true, "configured": true, "connected": false}),
-        Some(tok) => {
-            let v: Value = serde_json::from_str(&tok).unwrap_or_else(|_| json!({}));
-            let access = v.get("access_token").and_then(Value::as_str).unwrap_or("");
-            match st
-                .http
-                .get("https://id.twitch.tv/oauth2/validate")
-                .bearer_auth(access)
-                .send()
-                .await
-            {
-                Ok(r) if r.status().is_success() => {
-                    json!({"enabled": true, "configured": true, "connected": true})
-                }
-                _ => json!({
-                    "enabled": true,
-                    "configured": true,
-                    "connected": false,
-                    "message": "Twitch token устарел или недоступен",
-                }),
-            }
-        }
+    // Ниже раньше лежала вторая проверка токена — свой запрос к validate на
+    // случай, если первая ветка не сработала. Сработать она не могла: обе
+    // ветки спрашивали одно и то же хранилище, и до второй дело доходило
+    // только при отсутствии токена, где её ветка Some не выполнялась никогда.
+    match twitch_user_refreshed(st).await {
+        Ok(_) => json!({"enabled": true, "configured": true, "connected": true}),
+        Err(e) => json!({
+            "enabled": true,
+            "configured": true,
+            "connected": false,
+            "message": format!("{e:#}"),
+        }),
     }
 }
 
@@ -217,6 +201,8 @@ pub(crate) async fn twitch_device_check(
         save_secret("twitch_tokens", &v.to_string())
             .map_err(|e| err("Не удалось сохранить Twitch token", e))?;
         delete_secret("twitch_device_code").ok();
+        // Пришёл новый токен: прежнее подтверждение относилось к другому.
+        forget_twitch_identity(&st).await;
         return Ok(Json(json!({"status": "connected"})));
     }
     if message.contains("authorization_pending") {
@@ -242,31 +228,47 @@ pub(crate) async fn twitch_device_check(
         .into_response())
 }
 
-#[allow(dead_code)]
-pub(crate) async fn twitch_user(st: &AppState) -> Result<(String, String)> {
-    let tok = load_secret("twitch_tokens")?.ok_or_else(|| anyhow!("Twitch не подключён"))?;
-    let v: Value = serde_json::from_str(&tok)?;
-    let access = v
-        .get("access_token")
-        .and_then(Value::as_str)
-        .ok_or_else(|| anyhow!("access_token отсутствует"))?;
-    let val: Value = st
-        .http
-        .get("https://id.twitch.tv/oauth2/validate")
-        .bearer_auth(access)
-        .send()
-        .await?
-        .json()
-        .await?;
-    let uid = val
-        .get("user_id")
-        .and_then(Value::as_str)
-        .ok_or_else(|| anyhow!("Twitch не вернул user_id — вероятно, токен истёк"))?
-        .to_string();
-    Ok((access.to_string(), uid))
+/// Подтверждённая личность подключённого канала.
+///
+/// Логин и user_id приходят одним ответом validate, поэтому и хранятся вместе.
+/// Раньше [`twitch_channel_login`] брал user_id через `twitch_user_refreshed`,
+/// а потом спрашивал validate второй раз ради логина — два одинаковых запроса
+/// к Twitch там, где хватает одного.
+#[derive(Clone)]
+pub(crate) struct TwitchIdentity {
+    pub access: String,
+    pub user_id: String,
+    pub login: Option<String>,
+    checked_at: Instant,
 }
 
-pub(crate) async fn twitch_user_refreshed(st: &AppState) -> Result<(String, String)> {
+/// Сколько доверять уже подтверждённому токену.
+///
+/// Панель зовёт /api/health и /api/twitch/status после каждой команды
+/// оператора, а каждый такой вызов упирался в сетевой запрос к Twitch: два
+/// обращения на одно нажатие кнопки плюс задержка ответа, которую незрячий
+/// оператор ждёт, не понимая, прошла команда или нет. Сам Twitch просит
+/// проверять токен раз в час, так что минута кэша ничего не портит, а отзыв
+/// доступа на стороне Twitch мы заметим на следующей минуте.
+const TWITCH_IDENTITY_TTL: Duration = Duration::from_secs(60);
+
+/// Забыть подтверждённую личность: вызывается там, где токен заменён или снят.
+pub(crate) async fn forget_twitch_identity(st: &AppState) {
+    *st.twitch_identity.write().await = None;
+}
+
+pub(crate) async fn twitch_user_refreshed(st: &AppState) -> Result<TwitchIdentity> {
+    if let Some(cached) = st.twitch_identity.read().await.as_ref()
+        && cached.checked_at.elapsed() < TWITCH_IDENTITY_TTL
+    {
+        return Ok(cached.clone());
+    }
+    let identity = twitch_identity_from_network(st).await?;
+    *st.twitch_identity.write().await = Some(identity.clone());
+    Ok(identity)
+}
+
+async fn twitch_identity_from_network(st: &AppState) -> Result<TwitchIdentity> {
     let tok = load_secret("twitch_tokens")?.ok_or_else(|| anyhow!("Twitch не подключён"))?;
     let v: Value = serde_json::from_str(&tok)?;
     let access = v
@@ -274,7 +276,12 @@ pub(crate) async fn twitch_user_refreshed(st: &AppState) -> Result<(String, Stri
         .and_then(Value::as_str)
         .ok_or_else(|| anyhow!("access_token отсутствует"))?;
     match validate_twitch_access(st, access).await {
-        Ok(uid) => Ok((access.to_string(), uid)),
+        Ok((user_id, login)) => Ok(TwitchIdentity {
+            access: access.to_string(),
+            user_id,
+            login,
+            checked_at: Instant::now(),
+        }),
         Err(first_error) => {
             let Some(refresh) = v.get("refresh_token").and_then(Value::as_str) else {
                 return Err(first_error);
@@ -285,13 +292,22 @@ pub(crate) async fn twitch_user_refreshed(st: &AppState) -> Result<(String, Stri
                 .and_then(Value::as_str)
                 .ok_or_else(|| anyhow!("Twitch не вернул новый access_token"))?;
             save_secret("twitch_tokens", &refreshed.to_string())?;
-            let uid = validate_twitch_access(st, access).await?;
-            Ok((access.to_string(), uid))
+            let (user_id, login) = validate_twitch_access(st, access).await?;
+            Ok(TwitchIdentity {
+                access: access.to_string(),
+                user_id,
+                login,
+                checked_at: Instant::now(),
+            })
         }
     }
 }
 
-pub(crate) async fn validate_twitch_access(st: &AppState, access: &str) -> Result<String> {
+/// Возвращает user_id и логин: validate отдаёт их одним ответом.
+pub(crate) async fn validate_twitch_access(
+    st: &AppState,
+    access: &str,
+) -> Result<(String, Option<String>)> {
     let response = st
         .http
         .get("https://id.twitch.tv/oauth2/validate")
@@ -310,10 +326,18 @@ pub(crate) async fn validate_twitch_access(st: &AppState, access: &str) -> Resul
             "Twitch token не прошёл validate: {status} {detail}"
         ));
     }
-    val.get("user_id")
+    let user_id = val
+        .get("user_id")
         .and_then(Value::as_str)
         .map(str::to_string)
-        .ok_or_else(|| anyhow!("Twitch не вернул user_id"))
+        .ok_or_else(|| anyhow!("Twitch не вернул user_id"))?;
+    let login = val
+        .get("login")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|login| !login.is_empty())
+        .map(str::to_string);
+    Ok((user_id, login))
 }
 
 pub(crate) async fn twitch_channel_login(st: &AppState) -> Result<Option<String>> {
@@ -321,30 +345,7 @@ pub(crate) async fn twitch_channel_login(st: &AppState) -> Result<Option<String>
     if !cfg.enabled || cfg.client_id.is_empty() || load_secret("twitch_tokens")?.is_none() {
         return Ok(None);
     }
-    let (access, _) = twitch_user_refreshed(st).await?;
-    let response = st
-        .http
-        .get("https://id.twitch.tv/oauth2/validate")
-        .bearer_auth(access)
-        .send()
-        .await?;
-    let status = response.status();
-    let body = response.text().await.unwrap_or_default();
-    let val: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
-    if !status.is_success() {
-        let detail = val
-            .get("message")
-            .and_then(Value::as_str)
-            .unwrap_or(body.trim());
-        return Err(anyhow!(
-            "Twitch validate для чата отклонён: {status} {detail}"
-        ));
-    }
-    Ok(val
-        .get("login")
-        .and_then(Value::as_str)
-        .filter(|login| !login.trim().is_empty())
-        .map(str::to_string))
+    Ok(twitch_user_refreshed(st).await?.login)
 }
 
 pub(crate) async fn refresh_twitch_tokens(st: &AppState, refresh: &str) -> Result<Value> {
@@ -382,15 +383,15 @@ pub(crate) async fn twitch_channel_get(
 ) -> ApiResult<Value> {
     require_auth(&st, &headers).await?;
     let cfg = effective_twitch_config(&st);
-    let (access, uid) = twitch_user_refreshed(&st)
+    let me = twitch_user_refreshed(&st)
         .await
         .map_err(|e| err("Twitch не подключён", e))?;
     let response = st
         .http
         .get("https://api.twitch.tv/helix/channels")
-        .query(&[("broadcaster_id", uid.as_str())])
+        .query(&[("broadcaster_id", me.user_id.as_str())])
         .header("Client-Id", &cfg.client_id)
-        .bearer_auth(access)
+        .bearer_auth(&me.access)
         .send()
         .await
         .map_err(|e| err("Twitch недоступен", e.into()))?;
@@ -406,15 +407,15 @@ pub(crate) async fn twitch_channel_modify(
 ) -> ApiResult<Value> {
     require_auth(&st, &headers).await?;
     let cfg = effective_twitch_config(&st);
-    let (access, uid) = twitch_user_refreshed(&st)
+    let me = twitch_user_refreshed(&st)
         .await
         .map_err(|e| err("Twitch не подключён", e))?;
     let response = st
         .http
         .patch("https://api.twitch.tv/helix/channels")
-        .query(&[("broadcaster_id", uid.as_str())])
+        .query(&[("broadcaster_id", me.user_id.as_str())])
         .header("Client-Id", &cfg.client_id)
-        .bearer_auth(access)
+        .bearer_auth(&me.access)
         .json(&body)
         .send()
         .await
@@ -431,7 +432,7 @@ pub(crate) async fn twitch_marker(
 ) -> ApiResult<Value> {
     require_auth(&st, &headers).await?;
     let cfg = effective_twitch_config(&st);
-    let (access, uid) = twitch_user_refreshed(&st)
+    let me = twitch_user_refreshed(&st)
         .await
         .map_err(|e| err("Twitch не подключён", e))?;
     let description = body
@@ -442,8 +443,8 @@ pub(crate) async fn twitch_marker(
         .http
         .post("https://api.twitch.tv/helix/streams/markers")
         .header("Client-Id", &cfg.client_id)
-        .bearer_auth(access)
-        .json(&json!({"user_id": uid, "description": description}))
+        .bearer_auth(&me.access)
+        .json(&json!({"user_id": me.user_id, "description": description}))
         .send()
         .await
         .map_err(|e| err("Не удалось создать метку Twitch", e.into()))?;
