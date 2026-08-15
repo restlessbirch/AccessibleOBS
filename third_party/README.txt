@@ -1,2 +1,9 @@
-При первом запуске START_FRIEND.bat/START_ME.bat bootstrap сам скачает официальный Tailscale MSI в эту папку, если Tailscale не установлен.
-Если интернет недоступен, положите сюда файл tailscale-setup-latest-amd64.msi с https://tailscale.com/download/windows
+Official third-party installers are staged here only for release packaging.
+
+The source repository tracks `installers.json`, not installer binaries.
+`scripts\package_release.ps1` downloads missing pinned installers, verifies
+their SHA256 values, and places the verified files into the release zip.
+
+Runtime users normally start `RemoteStreamControl.exe`; the launcher installs
+or reuses OBS Studio and Tailscale from the packaged installers when available,
+or opens the official download pages when an installer is missing.

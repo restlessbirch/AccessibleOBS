@@ -4,9 +4,12 @@ Remote Stream Control — technical notes
 Бинарники
 ---------
 bin\bootstrap.exe — первичная настройка, консольное приложение.
+  --launcher          доступное мини-меню запуска; это режим по умолчанию
+                      для RemoteStreamControl.exe в релизном архиве.
   --host              Tailscale + OBS + пароль WebSocket + host-agent +
                       регистрация автозапуска + вывод pairing-кода.
   --controller        Tailscale + поиск агента в tailnet + открытие браузера.
+  --local             локальный доступный режим без Tailscale и pairing-кода.
   --remove-autostart  удаление ярлыка из автозагрузки.
 
 bin\host-agent.exe — фоновый агент, HTTP API и статика панели.
@@ -53,6 +56,15 @@ GET /api/events — Server-Sent Events, требует авторизации.
 /api/obs/request оставлен только как узкий compatibility endpoint для read-only запросов,
 которые ещё использует frontend: GetStreamStatus и GetRecordStatus. Остальные OBS-команды
 должны идти через специализированные API-ручки Remote Stream Control.
+
+Экран актёра для второго монитора использует отдельные view-only ручки:
+  GET  /api/actor-display/state
+  GET  /api/actor-display/events
+  POST /api/actor-display/open
+
+Loopback-запросы к display state/events разрешены без pairing-кода, чтобы
+браузер на компьютере актёра мог показать `display.html`. Любой non-loopback
+запрос требует обычную авторизованную сессию панели.
 
 
 Сетевая модель
@@ -172,7 +184,8 @@ Twitch
 ------
 Device Code OAuth, хранение токенов через DPAPI, проверка через /oauth2/validate,
 чтение и изменение параметров канала, создание маркера.
-Требуется twitch.client_id в config\host.json.
+Client ID и scopes сохраняются из web-панели; публичная часть зеркалируется
+в config\host.json, токены лежат в DPAPI.
 
 
 Автозапуск
@@ -199,7 +212,7 @@ WScript.Shell. Выбран ярлык, а не ключ реестра Run: о�
 
 Приёмочный тест на компьютере актёра
 ------------------------------------
-1. Запустить START_FRIEND.bat, дождаться pairing-кода.
+1. Запустить RemoteStreamControl.exe, выбрать режим актёра, дождаться pairing-кода.
 2. Перезагрузить компьютер и убедиться, что панель доступна без запуска BAT.
 3. Открыть панель у владельца, ввести код.
 4. Переключить сцену.
@@ -224,12 +237,14 @@ runtime_mode продолжают загружаться. CLI-флаг host-agen
 переключает текущий запуск в Local Mode и не переписывает host.json.
 
 Remote Mode:
-- START_FRIEND.bat не менялся;
+- RemoteStreamControl.exe --launcher остаётся основным входом;
+- START_FRIEND.bat сохранён как совместимый wrapper для --host;
 - listen_mode=tailscale_only по-прежнему поднимает 127.0.0.1 и Tailscale IP;
 - pairing, session cookie и Tailscale остаются обязательной моделью доступа.
 
 Local Mode:
-- START_LOCAL.bat запускает bin\host-agent.exe --local;
+- RemoteStreamControl.exe --local запускает локальную панель;
+- START_LOCAL.bat сохранён как совместимый wrapper;
 - HTTP listener поднимается только на 127.0.0.1:web_port;
 - Tailscale IP не запрашивается и не слушается;
 - /api/auth/status возвращает authenticated=true без pairing secret;

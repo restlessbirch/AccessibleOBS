@@ -465,6 +465,82 @@ li {
   margin: 0.35rem 0 0;
 }
 
+.actor-display {
+  padding-bottom: 0;
+  background: #05070a;
+  color: #f7fafc;
+}
+.actor-display header {
+  background: #0f1720;
+  border-bottom-color: #334155;
+}
+.actor-display header p {
+  color: #cbd5e1;
+}
+.display-main {
+  max-width: none;
+  min-height: calc(100vh - 5.6rem);
+  padding: 1rem;
+  grid-template-columns: minmax(20rem, 1.1fr) minmax(18rem, 0.9fr);
+  align-items: stretch;
+}
+.display-panel {
+  min-height: 24rem;
+  padding: 1rem;
+  background: #0f1720;
+  border: 1px solid #334155;
+  border-radius: var(--radius);
+}
+.display-panel h2 {
+  margin: 0 0 0.75rem;
+  font-size: 1.4rem;
+}
+.chat-box,
+.chat-frame {
+  width: 100%;
+  height: min(74vh, 52rem);
+}
+.chat-frame {
+  border: 0;
+  background: #18181b;
+}
+.display-state {
+  margin-bottom: 0.75rem;
+  color: #cbd5e1;
+  font-size: 1.1rem;
+}
+.display-donations {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  font-size: 1.25rem;
+}
+.display-donations li {
+  margin: 0 0 0.75rem;
+  padding: 0.85rem 1rem;
+  background: #111827;
+  border: 1px solid #475569;
+  border-left: 0.35rem solid #74d69b;
+  border-radius: var(--radius);
+}
+.display-donations .empty {
+  color: #cbd5e1;
+  border-left-color: #64748b;
+}
+.display-actions {
+  grid-column: 1 / -1;
+}
+.actor-display :is(button, input, select, a, [tabindex]):focus-visible {
+  outline-color: #fbbf24;
+}
+body[data-display-mode="chat"] .display-main,
+body[data-display-mode="donations"] .display-main {
+  grid-template-columns: 1fr;
+}
+body[data-display-mode="donations"] .display-donations {
+  font-size: 1.6rem;
+}
+
 /* Выключенная кнопка обязана выглядеть выключенной, а не просто не работать. */
 button:disabled,
 select:disabled {
@@ -490,5 +566,12 @@ select:disabled {
   button {
     width: 100%;
     margin-right: 0;
+  }
+  .display-main {
+    grid-template-columns: 1fr;
+  }
+  .chat-box,
+  .chat-frame {
+    height: 32rem;
   }
 }

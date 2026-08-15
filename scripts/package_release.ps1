@@ -30,7 +30,7 @@ Copy-Item (Join-Path $Root "target\release\host-agent.exe") (Join-Path $Bin "hos
 # архива и с нашей репутацией.
 $manifestPath = Join-Path $Root "third_party\installers.json"
 if (-not (Test-Path -LiteralPath $manifestPath)) {
-  throw "Не найден манифест $manifestPath"
+  throw "Installer manifest not found: $manifestPath"
 }
 $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
 
@@ -39,7 +39,7 @@ function Get-PinnedInstaller {
 
   $path = Join-Path $Installers $Entry.file
   if (-not (Test-Path -LiteralPath $path)) {
-    Write-Host "Скачиваю $Name $($Entry.version)..."
+    Write-Host "Downloading $Name $($Entry.version)..."
     Invoke-WebRequest $Entry.url -OutFile $path
   }
 
@@ -51,23 +51,23 @@ function Get-PinnedInstaller {
     # значило бы «доверяем чему угодно, что скачалось» — ровно то, от чего
     # контрольная сумма и защищает.
     throw @"
-Для $Name не зафиксирована контрольная сумма.
-Файл: $path
-Посчитано: $actual
-Проверьте происхождение файла и впишите это значение в поле sha256
-для «$Name» в third_party\installers.json.
+Missing pinned SHA256 for $Name.
+File: $path
+Actual: $actual
+Verify the file origin, then write this value to the sha256 field
+for "$Name" in third_party\installers.json.
 "@
   }
   if ($actual -ne $expected) {
     throw @"
-Контрольная сумма $Name не совпала.
-Файл:     $path
-Ожидали:  $expected
-Получили: $actual
-Файл повреждён или подменён. В архив он не попадёт.
+SHA256 mismatch for $Name.
+File:     $path
+Expected: $expected
+Actual:   $actual
+The file may be damaged or replaced. It will not be packaged.
 "@
   }
-  Write-Host "$Name $($Entry.version): контрольная сумма совпала"
+  Write-Host "$Name $($Entry.version): SHA256 OK"
   return $path
 }
 
@@ -84,18 +84,16 @@ $items = @(
   "START_FRIEND.bat",
   "START_ME.bat",
   "START_LOCAL.bat",
-  "README_FIRST.txt",
-  "CHECKLIST_FOR_ACTOR.txt",
-  "CHECKLIST_FOR_OWNER.txt",
-  "TECHNICAL_NOTES.txt",
+  "README.md",
+  "SECURITY.md",
   "LICENSE",
-  "THIRD_PARTY_NOTICES.txt",
-  "PACKAGING_MICROSOFT.md"
+  "THIRD_PARTY_NOTICES.txt"
 )
 
 foreach ($item in $items) {
   Copy-Item -LiteralPath (Join-Path $Root $item) -Destination $Stage -Recurse -Force
 }
+Copy-Item -LiteralPath (Join-Path $Bin "bootstrap.exe") -Destination (Join-Path $Stage "RemoteStreamControl.exe") -Force
 
 $StageConfig = Join-Path $Stage "config"
 New-Item -ItemType Directory -Force -Path $StageConfig | Out-Null
@@ -103,6 +101,11 @@ Copy-Item -LiteralPath (Join-Path $Root "config\host.json") -Destination $StageC
 Copy-Item -LiteralPath (Join-Path $Root "config\controller.json") -Destination $StageConfig -Force
 
 New-Item -ItemType Directory -Force -Path (Join-Path $Stage "third_party\installers") | Out-Null
+$StageInstallers = Join-Path $Stage "third_party\installers"
+if (Test-Path -LiteralPath $StageInstallers) {
+  Remove-Item -LiteralPath $StageInstallers -Recurse -Force
+}
+New-Item -ItemType Directory -Force -Path $StageInstallers | Out-Null
 Copy-Item -LiteralPath $tailscale -Destination (Join-Path $Stage "third_party\installers") -Force
 Copy-Item -LiteralPath $obsPath -Destination (Join-Path $Stage "third_party\installers") -Force
 
@@ -126,3 +129,7 @@ Compress-Archive -Path (Join-Path $StageRoot "RemoteStreamControl") -Destination
 
 Get-FileHash -Algorithm SHA256 -LiteralPath $zip | Format-List
 Write-Host "Created $zip"
+
+if (Test-Path -LiteralPath $StageRoot) {
+  Remove-Item -LiteralPath $StageRoot -Recurse -Force
+}

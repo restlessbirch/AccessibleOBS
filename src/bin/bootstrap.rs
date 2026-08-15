@@ -8,28 +8,42 @@
 //! `--controller` (компьютер владельца): находит агента в tailnet и открывает панель.
 
 use anyhow::{Context, Result, anyhow};
+use axum::{
+    Router,
+    extract::State,
+    response::{Html, IntoResponse},
+    routing::{get, post},
+};
 use remote_stream_control::*;
+use serde_json::Value;
 use std::{
     fs,
     io::{self, Write},
+    net::SocketAddr,
     path::{Path, PathBuf},
     process::{Command, Stdio},
+    sync::Arc,
     time::{Duration, Instant},
 };
+use tokio::net::TcpListener;
 use tokio::time::sleep;
+
+const LAUNCHER_PORT: u16 = 8786;
 
 #[tokio::main]
 async fn main() -> Result<()> {
     ensure_dirs()?;
     // Держим страж до конца main: он живёт столько же, сколько процесс.
-    let _log_guard = init_logging()?;
+    let _log_guard = init_file_logging("bootstrap.log")?;
     match std::env::args()
         .nth(1)
-        .unwrap_or_else(|| "--help".into())
+        .unwrap_or_else(|| "--launcher".into())
         .as_str()
     {
+        "--launcher" | "--install" => launcher_flow().await,
         "--host" => host_flow().await,
         "--controller" => controller_flow().await,
+        "--local" => local_flow().await,
         "--remove-autostart" => {
             unregister_autostart()?;
             println!("Автозапуск Remote Stream Control удалён.");
@@ -40,32 +54,348 @@ async fn main() -> Result<()> {
             println!(
                 "Remote Stream Control bootstrap\n\n\
                  Использование:\n  \
-                 bootstrap.exe --host              компьютер актёра/стримера\n  \
-                 bootstrap.exe --controller        компьютер владельца\n  \
-                 bootstrap.exe --remove-autostart  убрать агент из автозагрузки"
+                 RemoteStreamControl.exe                   открыть доступное меню запуска\n  \
+                 RemoteStreamControl.exe --launcher        открыть доступное меню запуска\n  \
+                 RemoteStreamControl.exe --host              компьютер актёра/стримера\n  \
+                 RemoteStreamControl.exe --controller        компьютер владельца\n  \
+                 RemoteStreamControl.exe --local             локальный доступный режим\n  \
+                 RemoteStreamControl.exe --remove-autostart  убрать агент из автозагрузки"
             );
             Ok(())
         }
     }
 }
 
-/// Возвращает страж записи логов: пока он жив, фоновый поток дописывает файл.
-///
-/// Раньше страж намеренно «терялся» через mem::forget. Работало, но управление
-/// временем жизни превращалось в скрытую утечку, а читатель кода не мог понять,
-/// почему объект просто выбрасывают. Теперь его держит вызывающая сторона.
-#[must_use = "пока страж жив, пишутся логи; если его уронить, записи пропадут"]
-fn init_logging() -> Result<tracing_appender::non_blocking::WorkerGuard> {
-    let file = tracing_appender::rolling::never(logs_dir(), "bootstrap.log");
-    let (writer, guard) = tracing_appender::non_blocking(file);
-    tracing_subscriber::fmt()
-        .with_writer(writer)
-        .with_ansi(false)
-        .with_target(false)
-        .try_init()
-        .ok();
-    Ok(guard)
+async fn launcher_flow() -> Result<()> {
+    let shortcut = register_launcher_shortcut()?;
+    println!(
+        "Remote Stream Control launcher\n\n\
+         Desktop shortcut: {}\n\
+         Opening accessible launcher...",
+        shortcut.display()
+    );
+
+    let addr = SocketAddr::from(([127, 0, 0, 1], LAUNCHER_PORT));
+    let listener = match TcpListener::bind(addr).await {
+        Ok(listener) => listener,
+        Err(_) => {
+            let url = launcher_url();
+            println!("Launcher already seems to be running. Opening {url}");
+            open::that(url).context("не удалось открыть браузер")?;
+            return Ok(());
+        }
+    };
+
+    let state = LauncherState {
+        exe: Arc::new(launcher_exe()),
+    };
+    let app = Router::new()
+        .route("/", get(launcher_page))
+        .route("/actor", post(launcher_actor))
+        .route("/operator", post(launcher_operator))
+        .route("/local", post(launcher_local))
+        .route("/interface-mode/accessible", post(launcher_mode_accessible))
+        .route("/interface-mode/standard", post(launcher_mode_standard))
+        .route("/remove-autostart", post(launcher_remove_autostart))
+        .with_state(state);
+
+    let url = launcher_url();
+    open::that(&url).context("не удалось открыть браузер")?;
+    println!("Launcher: {url}");
+    println!("Keep this window open while using the launcher.");
+    axum::serve(listener, app).await?;
+    Ok(())
 }
+
+#[derive(Clone)]
+struct LauncherState {
+    exe: Arc<PathBuf>,
+}
+
+fn launcher_url() -> String {
+    format!("http://127.0.0.1:{LAUNCHER_PORT}/")
+}
+
+fn launcher_exe() -> PathBuf {
+    let root_exe = app_root().join("RemoteStreamControl.exe");
+    if root_exe.exists() {
+        root_exe
+    } else {
+        std::env::current_exe().unwrap_or_else(|_| bin_dir().join("bootstrap.exe"))
+    }
+}
+
+async fn launcher_page() -> Html<String> {
+    // Показываем текущий выбор прямо на странице: незрячий иначе не поймёт,
+    // в каком режиме окажется, пока не запустит панель.
+    let mode = load_host_config()
+        .map(|c| c.interface_mode)
+        .unwrap_or(InterfaceMode::Accessible);
+    let label = match mode {
+        InterfaceMode::Accessible => "доступный, для незрячего",
+        InterfaceMode::Standard => "обычный, для зрячего",
+    };
+    Html(LAUNCHER_HTML.replace("{MODE}", label))
+}
+
+async fn launcher_mode_accessible() -> impl IntoResponse {
+    set_interface_mode(InterfaceMode::Accessible)
+}
+
+async fn launcher_mode_standard() -> impl IntoResponse {
+    set_interface_mode(InterfaceMode::Standard)
+}
+
+fn set_interface_mode(mode: InterfaceMode) -> Html<String> {
+    let outcome = load_host_config().and_then(|mut cfg| {
+        cfg.interface_mode = mode;
+        save_json(&config_dir().join("host.json"), &cfg)
+    });
+    match outcome {
+        Ok(()) => Html(result_page(
+            "Режим сохранён",
+            match mode {
+                InterfaceMode::Accessible => {
+                    "Выбран доступный режим: важное зачитывается вслух,                      вывод на второй монитор скрыт."
+                }
+                InterfaceMode::Standard => {
+                    "Выбран обычный режим: доступен вывод на второй монитор,                      вслух ничего не зачитывается."
+                }
+            },
+            Some(&launcher_url()),
+        )),
+        Err(e) => Html(result_page(
+            "Не удалось сохранить режим",
+            &e.to_string(),
+            Some(&launcher_url()),
+        )),
+    }
+}
+
+async fn launcher_actor(State(st): State<LauncherState>) -> impl IntoResponse {
+    spawn_launcher_command(&st.exe, "--host", "Actor setup")
+}
+
+async fn launcher_operator(State(st): State<LauncherState>) -> impl IntoResponse {
+    spawn_launcher_command(&st.exe, "--controller", "Operator panel")
+}
+
+async fn launcher_local(State(st): State<LauncherState>) -> impl IntoResponse {
+    spawn_launcher_command(&st.exe, "--local", "Local accessible mode")
+}
+
+async fn launcher_remove_autostart() -> impl IntoResponse {
+    match unregister_autostart() {
+        Ok(()) => Html(result_page(
+            "Autostart removed",
+            "Remote actor autostart shortcut was removed.",
+            Some(&launcher_url()),
+        )),
+        Err(e) => Html(result_page(
+            "Autostart error",
+            &e.to_string(),
+            Some(&launcher_url()),
+        )),
+    }
+}
+
+fn spawn_launcher_command(exe: &Path, arg: &str, title: &str) -> Html<String> {
+    match Command::new(exe).arg(arg).current_dir(app_root()).spawn() {
+        Ok(_) => Html(result_page(
+            title,
+            "A separate setup window was opened. Follow the spoken or on-screen instructions there.",
+            Some(&launcher_url()),
+        )),
+        Err(e) => Html(result_page(
+            title,
+            &format!("Could not start command: {e}"),
+            Some(&launcher_url()),
+        )),
+    }
+}
+
+fn result_page(title: &str, message: &str, back: Option<&str>) -> String {
+    let back_link = back
+        .map(|url| format!(r#"<p><a href="{url}">Back to launcher</a></p>"#))
+        .unwrap_or_default();
+    format!(
+        r#"<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{}</title>
+  <style>{}</style>
+</head>
+<body>
+  <main>
+    <h1>{}</h1>
+    <p role="status">{}</p>
+    {}
+  </main>
+</body>
+</html>"#,
+        html_escape(title),
+        LAUNCHER_CSS,
+        html_escape(title),
+        html_escape(message),
+        back_link
+    )
+}
+
+fn html_escape(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
+const LAUNCHER_CSS: &str = r#"
+:root { color-scheme: light dark; }
+body {
+  margin: 0;
+  font-family: system-ui, "Segoe UI", sans-serif;
+  line-height: 1.5;
+  background: Canvas;
+  color: CanvasText;
+}
+main {
+  max-width: 760px;
+  margin: 0 auto;
+  padding: 24px;
+}
+h1 { font-size: 1.8rem; margin: 0 0 12px; }
+p { margin: 0 0 18px; }
+form { margin: 16px 0; }
+button, a {
+  font: inherit;
+  min-height: 48px;
+}
+button {
+  width: 100%;
+  text-align: left;
+  border: 2px solid ButtonText;
+  background: ButtonFace;
+  color: ButtonText;
+  padding: 14px 16px;
+  border-radius: 6px;
+  cursor: pointer;
+}
+button:focus-visible, a:focus-visible {
+  outline: 3px solid Highlight;
+  outline-offset: 3px;
+}
+.hint {
+  display: block;
+  margin-top: 4px;
+  font-size: 0.95rem;
+}
+"#;
+
+const LAUNCHER_HTML: &str = r#"<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Remote Stream Control</title>
+  <style>
+:root { color-scheme: light dark; }
+body {
+  margin: 0;
+  font-family: system-ui, "Segoe UI", sans-serif;
+  line-height: 1.5;
+  background: Canvas;
+  color: CanvasText;
+}
+main {
+  max-width: 760px;
+  margin: 0 auto;
+  padding: 24px;
+}
+h1 { font-size: 1.8rem; margin: 0 0 12px; }
+p { margin: 0 0 18px; }
+form { margin: 16px 0; }
+button {
+  width: 100%;
+  min-height: 56px;
+  text-align: left;
+  border: 2px solid ButtonText;
+  background: ButtonFace;
+  color: ButtonText;
+  padding: 14px 16px;
+  border-radius: 6px;
+  font: inherit;
+  cursor: pointer;
+}
+button:focus-visible {
+  outline: 3px solid Highlight;
+  outline-offset: 3px;
+}
+.hint {
+  display: block;
+  margin-top: 4px;
+  font-size: 0.95rem;
+}
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Remote Stream Control</h1>
+    <p>Выберите, как использовать этот компьютер.</p>
+
+    <h2>Режим интерфейса</h2>
+    <p>
+      От него зависит, что панель показывает и что произносит вслух.
+      Сейчас выбран: <strong>{MODE}</strong>
+    </p>
+
+    <form method="post" action="/interface-mode/accessible">
+      <button type="submit">
+        Доступный: для незрячего
+        <span class="hint">Чат, донаты и тревоги зачитываются вслух. Вывод на второй монитор скрыт: окно проектора OBS экранный диктор прочитать не может в принципе.</span>
+      </button>
+    </form>
+
+    <form method="post" action="/interface-mode/standard">
+      <button type="submit">
+        Обычный: для зрячего
+        <span class="hint">Доступен вывод чата и донатов на второй монитор через проектор OBS. Вслух ничего не зачитывается.</span>
+      </button>
+    </form>
+
+    <h2>Что запустить</h2>
+
+    <form method="post" action="/actor">
+      <button type="submit">
+        Актёр: настроить компьютер для стрима
+        <span class="hint">Установит или скачает OBS и Tailscale, включит агент, покажет pairing-код.</span>
+      </button>
+    </form>
+
+    <form method="post" action="/operator">
+      <button type="submit">
+        Оператор: открыть панель управления
+        <span class="hint">Откроет удалённую панель через Tailscale и попросит pairing-код.</span>
+      </button>
+    </form>
+
+    <form method="post" action="/local">
+      <button type="submit">
+        Локальный доступный режим
+        <span class="hint">Для незрячего стримера на этом же компьютере, без Tailscale и pairing-кода.</span>
+      </button>
+    </form>
+
+    <form method="post" action="/remove-autostart">
+      <button type="submit">
+        Убрать автозапуск удалённого агента
+        <span class="hint">Полезно, если локальный режим конфликтует с remote-режимом на порту 8787.</span>
+      </button>
+    </form>
+  </main>
+</body>
+</html>"#;
 
 async fn host_flow() -> Result<()> {
     println!("Remote Stream Control — настройка компьютера актёра\n");
@@ -144,6 +474,56 @@ async fn host_flow() -> Result<()> {
     Ok(())
 }
 
+async fn local_flow() -> Result<()> {
+    println!("Remote Stream Control — локальный доступный режим\n");
+    let cfg = load_host_config()?;
+    ensure_obs_installed(&cfg).await?;
+    let obs_password = runtime_or_existing_obs_password(&cfg)?;
+    configure_obs_websocket(&obs_password, cfg.obs_websocket_port).await?;
+
+    let url = format!("http://127.0.0.1:{}/", cfg.web_port);
+    match public_ping_mode(cfg.web_port).await {
+        Some(mode) if mode == "local" => {
+            println!("Локальный режим уже работает: {url}");
+            open::that(&url).context("не удалось открыть браузер")?;
+            return Ok(());
+        }
+        Some(mode) if mode == "remote" => {
+            println!(
+                "На порту {} уже работает удалённый агент.\n\
+                 Уберите автозапуск через кнопку в меню или командой:\n\
+                 bootstrap.exe --remove-autostart\n\
+                 Затем завершите host-agent.exe и запустите локальный режим снова.",
+                cfg.web_port
+            );
+            pause_if_console();
+            return Err(anyhow!("порт занят удалённым агентом"));
+        }
+        _ => {}
+    }
+
+    if cfg.auto_start_obs {
+        match start_obs_if_needed(&cfg.obs_path) {
+            Ok(true) => println!("OBS: запущен"),
+            Ok(false) => println!("OBS: уже запущен"),
+            Err(e) => println!("OBS: не удалось запустить — {e:#}"),
+        }
+    }
+    wait_for_obs(&cfg, 25).await;
+    ensure_local_host_agent_started().await?;
+    wait_for_local_web(cfg.web_port, 20).await?;
+    create_launcher_shortcut(
+        "Remote Stream Control - Local.lnk",
+        &launcher_exe(),
+        "--local",
+        "Remote Stream Control local accessible mode",
+    )
+    .ok();
+    println!("Открываю локальную панель: {url}");
+    open::that(&url).context("не удалось открыть браузер")?;
+    Ok(())
+}
+
 async fn controller_flow() -> Result<()> {
     println!("Remote Stream Control — запуск панели владельца\n");
     let cfg = load_controller_config()?;
@@ -185,6 +565,19 @@ async fn controller_flow() -> Result<()> {
         open::that(&url).context("не удалось открыть браузер")?;
     }
     Ok(())
+}
+
+async fn public_ping_mode(port: u16) -> Option<String> {
+    let url = format!("http://127.0.0.1:{port}/api/public/ping");
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(2))
+        .build()
+        .ok()?;
+    let value: Value = client.get(url).send().await.ok()?.json().await.ok()?;
+    value
+        .get("mode")
+        .and_then(Value::as_str)
+        .map(str::to_string)
 }
 
 fn candidate_urls(cfg: &ControllerConfig) -> Vec<String> {
@@ -352,6 +745,24 @@ async fn ensure_obs_installed(cfg: &HostConfig) -> Result<()> {
     Ok(())
 }
 
+fn runtime_or_existing_obs_password(cfg: &HostConfig) -> Result<String> {
+    if let Some(secret) = load_secret("obs_websocket_password")? {
+        return Ok(secret);
+    }
+    if !cfg.obs_websocket_password.trim().is_empty() {
+        let password = cfg.obs_websocket_password.clone();
+        save_secret("obs_websocket_password", &password)?;
+        return Ok(password);
+    }
+    if let Some(existing) = existing_obs_websocket_password() {
+        save_secret("obs_websocket_password", &existing)?;
+        return Ok(existing);
+    }
+    let password = random_secret_b64(24);
+    save_secret("obs_websocket_password", &password)?;
+    Ok(password)
+}
+
 async fn latest_obs_installer_url() -> Result<String> {
     let v: serde_json::Value = reqwest::Client::builder()
         .user_agent("RemoteStreamControl/0.2")
@@ -418,6 +829,24 @@ async fn ensure_host_agent_started() -> Result<()> {
     Ok(())
 }
 
+async fn ensure_local_host_agent_started() -> Result<()> {
+    let exe = bin_dir().join("host-agent.exe");
+    if !exe.exists() {
+        return Err(anyhow!("{} не найден", exe.display()));
+    }
+    println!("Запускаю Host Agent в локальном режиме");
+    Command::new(exe)
+        .current_dir(app_root())
+        .arg("--local")
+        .arg("--no-open")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    sleep(Duration::from_secs(2)).await;
+    Ok(())
+}
+
 async fn wait_for_web(port: u16, seconds: u64) {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(1))
@@ -450,6 +879,18 @@ async fn wait_for_web(port: u16, seconds: u64) {
     println!(" не дождался — смотрите logs\\host.log");
 }
 
+async fn wait_for_local_web(port: u16, seconds: u64) -> Result<()> {
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_secs(seconds) {
+        if public_ping_mode(port).await.as_deref() == Some("local") {
+            println!("Локальная web-панель: OK");
+            return Ok(());
+        }
+        sleep(Duration::from_millis(500)).await;
+    }
+    Err(anyhow!("локальная web-панель не ответила"))
+}
+
 fn ensure_pairing_secret() -> Result<String> {
     match load_secret("pairing_secret")? {
         Some(s) => Ok(s),
@@ -465,6 +906,59 @@ fn pause_if_console() {
     println!("Нажмите Enter, чтобы закрыть это окно.");
     let mut s = String::new();
     let _ = io::stdin().read_line(&mut s);
+}
+
+fn register_launcher_shortcut() -> Result<PathBuf> {
+    create_launcher_shortcut(
+        "Remote Stream Control.lnk",
+        &launcher_exe(),
+        "",
+        "Remote Stream Control accessible launcher",
+    )
+}
+
+fn create_launcher_shortcut(
+    file_name: &str,
+    target: &Path,
+    arguments: &str,
+    description: &str,
+) -> Result<PathBuf> {
+    let desktop = desktop_dir().context("не удалось определить рабочий стол")?;
+    fs::create_dir_all(&desktop)?;
+    let shortcut = desktop.join(file_name);
+    let script = format!(
+        "$s = (New-Object -ComObject WScript.Shell).CreateShortcut('{}'); \
+         $s.TargetPath = '{}'; \
+         $s.Arguments = '{}'; \
+         $s.WorkingDirectory = '{}'; \
+         $s.Description = '{}'; \
+         $s.Save()",
+        ps_quote(&shortcut.to_string_lossy()),
+        ps_quote(&target.to_string_lossy()),
+        ps_quote(arguments),
+        ps_quote(&app_root().to_string_lossy()),
+        ps_quote(description),
+    );
+    let out = Command::new("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+        .output()
+        .context("не удалось запустить powershell для создания ярлыка")?;
+    if !shortcut.exists() {
+        return Err(anyhow!(
+            "ярлык не создан: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    Ok(shortcut)
+}
+
+fn desktop_dir() -> Option<PathBuf> {
+    let profile = std::env::var("USERPROFILE").ok()?;
+    let onedrive = PathBuf::from(&profile).join("OneDrive").join("Desktop");
+    if onedrive.exists() {
+        return Some(onedrive);
+    }
+    Some(PathBuf::from(profile).join("Desktop"))
 }
 
 /// Ищет вложенный установщик по началу и концу имени.

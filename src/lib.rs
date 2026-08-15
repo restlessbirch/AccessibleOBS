@@ -2,6 +2,8 @@ pub mod donationalerts;
 pub mod health;
 pub mod obs;
 pub mod preflight;
+pub mod roles;
+pub mod twitch_chat;
 
 use anyhow::{Context, Result, anyhow, bail};
 use base64::{Engine as _, engine::general_purpose};
@@ -36,10 +38,34 @@ fn default_runtime_mode() -> RuntimeMode {
     RuntimeMode::Remote
 }
 
+/// Кому предназначен интерфейс.
+///
+/// Разделение нужно потому, что «доступно» и «удобно глазами» — разные вещи,
+/// а не градации одного. Проектор OBS незрячему бесполезен в принципе: окно
+/// проектора это поверхность отрисовки, у неё нет дерева доступности, и
+/// экранному диктору там нечего читать. Наоборот, непрерывное зачитывание
+/// чата зрячему только мешает.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum InterfaceMode {
+    /// Для незрячего: всё важное объявляется вслух, визуальные штуки скрыты.
+    Accessible,
+    /// Для зрячего: доступен проектор и прочее, что смотрят глазами.
+    Standard,
+}
+
+/// По умолчанию доступный: проект существует ради него, и лучше показать
+/// зрячему лишнюю настройку, чем незрячему — бесполезную кнопку.
+fn default_interface_mode() -> InterfaceMode {
+    InterfaceMode::Accessible
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HostConfig {
     #[serde(default = "default_runtime_mode")]
     pub runtime_mode: RuntimeMode,
+    #[serde(default = "default_interface_mode")]
+    pub interface_mode: InterfaceMode,
     #[serde(default)]
     pub obs_path: String,
     #[serde(default = "default_obs_host")]
@@ -198,12 +224,17 @@ pub fn app_root() -> PathBuf {
     ROOT.get_or_init(|| {
         if let Ok(exe) = std::env::current_exe()
             && let Some(dir) = exe.parent()
-            && dir
+        {
+            if dir.join("bin").exists() && dir.join("web").exists() {
+                return dir.to_path_buf();
+            }
+            if dir
                 .file_name()
                 .is_some_and(|n| n.eq_ignore_ascii_case("bin"))
-            && let Some(root) = dir.parent()
-        {
-            return root.to_path_buf();
+                && let Some(root) = dir.parent()
+            {
+                return root.to_path_buf();
+            }
         }
         std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
     })
@@ -253,6 +284,7 @@ impl Default for HostConfig {
     fn default() -> Self {
         Self {
             runtime_mode: default_runtime_mode(),
+            interface_mode: default_interface_mode(),
             obs_path: String::new(),
             obs_websocket_host: default_obs_host(),
             obs_websocket_port: 4455,
@@ -266,6 +298,25 @@ impl Default for HostConfig {
         }
     }
 }
+/// Роли источников лежат отдельным файлом, а не в host.json и не в хранилище
+/// секретов: это не секрет и не настройка соединения, а выбор владельца,
+/// который полезно уметь посмотреть и поправить руками.
+pub fn roles_path() -> PathBuf {
+    config_dir().join("roles.json")
+}
+
+pub fn load_source_roles() -> roles::SourceRoles {
+    fs::read_to_string(roles_path())
+        .map(|raw| roles::SourceRoles::from_json(&strip_bom(&raw)))
+        .unwrap_or_default()
+}
+
+pub fn save_source_roles(assigned: &roles::SourceRoles) -> Result<()> {
+    ensure_dirs()?;
+    fs::write(roles_path(), assigned.to_json())?;
+    Ok(())
+}
+
 pub fn load_controller_config() -> Result<ControllerConfig> {
     ensure_dirs()?;
     let path = config_dir().join("controller.json");
@@ -560,7 +611,7 @@ pub fn start_obs_if_needed(configured_path: &str) -> Result<bool> {
         tracing::warn!("Прошлый сеанс OBS завершился аварийно; окно безопасного режима подавлено");
     }
     let obs = find_obs(configured_path).ok_or_else(|| {
-        anyhow!("OBS Studio не найден. Установите OBS с https://obsproject.com/ и запустите START_FRIEND.bat.")
+        anyhow!("OBS Studio не найден. Установите OBS с https://obsproject.com/ или запустите RemoteStreamControl.exe в режиме актёра.")
     })?;
     let mut cmd = Command::new(&obs);
     if let Some(parent) = obs.parent() {
@@ -643,8 +694,26 @@ pub fn unregister_autostart() -> Result<()> {
     Ok(())
 }
 
+/// Включает запись логов в файл и возвращает страж.
+///
+/// Пока страж жив, фоновый поток дописывает файл; уронив его, потеряем
+/// записи. Общая для обоих бинарников: различие было только в имени файла,
+/// а копия кода жила своей жизнью.
+#[must_use = "пока страж жив, пишутся логи; если его уронить, записи пропадут"]
+pub fn init_file_logging(file_name: &str) -> Result<tracing_appender::non_blocking::WorkerGuard> {
+    let file = tracing_appender::rolling::never(logs_dir(), file_name);
+    let (writer, guard) = tracing_appender::non_blocking(file);
+    tracing_subscriber::fmt()
+        .with_writer(writer)
+        .with_ansi(false)
+        .with_target(false)
+        .try_init()
+        .ok();
+    Ok(guard)
+}
+
 /// Экранирование для одинарных кавычек PowerShell: удвоение апострофа.
-fn ps_quote(s: &str) -> String {
+pub fn ps_quote(s: &str) -> String {
     s.replace('\'', "''")
 }
 

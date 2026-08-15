@@ -316,6 +316,37 @@ pub(crate) async fn validate_twitch_access(st: &AppState, access: &str) -> Resul
         .ok_or_else(|| anyhow!("Twitch не вернул user_id"))
 }
 
+pub(crate) async fn twitch_channel_login(st: &AppState) -> Result<Option<String>> {
+    let cfg = effective_twitch_config(st);
+    if !cfg.enabled || cfg.client_id.is_empty() || load_secret("twitch_tokens")?.is_none() {
+        return Ok(None);
+    }
+    let (access, _) = twitch_user_refreshed(st).await?;
+    let response = st
+        .http
+        .get("https://id.twitch.tv/oauth2/validate")
+        .bearer_auth(access)
+        .send()
+        .await?;
+    let status = response.status();
+    let body = response.text().await.unwrap_or_default();
+    let val: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
+    if !status.is_success() {
+        let detail = val
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or(body.trim());
+        return Err(anyhow!(
+            "Twitch validate для чата отклонён: {status} {detail}"
+        ));
+    }
+    Ok(val
+        .get("login")
+        .and_then(Value::as_str)
+        .filter(|login| !login.trim().is_empty())
+        .map(str::to_string))
+}
+
 pub(crate) async fn refresh_twitch_tokens(st: &AppState, refresh: &str) -> Result<Value> {
     let cfg = effective_twitch_config(st);
     let form = [

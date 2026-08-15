@@ -76,6 +76,12 @@ pub struct AudioInput {
     /// экранного диктора. По одной роли такой источник не разглядеть.
     pub kind: Option<String>,
     pub muted: bool,
+    /// Обычный audio source реально участвует в текущем program output.
+    ///
+    /// OBS special desktop1/2 живут глобально и сюда не завязаны. Для
+    /// wasapi_output_capture, добавленного как source в старую сцену, это
+    /// false — иначе preflight пугал бы диктором там, где source не в эфире.
+    pub in_program_output: bool,
     /// Последний измеренный пик, dB. None — измерений ещё не было.
     pub level_db: Option<f64>,
 }
@@ -86,8 +92,19 @@ pub struct SceneSource {
     pub enabled: bool,
     /// Вид источника. None у вложенных сцен и групп.
     pub kind: Option<String>,
-    /// Вложенная сцена или группа: картинку даёт, вида входа не имеет.
+    /// Вложенная сцена или группа. Сама по себе больше не считается картинкой:
+    /// картинку дают только её раскрытые дети.
     pub is_scene_or_group: bool,
+    /// OBS считает source реально активным/показываемым в program output.
+    pub active: Verdict,
+    /// Раскрытое содержимое вложенной сцены или группы.
+    pub children: Vec<SceneSource>,
+}
+
+struct VisualSource<'a> {
+    name: &'a str,
+    enabled: bool,
+    active: Verdict,
 }
 
 /// Виды входов, которые дают только звук и никакой картинки.
@@ -120,15 +137,29 @@ const SYSTEM_AUDIO_KINDS: &[&str] = &[
 ];
 
 impl SceneSource {
-    /// Даёт ли источник картинку.
-    fn produces_video(&self) -> bool {
-        if self.is_scene_or_group {
-            return true;
-        }
+    /// Даёт ли leaf-source картинку.
+    fn produces_video_leaf(&self) -> bool {
         match self.kind.as_deref() {
             Some(kind) => !AUDIO_ONLY_KINDS.contains(&kind),
             // Вид неизвестен — считаем видимым, чтобы не пугать зря.
             None => true,
+        }
+    }
+
+    fn collect_visual_sources<'a>(&'a self, parent_enabled: bool, out: &mut Vec<VisualSource<'a>>) {
+        let enabled = parent_enabled && self.enabled;
+        if self.is_scene_or_group {
+            for child in &self.children {
+                child.collect_visual_sources(enabled, out);
+            }
+            return;
+        }
+        if self.produces_video_leaf() {
+            out.push(VisualSource {
+                name: &self.name,
+                enabled,
+                active: self.active,
+            });
         }
     }
 }
@@ -142,6 +173,7 @@ impl AudioInput {
         self.kind
             .as_deref()
             .is_some_and(|kind| SYSTEM_AUDIO_KINDS.contains(&kind))
+            && self.in_program_output
     }
 }
 
@@ -202,6 +234,9 @@ pub struct Snapshot {
     /// Состояние оверлея донатов. None — DonationAlerts не настраивался.
     pub donation_overlay: Option<OverlayState>,
     pub twitch_connected: bool,
+    /// Источник, назначенный камерой. None — роль не назначена, и проверять
+    /// нечего: не у каждого эфира есть камера.
+    pub camera: Option<String>,
 }
 
 /// Ниже этого уровня считаем, что звука нет.
@@ -239,6 +274,9 @@ pub fn evaluate(snapshot: &Snapshot) -> Vec<Check> {
     });
 
     checks.push(scene_content_check(&snapshot.sources));
+    if let Some(camera) = &snapshot.camera {
+        checks.push(camera_check(camera, &snapshot.sources));
+    }
     checks.extend(microphone_checks(&snapshot.audio));
     checks.push(desktop_audio_check(&snapshot.audio));
 
@@ -271,6 +309,35 @@ pub fn evaluate(snapshot: &Snapshot) -> Vec<Check> {
     checks
 }
 
+/// Видна ли камера в текущей сцене.
+///
+/// Проверка существует потому, что оператор не может посмотреть на себя сам.
+/// Скрытая камера — не поломка эфира, но почти наверняка не то, что задумано,
+/// а узнать об этом иначе можно только от зрителей.
+///
+/// Ищем по раскрытому дереву: камера может лежать внутри вложенной сцены
+/// или группы, и по верхнему уровню её не найти.
+fn camera_check(camera: &str, sources: &[SceneSource]) -> Check {
+    let mut visual = Vec::new();
+    for source in sources {
+        source.collect_visual_sources(true, &mut visual);
+    }
+
+    match visual.iter().find(|s| s.name == camera) {
+        Some(found) if found.enabled => Check::ok("Камера", format!("{camera} видна")),
+        Some(_) => Check::warn(
+            "Камера",
+            format!("{camera} есть в сцене, но скрыта"),
+            "Включите её в разделе «Источники», если она должна быть в кадре.",
+        ),
+        None => Check::warn(
+            "Камера",
+            format!("{camera} отсутствует в текущей сцене"),
+            "Либо добавьте камеру в сцену, либо снимите ей роль в разделе «Роли источников».",
+        ),
+    }
+}
+
 fn scene_content_check(sources: &[SceneSource]) -> Check {
     if sources.is_empty() {
         return Check::critical(
@@ -282,7 +349,10 @@ fn scene_content_check(sources: &[SceneSource]) -> Check {
     // Считаем только источники с картинкой. Сцена, где включён один
     // микрофон, формально непустая, но в эфир из неё идёт чёрный экран —
     // прежняя проверка на такой конфигурации сообщала «видимых 1 из 1».
-    let visual: Vec<&SceneSource> = sources.iter().filter(|s| s.produces_video()).collect();
+    let mut visual = Vec::new();
+    for source in sources {
+        source.collect_visual_sources(true, &mut visual);
+    }
     if visual.is_empty() {
         return Check::critical(
             "Содержимое сцены",
@@ -294,7 +364,8 @@ fn scene_content_check(sources: &[SceneSource]) -> Check {
         );
     }
 
-    let shown = visual.iter().filter(|s| s.enabled).count();
+    let shown_sources: Vec<&VisualSource<'_>> = visual.iter().filter(|s| s.enabled).collect();
+    let shown = shown_sources.len();
     if shown == 0 {
         return Check::critical(
             "Содержимое сцены",
@@ -305,18 +376,75 @@ fn scene_content_check(sources: &[SceneSource]) -> Check {
             "Включите нужный источник в разделе «Источники».",
         );
     }
+
+    let active = shown_sources
+        .iter()
+        .filter(|s| s.active == Verdict::Ok)
+        .count();
+    let inactive: Vec<&str> = shown_sources
+        .iter()
+        .filter(|s| s.active == Verdict::Broken)
+        .map(|s| s.name)
+        .collect();
+    let unknown = shown_sources
+        .iter()
+        .filter(|s| s.active == Verdict::Unknown)
+        .count();
+
+    if active == 0 && !inactive.is_empty() {
+        return Check::critical(
+            "Содержимое сцены",
+            format!(
+                "Источники включены, но OBS говорит, что они сейчас не активны: {}",
+                inactive.join(", ")
+            ),
+            "Проверьте окно игры, камеру или захват экрана. Если нужно, выберите другой source.",
+        );
+    }
+    if active == 0 {
+        return Check::warn(
+            "Содержимое сцены",
+            "Источники включены, но OBS не дал проверить active/showing состояние",
+            "Повторите проверку. Если есть сомнения — проверьте превью эфира.",
+        );
+    }
+    if !inactive.is_empty() || unknown > 0 {
+        let mut parts = Vec::new();
+        if !inactive.is_empty() {
+            parts.push(format!("не активны: {}", inactive.join(", ")));
+        }
+        if unknown > 0 {
+            parts.push(format!("не проверено: {unknown}"));
+        }
+        return Check::warn(
+            "Содержимое сцены",
+            format!(
+                "Есть активная картинка: {active} из {shown}; {}",
+                parts.join("; ")
+            ),
+            "Проверьте источники, которые OBS не считает active/showing.",
+        );
+    }
     Check::ok(
         "Содержимое сцены",
-        format!("Источников с картинкой: {shown} из {}", visual.len()),
+        format!(
+            "Активных источников с картинкой: {active} из {}",
+            visual.len()
+        ),
     )
 }
 
 fn microphone_checks(audio: &[AudioInput]) -> Vec<Check> {
+    // Роль сюда приходит уже разрешённой: назначение владельца перекрывает
+    // роль самого OBS. Поэтому микрофон, заведённый обычным «Захватом входного
+    // аудиопотока», больше не даёт «начинать нельзя» — достаточно один раз
+    // указать его в разделе «Роли источников».
     let Some(mic) = audio.iter().find(|a| a.role.as_deref() == Some("mic")) else {
         return vec![Check::critical(
             "Микрофон",
-            "OBS не знает, какой источник считать микрофоном",
-            "У актёра: Настройки OBS → Аудио → «Микрофон/дополнительное аудио». \
+            "Не указано, какой источник считать микрофоном",
+            "Назначьте его в разделе «Роли источников» либо у актёра в OBS: \
+             Настройки → Аудио → «Микрофон/дополнительное аудио». \
              Без этого не работает и горячая клавиша заглушения.",
         )];
     };
@@ -490,6 +618,7 @@ mod tests {
             role: Some("mic".into()),
             kind: Some("wasapi_input_capture".into()),
             muted,
+            in_program_output: true,
             level_db: level,
         }
     }
@@ -500,7 +629,52 @@ mod tests {
             role: Some("desktop".into()),
             kind: Some("wasapi_output_capture".into()),
             muted,
+            in_program_output: false,
             level_db: None,
+        }
+    }
+
+    fn visual(name: &str, enabled: bool, active: Verdict) -> SceneSource {
+        SceneSource {
+            name: name.into(),
+            enabled,
+            kind: Some("game_capture".into()),
+            is_scene_or_group: false,
+            active,
+            children: Vec::new(),
+        }
+    }
+
+    fn audio_source(name: &str, kind: &str) -> SceneSource {
+        SceneSource {
+            name: name.into(),
+            enabled: true,
+            kind: Some(kind.into()),
+            is_scene_or_group: false,
+            active: Verdict::Unknown,
+            children: Vec::new(),
+        }
+    }
+
+    fn camera_source(name: &str, enabled: bool) -> SceneSource {
+        SceneSource {
+            name: name.into(),
+            enabled,
+            kind: Some("dshow_input".into()),
+            is_scene_or_group: false,
+            active: Verdict::Ok,
+            children: Vec::new(),
+        }
+    }
+
+    fn nested(name: &str, enabled: bool, children: Vec<SceneSource>) -> SceneSource {
+        SceneSource {
+            name: name.into(),
+            enabled,
+            kind: None,
+            is_scene_or_group: true,
+            active: Verdict::Unknown,
+            children,
         }
     }
 
@@ -509,12 +683,7 @@ mod tests {
             obs_connected: true,
             obs_version: Some("32.2.1".into()),
             current_scene: Some("Игра".into()),
-            sources: vec![SceneSource {
-                name: "Захват игры".into(),
-                enabled: true,
-                kind: Some("game_capture".into()),
-                is_scene_or_group: false,
-            }],
+            sources: vec![visual("Захват игры", true, Verdict::Ok)],
             audio: vec![mic(false, Some(-20.0)), desktop(true)],
             free_disk_mb: 80_000.0,
             streaming: false,
@@ -526,6 +695,7 @@ mod tests {
                 audible: Verdict::Ok,
             }),
             twitch_connected: true,
+            camera: None,
         }
     }
 
@@ -621,13 +791,63 @@ mod tests {
     }
 
     #[test]
+    fn camera_is_not_checked_until_a_role_is_assigned() {
+        // Не у каждого эфира есть камера. Лишний пункт удлиняет чтение
+        // с экранного диктора и ничего не сообщает.
+        let s = healthy();
+        assert!(s.camera.is_none());
+        assert!(evaluate(&s).iter().all(|c| c.title != "Камера"));
+    }
+
+    #[test]
+    fn hidden_camera_is_reported() {
+        // Посмотреть на себя оператор не может, а скрытая камера почти
+        // наверняка не то, что задумано.
+        let mut s = healthy();
+        s.camera = Some("Sony".into());
+        s.sources.push(camera_source("Sony", false));
+        let checks = evaluate(&s);
+        let check = find(&checks, "Камера");
+        assert_eq!(check.severity, Severity::Warning);
+        assert!(check.detail.contains("скрыта"), "{}", check.detail);
+    }
+
+    #[test]
+    fn camera_missing_from_scene_is_reported() {
+        let mut s = healthy();
+        s.camera = Some("Sony".into());
+        let checks = evaluate(&s);
+        let check = find(&checks, "Камера");
+        assert_eq!(check.severity, Severity::Warning);
+        assert!(check.detail.contains("отсутствует"), "{}", check.detail);
+    }
+
+    #[test]
+    fn camera_inside_a_nested_scene_is_found() {
+        // Камеру часто прячут внутрь группы: по верхнему уровню её не видно,
+        // и без обхода дерева проверка соврала бы «отсутствует».
+        let mut s = healthy();
+        s.camera = Some("Sony".into());
+        s.sources.push(nested(
+            "Группа камеры",
+            true,
+            vec![camera_source("Sony", true)],
+        ));
+        assert_eq!(find(&evaluate(&s), "Камера").severity, Severity::Ok);
+    }
+
+    #[test]
     fn unassigned_microphone_is_critical_and_explains_where_to_fix() {
         let mut s = healthy();
         s.audio = vec![desktop(true)];
         let checks = evaluate(&s);
         let check = find(&checks, "Микрофон");
         assert_eq!(check.severity, Severity::Critical);
-        assert!(check.fix.as_ref().unwrap().contains("Настройки OBS"));
+        // Способов исправить два, и назвать надо оба: роль можно указать в
+        // панели, а можно назначить слот в самом OBS.
+        let fix = check.fix.as_ref().unwrap();
+        assert!(fix.contains("Роли источников"), "{fix}");
+        assert!(fix.contains("Аудио"), "{fix}");
     }
 
     #[test]
@@ -636,18 +856,8 @@ mod tests {
         // смотрят в черноту. Прежняя проверка отвечала «видимых 1 из 1».
         let mut s = healthy();
         s.sources = vec![
-            SceneSource {
-                name: "Микрофон".into(),
-                enabled: true,
-                kind: Some("wasapi_input_capture".into()),
-                is_scene_or_group: false,
-            },
-            SceneSource {
-                name: "Звук игры".into(),
-                enabled: true,
-                kind: Some("wasapi_process_output_capture".into()),
-                is_scene_or_group: false,
-            },
+            audio_source("Микрофон", "wasapi_input_capture"),
+            audio_source("Звук игры", "wasapi_process_output_capture"),
         ];
         let checks = evaluate(&s);
         let check = find(&checks, "Содержимое сцены");
@@ -661,24 +871,9 @@ mod tests {
         // Один захват игры плюс два звуковых входа — это «1 из 1», а не «3 из 3».
         let mut s = healthy();
         s.sources = vec![
-            SceneSource {
-                name: "Захват игры".into(),
-                enabled: true,
-                kind: Some("game_capture".into()),
-                is_scene_or_group: false,
-            },
-            SceneSource {
-                name: "Микрофон".into(),
-                enabled: true,
-                kind: Some("wasapi_input_capture".into()),
-                is_scene_or_group: false,
-            },
-            SceneSource {
-                name: "Звук приложения".into(),
-                enabled: true,
-                kind: Some("wasapi_process_output_capture".into()),
-                is_scene_or_group: false,
-            },
+            visual("Захват игры", true, Verdict::Ok),
+            audio_source("Микрофон", "wasapi_input_capture"),
+            audio_source("Звук приложения", "wasapi_process_output_capture"),
         ];
         let checks = evaluate(&s);
         let check = find(&checks, "Содержимое сцены");
@@ -687,18 +882,64 @@ mod tests {
     }
 
     #[test]
-    fn nested_scene_counts_as_picture() {
-        // Вложенная сцена вида не имеет, но картинку даёт.
+    fn nested_scene_counts_its_real_picture_children() {
         let mut s = healthy();
-        s.sources = vec![SceneSource {
-            name: "RSC_OVERLAYS".into(),
-            enabled: true,
-            kind: None,
-            is_scene_or_group: true,
-        }];
+        s.sources = vec![nested(
+            "Игра во вложенной сцене",
+            true,
+            vec![visual("Захват игры", true, Verdict::Ok)],
+        )];
         assert_eq!(
             find(&evaluate(&s), "Содержимое сцены").severity,
             Severity::Ok
+        );
+    }
+
+    #[test]
+    fn empty_nested_scene_is_not_a_picture() {
+        let mut s = healthy();
+        s.sources = vec![nested("Пустая вложенная сцена", true, vec![])];
+        let checks = evaluate(&s);
+        let check = find(&checks, "Содержимое сцены");
+        assert_eq!(check.severity, Severity::Critical);
+        assert!(check.detail.contains("чёрный экран"), "{}", check.detail);
+    }
+
+    #[test]
+    fn group_with_only_audio_children_is_a_black_screen() {
+        let mut s = healthy();
+        s.sources = vec![nested(
+            "Группа звука",
+            true,
+            vec![audio_source("Микрофон", "wasapi_input_capture")],
+        )];
+        let check_owner = evaluate(&s);
+        let check = find(&check_owner, "Содержимое сцены");
+        assert_eq!(check.severity, Severity::Critical);
+        assert!(check.detail.contains("чёрный экран"), "{}", check.detail);
+    }
+
+    #[test]
+    fn enabled_visual_source_must_be_active_or_showing() {
+        let mut s = healthy();
+        s.sources = vec![visual("Захват игры", true, Verdict::Broken)];
+        let check_owner = evaluate(&s);
+        let check = find(&check_owner, "Содержимое сцены");
+        assert_eq!(check.severity, Severity::Critical);
+        assert!(check.detail.contains("не активны"), "{}", check.detail);
+    }
+
+    #[test]
+    fn unknown_active_state_is_not_reported_as_green() {
+        let mut s = healthy();
+        s.sources = vec![visual("Захват игры", true, Verdict::Unknown)];
+        let check_owner = evaluate(&s);
+        let check = find(&check_owner, "Содержимое сцены");
+        assert_eq!(check.severity, Severity::Warning);
+        assert!(
+            check.detail.contains("не дал проверить"),
+            "{}",
+            check.detail
         );
     }
 
@@ -715,6 +956,7 @@ mod tests {
                 role: None,
                 kind: Some("wasapi_output_capture".into()),
                 muted: false,
+                in_program_output: true,
                 level_db: None,
             },
         ];
@@ -722,6 +964,26 @@ mod tests {
         let check = find(&check_owner, "Звук рабочего стола");
         assert_eq!(check.severity, Severity::Warning);
         assert!(check.detail.contains("диктора"), "{}", check.detail);
+    }
+
+    #[test]
+    fn system_audio_capture_outside_program_output_does_not_warn() {
+        let mut s = healthy();
+        s.audio = vec![
+            mic(false, Some(-20.0)),
+            AudioInput {
+                name: "Старый системный звук".into(),
+                role: None,
+                kind: Some("wasapi_output_capture".into()),
+                muted: false,
+                in_program_output: false,
+                level_db: None,
+            },
+        ];
+        let check_owner = evaluate(&s);
+        let check = find(&check_owner, "Звук рабочего стола");
+        assert_eq!(check.severity, Severity::Ok);
+        assert!(check.detail.contains("не настроен"), "{}", check.detail);
     }
 
     #[test]
@@ -736,6 +998,7 @@ mod tests {
                 role: None,
                 kind: Some("wasapi_process_output_capture".into()),
                 muted: false,
+                in_program_output: true,
                 level_db: None,
             },
         ];
@@ -759,18 +1022,8 @@ mod tests {
     fn all_sources_hidden_is_as_bad_as_empty_scene() {
         let mut s = healthy();
         s.sources = vec![
-            SceneSource {
-                name: "Захват игры".into(),
-                enabled: false,
-                kind: Some("game_capture".into()),
-                is_scene_or_group: false,
-            },
-            SceneSource {
-                name: "Камера".into(),
-                enabled: false,
-                kind: Some("dshow_input".into()),
-                is_scene_or_group: false,
-            },
+            visual("Захват игры", false, Verdict::Broken),
+            visual("Камера", false, Verdict::Broken),
         ];
         let checks = evaluate(&s);
         let check = find(&checks, "Содержимое сцены");

@@ -62,6 +62,10 @@ try {
     try {
       $ping = Invoke-RestMethod -Uri "http://127.0.0.1:$Port/api/public/ping" -TimeoutSec 1
       if ($ping.ok -eq $true -and $ping.app -eq "Remote Stream Control") {
+        $display = Invoke-WebRequest -UseBasicParsing -Uri "http://127.0.0.1:$Port/display.html" -TimeoutSec 1
+        if ($display.Content -notmatch "display.js") {
+          throw "actor display page did not load"
+        }
         if ($Local) {
           $runtime = Invoke-RestMethod -Uri "http://127.0.0.1:$Port/api/runtime" -TimeoutSec 1
           if ($runtime.mode -ne "local" -or $runtime.loopback_only -ne $true -or $runtime.tailscale_required -ne $false) {
@@ -90,9 +94,21 @@ try {
 }
 finally {
   if ($proc -and -not $proc.HasExited) {
-    Stop-Process -Id $proc.Id -Force
+    Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+    try {
+      Wait-Process -Id $proc.Id -Timeout 5 -ErrorAction SilentlyContinue
+    } catch {
+    }
   }
   if (Test-Path -LiteralPath $TempRoot) {
-    Remove-Item -LiteralPath $TempRoot -Recurse -Force
+    for ($i = 0; $i -lt 10; $i++) {
+      try {
+        Remove-Item -LiteralPath $TempRoot -Recurse -Force -ErrorAction Stop
+        break
+      } catch {
+        if ($i -eq 9) { throw }
+        Start-Sleep -Milliseconds 300
+      }
+    }
   }
 }

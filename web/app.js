@@ -162,6 +162,10 @@ let runtime = {
 };
 
 const isLocalRuntime = () => runtime.mode === 'local';
+/// Режим выбирается на начальной странице и решает, что показывать и что
+/// произносить. По умолчанию доступный: лишняя настройка зрячему не мешает,
+/// а бесполезная кнопка незрячему мешает.
+const isAccessibleMode = () => runtime.accessible !== false;
 
 async function loadRuntime() {
   try {
@@ -174,6 +178,23 @@ async function loadRuntime() {
 
 function applyRuntimeUi() {
   document.body.dataset.runtimeMode = runtime.mode;
+  document.body.dataset.interfaceMode = isAccessibleMode() ? 'accessible' : 'standard';
+
+  // Проектор OBS — окно отрисовки видео, у него нет дерева доступности, и
+  // экранный диктор не прочитает оттуда ничего. Незрячему эта кнопка не
+  // просто бесполезна: нажав её, он получит окно, которое не сможет ни
+  // прочитать, ни найти, чтобы закрыть.
+  const projector = $('projectorBlock');
+  if (projector) projector.hidden = isAccessibleMode();
+  if (isAccessibleMode()) {
+    const note = $('projectorNote');
+    if (note) {
+      note.textContent = 'Вывод на второй монитор скрыт: в доступном режиме '
+        + 'чат и донаты зачитываются вслух, а окно проектора OBS экранный '
+        + 'диктор прочитать не может. Переключить режим можно на начальной странице.';
+      note.hidden = false;
+    }
+  }
   if (!isLocalRuntime()) return;
 
   $('appSubtitle').textContent = 'Локальная панель управления OBS, эфиром, записью, Twitch и DonationAlerts на этом компьютере.';
@@ -555,6 +576,10 @@ async function refreshAll() {
     ['Регистрация Twitch', refreshTwitchConfig],
     ['Twitch', refreshTwitch],
     ['Донаты', refreshDonations],
+    // Роли зависят от списков аудио и источников, поэтому идут последними:
+    // к этому моменту оба уже заполнены.
+    ['Роли источников', refreshRoles],
+    ['Мониторы', refreshMonitors],
   ];
   const results = await Promise.allSettled(rest.map(([, fn]) => fn()));
   results.forEach((r, i) => {
@@ -974,6 +999,7 @@ async function refreshSources() {
   try {
     const data = await api('/api/obs/sources?scene=' + encodeURIComponent(currentScene));
     const items = data.sceneItems || [];
+    sceneSourceNames = items.map((i) => i.sourceName).filter(Boolean);
     replace($('sources'), items.length
       ? items.map((item) => {
           const name = item.sourceName;
@@ -1159,6 +1185,10 @@ const levelNodes = new Map();
 const lastLevels = new Map();
 /// Имя микрофона по версии самого OBS. Используется горячей клавишей M.
 let micName = null;
+/// Имена для выпадающих списков ролей. Заполняются при обновлении аудио и
+/// источников: там эти данные уже есть, а второй запрос был бы лишним.
+let audioInputNames = [];
+let sceneSourceNames = [];
 const silenceCount = new Map();
 const silenceWarned = new Set();
 
@@ -1252,6 +1282,7 @@ async function refreshAudio() {
     const rows = data.audio || [];
     levelNodes.clear();
     micName = ((globalData.audio || []).find((a) => a.role === 'mic') || {}).inputName || null;
+    audioInputNames = (globalData.audio || []).map((a) => a.inputName).filter(Boolean);
     renderMicSummary(globalData.audio || []);
     replace($('audio'), rows.length
       ? rows.map((a) => {
@@ -1449,6 +1480,128 @@ $('refreshStats').onclick = async () => {
     say('Статистика обновлена');
   } catch (e) {
     renderDl($('stats'), { 'Ошибка': e.message });
+  }
+};
+
+// --------------------------------------------------------- экран актёра
+
+async function openActorDisplay(panels) {
+  const status = $('actorDisplayStatus');
+  status.hidden = true;
+  try {
+    const r = await post('/api/actor-display/open', { panels });
+    status.textContent = r.message + '.';
+    status.hidden = false;
+    say(r.message);
+  } catch (e) {
+    status.textContent = e.message;
+    status.hidden = false;
+    fail(e);
+  }
+}
+
+$('openActorDisplayBoth').onclick = () => openActorDisplay('both');
+$('openActorDisplayChat').onclick = () => openActorDisplay('chat');
+$('openActorDisplayDonations').onclick = () => openActorDisplay('donations');
+
+// -------------------------------------------- вывод на второй монитор
+
+/// Список мониторов берём у OBS: он единственный, кто их видит со стороны
+/// актёра. Владелец выбирает номер, не видя самих экранов, поэтому в подписи
+/// нужны разрешение и координаты — по ним монитор и опознают.
+async function refreshMonitors() {
+  try {
+    const data = await api('/api/actor-display/monitors');
+    const list = data.monitors || [];
+    replace($('monitorSelect'), list.length
+      ? list.map((m, i) => {
+          const index = m.monitorIndex ?? i;
+          const size = m.monitorWidth && m.monitorHeight
+            ? ` ${m.monitorWidth}×${m.monitorHeight}`
+            : '';
+          const name = m.monitorName || `Монитор ${index}`;
+          return el('option', { value: String(index), text: `${index}: ${name}${size}` });
+        })
+      : el('option', { value: '', text: 'мониторы не найдены' }));
+    return true;
+  } catch (e) {
+    replace($('monitorSelect'), el('option', { value: '', text: 'недоступно' }));
+    return false;
+  }
+}
+
+$('refreshMonitors').onclick = () =>
+  refreshMonitors().then((ok) => say(ok ? 'Список мониторов обновлён' : 'Список мониторов недоступен'));
+
+$('projectActorDisplay').onclick = async () => {
+  const value = $('monitorSelect').value;
+  if (value === '') return say('Сначала выберите монитор');
+  const status = $('actorDisplayStatus');
+  try {
+    const r = await post('/api/actor-display/project', {
+      monitorIndex: Number(value),
+      panels: 'both',
+    });
+    status.textContent = r.message;
+    status.hidden = false;
+    say(r.message);
+  } catch (e) {
+    status.textContent = e.message;
+    status.hidden = false;
+    fail(e);
+  }
+};
+
+// ------------------------------------------------------ роли источников
+
+/// Заполняет выбор роли: пустой пункт означает «не назначено».
+function fillRoleSelect(node, names, current) {
+  const options = [el('option', { value: '', text: '— не назначено —' })];
+  for (const name of names) {
+    options.push(el('option', { value: name, text: name, selected: name === current }));
+  }
+  replace(node, options);
+  node.value = current || '';
+}
+
+async function refreshRoles() {
+  try {
+    const data = await api('/api/roles');
+    // Камерой может быть любой источник сцены, не только аудиовход.
+    const sourceNames = [...new Set([...audioInputNames, ...sceneSourceNames])];
+
+    fillRoleSelect($('roleMicrophone'), audioInputNames, data.microphone);
+    fillRoleSelect($('roleCamera'), sourceNames, data.camera);
+
+    const origin = {
+      assigned: 'назначен вручную',
+      obs_special: 'взят из настроек OBS',
+      missing: 'не назначен нигде',
+    }[data.microphone_origin] || 'неизвестно';
+    renderDl($('rolesStatus'), {
+      'Микрофон': data.microphone || data.obs_microphone || 'не назначен',
+      'Откуда взят': origin,
+      'Камера': data.camera || 'не назначена',
+    });
+    return true;
+  } catch (e) {
+    renderDl($('rolesStatus'), { 'Ошибка': e.message });
+    return false;
+  }
+}
+
+$('saveRoles').onclick = async () => {
+  try {
+    await post('/api/roles', {
+      microphone: $('roleMicrophone').value,
+      camera: $('roleCamera').value,
+    });
+    say('Роли сохранены');
+    // Роли меняют то, что считается микрофоном, поэтому перечитываем всё:
+    // от них зависят и аудио, и проверка готовности.
+    await refreshAll();
+  } catch (e) {
+    fail(e);
   }
 };
 

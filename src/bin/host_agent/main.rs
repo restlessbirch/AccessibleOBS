@@ -22,7 +22,7 @@ use remote_stream_control::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet, VecDeque},
     convert::Infallible,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     sync::Arc,
@@ -47,6 +47,7 @@ const RAW_OBS_ALLOWLIST: &[&str] = &["GetStreamStatus", "GetRecordStatus"];
 /// Как часто уровни звука уходят в панель. OBS считает их ~50 раз в секунду;
 /// четырёх обновлений хватает, чтобы видеть, что звук идёт.
 const LEVELS_INTERVAL: Duration = Duration::from_millis(250);
+const MAX_PREFLIGHT_SCENE_DEPTH: usize = 5;
 
 #[derive(Clone)]
 struct AppState {
@@ -215,7 +216,7 @@ fn no_open_arg_present() -> bool {
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
 async fn main() -> Result<()> {
     ensure_dirs()?;
-    let _log_guard = init_logging()?;
+    let _log_guard = init_file_logging("host.log")?;
 
     let mut cfg = load_runtime_donationalerts_secret(load_host_config()?)?;
     if local_mode_arg_present() {
@@ -287,7 +288,13 @@ async fn main() -> Result<()> {
         .route("/api/auth/login", post(auth_login))
         .route("/api/auth/logout", post(auth_logout))
         .route("/api/events", get(sse_events))
+        .route("/api/actor-display/state", get(actor_display_state))
+        .route("/api/actor-display/events", get(actor_display_events))
+        .route("/api/actor-display/open", post(actor_display_open))
+        .route("/api/actor-display/monitors", get(actor_display_monitors))
+        .route("/api/actor-display/project", post(actor_display_project))
         .route("/api/health", get(health))
+        .route("/api/roles", get(roles_get).post(roles_set))
         .route("/api/preflight", get(preflight))
         .route("/api/obs", get(obs_status))
         .route("/api/obs/launch", post(obs_launch))
@@ -424,19 +431,6 @@ async fn serve(app: Router, cfg: &HostConfig) -> Result<()> {
         let _ = s.await;
     }
     Ok(())
-}
-
-fn init_logging() -> Result<tracing_appender::non_blocking::WorkerGuard> {
-    let file = tracing_appender::rolling::never(logs_dir(), "host.log");
-    let (writer, guard) = tracing_appender::non_blocking(file);
-    // Guard должен жить всё время работы процесса, иначе логи перестанут писаться.
-    tracing_subscriber::fmt()
-        .with_writer(writer)
-        .with_ansi(false)
-        .with_target(false)
-        .try_init()
-        .ok();
-    Ok(guard)
 }
 
 /// События OBS уходят в общий поток панели.
@@ -594,6 +588,10 @@ async fn runtime_info(State(st): State<AppState>) -> Json<Value> {
         "mode": if local { "local" } else { "remote" },
         "loopback_only": local,
         "tailscale_required": !local && st.cfg.listen_mode == "tailscale_only",
+        // Режим интерфейса задаётся на начальной странице и решает, что
+        // панель показывает и что произносит вслух.
+        "interface_mode": st.cfg.interface_mode,
+        "accessible": st.cfg.interface_mode == InterfaceMode::Accessible,
     }))
 }
 
@@ -617,6 +615,231 @@ async fn sse_events(
         Event::default().json_data(&value).ok().map(Ok)
     });
     Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
+}
+
+fn actor_display_panel(value: Option<&str>) -> &'static str {
+    match value.unwrap_or("both") {
+        "chat" => "chat",
+        "donations" => "donations",
+        _ => "both",
+    }
+}
+
+/// Адрес экрана актёра.
+///
+/// Именно localhost, а не 127.0.0.1: страница встраивает официальный виджет
+/// чата Twitch, а тот требует параметр `parent` с именем узла. Для IP-адреса
+/// вместо доменного имени встраивание может быть отклонено, и вместо чата
+/// актёр увидел бы ошибку. Слушаем мы тот же петлевой интерфейс, так что
+/// смена ничего не меняет для сети.
+fn actor_display_url(port: u16, panels: &str) -> String {
+    format!(
+        "http://localhost:{port}/display.html?panels={}",
+        actor_display_panel(Some(panels))
+    )
+}
+
+async fn require_actor_display_access(
+    st: &AppState,
+    headers: &HeaderMap,
+    peer: SocketAddr,
+) -> Result<(), Response> {
+    if peer.ip().is_loopback() {
+        Ok(())
+    } else {
+        require_auth(st, headers).await
+    }
+}
+
+async fn actor_display_state(
+    State(st): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+) -> ApiResult<Value> {
+    require_actor_display_access(&st, &headers, peer).await?;
+    let twitch_login = match twitch_channel_login(&st).await {
+        Ok(login) => login,
+        Err(e) => {
+            warn!("Twitch chat identity unavailable for actor display: {e:#}");
+            None
+        }
+    };
+    Ok(Json(json!({
+        "runtime": {
+            "mode": if st.cfg.runtime_mode == RuntimeMode::Local { "local" } else { "remote" },
+        },
+        "twitch": {
+            "connected": twitch_login.is_some(),
+            "channel_login": twitch_login,
+        },
+        "donationalerts": donationalerts_status_value(&st).await,
+        "donations": st.feed.recent().await,
+    })))
+}
+
+async fn actor_display_events(
+    State(st): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+) -> Result<Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>>>, Response> {
+    require_actor_display_access(&st, &headers, peer).await?;
+    let stream = BroadcastStream::new(st.events.subscribe()).filter_map(|msg| {
+        let value = match msg {
+            Ok(value) => value,
+            Err(BroadcastStreamRecvError::Lagged(lost)) => {
+                json!({"type": "resync_required", "lost": lost})
+            }
+        };
+        let allowed = matches!(
+            value.get("type").and_then(Value::as_str),
+            Some("donation" | "donationalerts_status" | "obs_status" | "alert" | "resync_required")
+        );
+        allowed.then(|| Event::default().json_data(&value).ok().map(Ok))?
+    });
+    Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
+}
+
+/// Сцена и источник, через которые экран актёра выводится на монитор.
+///
+/// Отдельная сцена нужна, чтобы содержимое не попало в эфир: её никуда не
+/// вкладывают и в program не переключают, она существует только как носитель
+/// источника для проектора.
+const ACTOR_DISPLAY_SCENE: &str = "RSC_ACTOR_DISPLAY";
+const ACTOR_DISPLAY_INPUT: &str = "RSC_ActorDisplay";
+
+async fn actor_display_monitors(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+) -> ApiResult<Value> {
+    require_auth(&st, &headers).await?;
+    st.obs
+        .request("GetMonitorList", json!({}))
+        .await
+        .map(Json)
+        .map_err(|e| err("Не удалось получить список мониторов", e))
+}
+
+/// Выводит экран актёра на выбранный монитор через проектор OBS.
+///
+/// Открытие обычного окна браузера оставляет его там, где решит система, и
+/// актёру приходится тащить окно на второй монитор руками. Проектор OBS умеет
+/// сразу полноэкранно на нужном мониторе, и выбирает его владелец из панели —
+/// то есть актёр по-прежнему ничего не делает.
+async fn actor_display_project(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> ApiResult<Value> {
+    require_auth(&st, &headers).await?;
+    let monitor = body
+        .get("monitorIndex")
+        .and_then(Value::as_i64)
+        .ok_or_else(|| bad("Выберите монитор"))?;
+    let panels = actor_display_panel(body.get("panels").and_then(Value::as_str));
+    let url = actor_display_url(st.cfg.web_port, panels);
+
+    let scenes = st
+        .obs
+        .request("GetSceneList", json!({}))
+        .await
+        .map_err(|e| err("Не удалось получить список сцен", e))?;
+    let has_scene = scenes
+        .get("scenes")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .any(|s| s.get("sceneName").and_then(Value::as_str) == Some(ACTOR_DISPLAY_SCENE));
+    if !has_scene {
+        st.obs
+            .request("CreateScene", json!({"sceneName": ACTOR_DISPLAY_SCENE}))
+            .await
+            .map_err(|e| err("Не удалось создать сцену экрана актёра", e))?;
+    }
+
+    // Размер берём по холсту: проектор растянет содержимое на весь монитор.
+    let video = st
+        .obs
+        .request("GetVideoSettings", json!({}))
+        .await
+        .unwrap_or_else(|_| json!({"baseWidth": 1920, "baseHeight": 1080}));
+    let settings = json!({
+        "url": url,
+        "width": video.get("baseWidth").and_then(Value::as_i64).unwrap_or(1920),
+        "height": video.get("baseHeight").and_then(Value::as_i64).unwrap_or(1080),
+        "reroute_audio": false,
+        "shutdown": false,
+        "restart_when_active": false,
+    });
+
+    match existing_input_kind(&st.obs, ACTOR_DISPLAY_INPUT).await {
+        Ok(Some(kind)) if kind == "browser_source" => {
+            st.obs
+                .request(
+                    "SetInputSettings",
+                    json!({"inputName": ACTOR_DISPLAY_INPUT, "inputSettings": settings, "overlay": true}),
+                )
+                .await
+                .map_err(|e| err("Не удалось обновить экран актёра", e))?;
+        }
+        Ok(Some(kind)) => {
+            return Err((
+                StatusCode::CONFLICT,
+                Json(json!({"error": {"message": format!(
+                    "Имя «{ACTOR_DISPLAY_INPUT}» занято источником типа {kind}. \
+                     Переименуйте его в OBS."
+                )}})),
+            )
+                .into_response());
+        }
+        Ok(None) => {
+            st.obs
+                .request(
+                    "CreateInput",
+                    json!({
+                        "sceneName": ACTOR_DISPLAY_SCENE,
+                        "inputName": ACTOR_DISPLAY_INPUT,
+                        "inputKind": "browser_source",
+                        "inputSettings": settings,
+                        "sceneItemEnabled": true,
+                    }),
+                )
+                .await
+                .map_err(|e| err("Не удалось создать экран актёра", e))?;
+        }
+        Err(e) => return Err(err("Не удалось проверить источники OBS", e)),
+    }
+
+    st.obs
+        .request(
+            "OpenSourceProjector",
+            json!({"sourceName": ACTOR_DISPLAY_INPUT, "monitorIndex": monitor}),
+        )
+        .await
+        .map_err(|e| err("Не удалось открыть проектор на выбранном мониторе", e))?;
+
+    Ok(Json(json!({
+        "ok": true,
+        "monitorIndex": monitor,
+        "panels": panels,
+        "message": format!("Экран актёра выведен на монитор {monitor}"),
+    })))
+}
+
+async fn actor_display_open(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> ApiResult<Value> {
+    require_auth(&st, &headers).await?;
+    let panels = actor_display_panel(body.get("panels").and_then(Value::as_str));
+    let url = actor_display_url(st.cfg.web_port, panels);
+    open::that(&url).map_err(|e| err("Не удалось открыть экран актёра", e.into()))?;
+    Ok(Json(json!({
+        "ok": true,
+        "url": url,
+        "panels": panels,
+        "message": "Экран актёра открыт на компьютере актёра",
+    })))
 }
 
 fn err(msg: &str, e: anyhow::Error) -> Response {
@@ -698,7 +921,7 @@ async fn preflight(State(st): State<AppState>, headers: HeaderMap) -> ApiResult<
             .map(str::to_string)
     });
 
-    let roles = at(2).map(special_input_roles).unwrap_or_default();
+    let roles = at(2).map(resolved_input_roles).unwrap_or_default();
     // Вид входа нужен наравне с именем: роль desktop OBS присваивает только
     // своим слотам, а обычный «Захват выходного аудиопотока» пишет системный
     // звук без всякой роли — и утащил бы в эфир речь экранного диктора.
@@ -715,6 +938,16 @@ async fn preflight(State(st): State<AppState>, headers: HeaderMap) -> ApiResult<
                     .map(str::to_string),
             ))
         })
+        .collect();
+
+    let sources = match &current_scene {
+        Some(scene) => collect_preflight_scene_sources(&st, scene).await,
+        None => Vec::new(),
+    };
+    let program_sources: HashSet<&str> = sources
+        .iter()
+        .filter(|source| source.enabled)
+        .map(|source| source.name.as_str())
         .collect();
 
     // Состояние заглушения — отдельным пакетом, по одному запросу на источник.
@@ -746,41 +979,11 @@ async fn preflight(State(st): State<AppState>, headers: HeaderMap) -> ApiResult<
                 role: roles.get(name.as_str()).map(|r| (*r).to_string()),
                 kind: kind.clone(),
                 muted,
+                in_program_output: program_sources.contains(name.as_str()),
                 level_db: levels.get(name).copied(),
             })
         })
         .collect();
-
-    let sources = match &current_scene {
-        Some(scene) => st
-            .obs
-            .request("GetSceneItemList", json!({"sceneName": scene}))
-            .await
-            .ok()
-            .and_then(|v| v.get("sceneItems").and_then(Value::as_array).cloned())
-            .unwrap_or_default()
-            .iter()
-            .filter_map(|i| {
-                Some(preflight::SceneSource {
-                    name: i.get("sourceName").and_then(Value::as_str)?.to_string(),
-                    enabled: i
-                        .get("sceneItemEnabled")
-                        .and_then(Value::as_bool)
-                        .unwrap_or(true),
-                    kind: i
-                        .get("inputKind")
-                        .and_then(Value::as_str)
-                        .map(str::to_string),
-                    // Вложенная сцена и группа картинку дают, но вида входа
-                    // не имеют — по одному лишь kind их не отличить от звука.
-                    is_scene_or_group: i.get("isGroup").and_then(Value::as_bool) == Some(true)
-                        || i.get("sourceType").and_then(Value::as_str)
-                            == Some("OBS_SOURCE_TYPE_SCENE"),
-                })
-            })
-            .collect(),
-        None => Vec::new(),
-    };
 
     let snapshot = preflight::Snapshot {
         obs_connected: true,
@@ -806,6 +1009,7 @@ async fn preflight(State(st): State<AppState>, headers: HeaderMap) -> ApiResult<
             .is_some_and(|key| !key.trim().is_empty()),
         donation_overlay: donation_overlay_state(&st).await,
         twitch_connected: load_secret("twitch_tokens").ok().flatten().is_some(),
+        camera: load_source_roles().camera,
     };
 
     let checks = preflight::evaluate(&snapshot);
@@ -813,6 +1017,88 @@ async fn preflight(State(st): State<AppState>, headers: HeaderMap) -> ApiResult<
         "summary": preflight::summary(&checks),
         "checks": checks,
     })))
+}
+
+async fn collect_preflight_scene_sources(
+    st: &AppState,
+    scene: &str,
+) -> Vec<preflight::SceneSource> {
+    let mut out = Vec::new();
+    let mut queue = VecDeque::from([(scene.to_string(), false, true, 0usize)]);
+    let mut seen = HashSet::new();
+
+    while let Some((name, is_group, parent_enabled, depth)) = queue.pop_front() {
+        if depth > MAX_PREFLIGHT_SCENE_DEPTH {
+            continue;
+        }
+        let key = format!("{}:{name}", if is_group { "group" } else { "scene" });
+        if !seen.insert(key) {
+            continue;
+        }
+
+        let request = if is_group {
+            ("GetGroupSceneItemList", json!({"groupName": name}))
+        } else {
+            ("GetSceneItemList", json!({"sceneName": name}))
+        };
+        let Ok(items) = st.obs.request(request.0, request.1).await else {
+            continue;
+        };
+        let Some(list) = items.get("sceneItems").and_then(Value::as_array) else {
+            continue;
+        };
+
+        for item in list {
+            let Some(source_name) = item.get("sourceName").and_then(Value::as_str) else {
+                continue;
+            };
+            let enabled = parent_enabled
+                && item
+                    .get("sceneItemEnabled")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(true);
+            let kind = item
+                .get("inputKind")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            let item_is_group = item.get("isGroup").and_then(Value::as_bool) == Some(true);
+            let item_is_scene =
+                item.get("sourceType").and_then(Value::as_str) == Some("OBS_SOURCE_TYPE_SCENE");
+
+            if (item_is_group || item_is_scene) && depth < MAX_PREFLIGHT_SCENE_DEPTH {
+                queue.push_back((source_name.to_string(), item_is_group, enabled, depth + 1));
+                continue;
+            }
+
+            out.push(preflight::SceneSource {
+                name: source_name.to_string(),
+                enabled,
+                kind,
+                is_scene_or_group: false,
+                active: source_active_verdict(st, source_name).await,
+                children: Vec::new(),
+            });
+        }
+    }
+
+    out
+}
+
+async fn source_active_verdict(st: &AppState, source: &str) -> preflight::Verdict {
+    let Ok(value) = st
+        .obs
+        .request("GetSourceActive", json!({"sourceName": source}))
+        .await
+    else {
+        return preflight::Verdict::Unknown;
+    };
+    let active = value.get("videoActive").and_then(Value::as_bool);
+    let showing = value.get("videoShowing").and_then(Value::as_bool);
+    match (active, showing) {
+        (Some(true), _) | (_, Some(true)) => preflight::Verdict::Ok,
+        (Some(false), Some(false)) => preflight::Verdict::Broken,
+        _ => preflight::Verdict::Unknown,
+    }
 }
 
 /// Состояние оверлея донатов, если DonationAlerts вообще настраивался.
@@ -1187,6 +1473,71 @@ async fn find_scene_item_id(obs: &ObsHandle, scene: &str, source: &str) -> Resul
 /// Раньше микрофон угадывался по названию, что ломалось, стоило актёру
 /// переименовать источник. OBS знает роли точно: desktop1/2 — звук системы,
 /// mic1..4 — микрофоны.
+/// Роли источников с учётом назначений владельца.
+///
+/// OBS присваивает роли только своим слотам «Микрофон/дополнительное аудио» и
+/// «Звук рабочего стола». Микрофон, добавленный обычным «Захватом входного
+/// аудиопотока», роли не получает — и проверка готовности отвечала «начинать
+/// нельзя», хотя всё работало. Назначение владельца перекрывает роль OBS.
+fn resolved_input_roles(special: &Value) -> HashMap<String, &'static str> {
+    let mut roles = special_input_roles(special);
+    let assigned = load_source_roles();
+    if let Some(mic) = assigned.microphone.as_deref() {
+        // Слот OBS мог указывать на другой источник: два микрофона сразу
+        // сделали бы поведение клавиши заглушения непредсказуемым.
+        roles.retain(|_, role| *role != "mic");
+        roles.insert(mic.to_string(), "mic");
+    }
+    if let Some(camera) = assigned.camera.as_deref() {
+        roles.insert(camera.to_string(), "camera");
+    }
+    roles
+}
+
+async fn roles_get(State(st): State<AppState>, headers: HeaderMap) -> ApiResult<Value> {
+    require_auth(&st, &headers).await?;
+    let assigned = load_source_roles();
+    // Заодно сообщаем, что думает сам OBS: панель показывает владельцу,
+    // откуда взят микрофон, если он ничего не назначал.
+    let obs_mic = st
+        .obs
+        .request("GetSpecialInputs", json!({}))
+        .await
+        .ok()
+        .and_then(|v| {
+            special_input_roles(&v)
+                .into_iter()
+                .find(|(_, role)| *role == "mic")
+                .map(|(name, _)| name)
+        });
+    Ok(Json(json!({
+        "microphone": assigned.microphone,
+        "camera": assigned.camera,
+        "obs_microphone": obs_mic,
+        "microphone_origin": assigned.microphone_origin(obs_mic.as_deref()),
+    })))
+}
+
+async fn roles_set(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> ApiResult<Value> {
+    require_auth(&st, &headers).await?;
+    let text = |key: &str| body.get(key).and_then(Value::as_str).map(str::to_string);
+    let assigned = roles::SourceRoles {
+        microphone: text("microphone"),
+        camera: text("camera"),
+    }
+    .normalized();
+    save_source_roles(&assigned).map_err(|e| err("Не удалось сохранить роли источников", e))?;
+    Ok(Json(json!({
+        "ok": true,
+        "microphone": assigned.microphone,
+        "camera": assigned.camera,
+    })))
+}
+
 fn special_input_roles(special: &Value) -> HashMap<String, &'static str> {
     let mut roles = HashMap::new();
     for (key, role) in [
@@ -1281,7 +1632,7 @@ async fn obs_audio(
     let roles = head
         .get(1)
         .and_then(response_data)
-        .map(special_input_roles)
+        .map(resolved_input_roles)
         .unwrap_or_default();
 
     let input_kinds: HashMap<String, Value> = inputs
@@ -1706,6 +2057,39 @@ mod tests {
         assert!(raw_obs_allowed("GetRecordStatus"));
         assert!(!raw_obs_allowed("SetCurrentProgramScene"));
         assert!(!raw_obs_allowed("SetStreamServiceSettings"));
+    }
+
+    #[test]
+    fn actor_display_panel_is_allowlisted() {
+        assert_eq!(actor_display_panel(Some("chat")), "chat");
+        assert_eq!(actor_display_panel(Some("donations")), "donations");
+        assert_eq!(actor_display_panel(Some("both")), "both");
+        assert_eq!(actor_display_panel(Some("https://evil.test")), "both");
+        assert_eq!(actor_display_panel(None), "both");
+    }
+
+    #[test]
+    fn actor_display_url_is_loopback_only() {
+        // Именно localhost, а не 127.0.0.1: страница встраивает виджет чата
+        // Twitch, а тот требует в parent имя узла, и для IP встраивание
+        // может быть отклонено. Наружу это всё равно тот же петлевой адрес.
+        assert_eq!(
+            actor_display_url(8787, "chat"),
+            "http://localhost:8787/display.html?panels=chat"
+        );
+        // Неизвестное значение panels откатывается к both, а не уходит в URL.
+        assert_eq!(
+            actor_display_url(8787, "bad"),
+            "http://localhost:8787/display.html?panels=both"
+        );
+        // Главное свойство теста: наружу адрес не смотрит ни при каких panels.
+        for panels in ["chat", "donations", "both", "bad"] {
+            let url = actor_display_url(8787, panels);
+            assert!(
+                url.starts_with("http://localhost:") || url.starts_with("http://127.0.0.1:"),
+                "адрес обязан оставаться петлевым: {url}"
+            );
+        }
     }
 
     #[test]

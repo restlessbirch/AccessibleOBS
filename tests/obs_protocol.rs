@@ -336,7 +336,7 @@ async fn wrong_password_is_explained_not_just_logged() {
 
     let message = message.expect("ошибка авторизации должна попасть в статус");
     assert!(message.contains("пароль"), "{message}");
-    assert!(message.contains("START_FRIEND.bat"), "{message}");
+    assert!(message.contains("RemoteStreamControl.exe"), "{message}");
     assert!(!obs.is_connected().await);
 }
 

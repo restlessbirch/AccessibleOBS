@@ -20,12 +20,12 @@
     "version": "1.90.6",
     "file": "tailscale-setup-1.90.6-amd64.msi",
     "url": "https://pkgs.tailscale.com/stable/tailscale-setup-1.90.6-amd64.msi",
-    "sha256": ""
+    "sha256": "46621FD1604FA5E22E16D1B5FAA153A16FA1CE9E962F1CC5E73D31CED3ABE1D6"
   },
   "obs": {
     "version": "32.2.1",
     "file": "OBS-Studio-32.2.1-Windows-x64-Installer.exe",
     "url": "https://github.com/obsproject/obs-studio/releases/download/32.2.1/OBS-Studio-32.2.1-Windows-x64-Installer.exe",
-    "sha256": ""
+    "sha256": "BBB95E52B96AD9B7CCD5ABD13121379D29774D6CC5FDBEF82FFA249E8A24A289"
   }
 }
