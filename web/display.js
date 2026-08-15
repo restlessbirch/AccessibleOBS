@@ -46,6 +46,11 @@ async function api(path) {
   return data;
 }
 
+let linkLost = false;
+/// В доступном режиме сообщения зачитываются, в обычном — только видны.
+/// Значение приходит из состояния: режим задаётся на начальной странице.
+let accessible = true;
+
 const mode = new URLSearchParams(window.location.search).get('panels') || 'both';
 
 function applyPanelMode() {
@@ -61,6 +66,32 @@ function safeTwitchLogin(login) {
   return /^[A-Za-z0-9_]{3,25}$/.test(value) ? value : '';
 }
 
+/// Сколько сообщений держать. Больше незачем: чат читают по мере поступления,
+/// а длинный список экранный диктор обходит мучительно долго.
+const MAX_CHAT = 60;
+
+/// Показывает сообщения своим списком, а не чужим iframe.
+///
+/// Виджет Twitch незрячему почти бесполезен: диктор читает чужой фрейм со
+/// скрипом, а новые сообщения не объявляются вовсе — приходится самому лазить
+/// туда курсором и проверять. Свой список — обычные элементы страницы,
+/// которые можно и прочитать, и озвучить сразу.
+function appendChatMessage(author, text) {
+  const box = $('chatBox');
+  const list = box.querySelector('ul') || (() => {
+    const fresh = el('ul', { class: 'chat-list' });
+    replace(box, fresh);
+    return fresh;
+  })();
+  list.append(el('li', {}, [
+    el('span', { class: 'chat-author', text: `${author}: ` }),
+    el('span', { text }),
+  ]));
+  while (list.children.length > MAX_CHAT) list.firstElementChild.remove();
+  // Держим последнее сообщение на виду: зрячий читает низ списка.
+  list.lastElementChild?.scrollIntoView({ block: 'nearest' });
+}
+
 function renderChat(twitch) {
   const login = safeTwitchLogin(twitch?.channel_login);
   if (!login) {
@@ -70,17 +101,14 @@ function renderChat(twitch) {
     }));
     return;
   }
-  // Twitch принимает в parent имя узла, а не IP-адрес. Страницу открывают по
-  // localhost, но если кто-то зашёл по 127.0.0.1 напрямую, подставляем имя —
-  // иначе виджет откажется встраиваться и вместо чата будет ошибка.
-  const host = window.location.hostname;
-  const parent = !host || /^[\d.]+$/.test(host) || host.includes(':') ? 'localhost' : host;
-  const iframe = el('iframe', {
-    title: `Twitch chat ${login}`,
-    class: 'chat-frame',
-    src: `https://www.twitch.tv/embed/${encodeURIComponent(login)}/chat?parent=${encodeURIComponent(parent)}&darkpopout=`,
-  });
-  replace($('chatBox'), iframe);
+  // Сообщения приходят потоком событий; здесь только готовим место под них,
+  // не затирая то, что уже успело прийти.
+  if (!$('chatBox').querySelector('ul')) {
+    replace($('chatBox'), el('p', {
+      class: 'empty',
+      text: `Чат канала ${login}: жду сообщений.`,
+    }));
+  }
 }
 
 function donationText(d) {
@@ -106,6 +134,7 @@ function renderDonationState(da) {
 async function refreshDisplay() {
   try {
     const state = await api('/api/actor-display/state');
+    accessible = state.runtime?.accessible !== false;
     renderChat(state.twitch || {});
     renderDonationState(state.donationalerts || {});
     renderDonations(state.donations || []);
@@ -116,8 +145,6 @@ async function refreshDisplay() {
     announce('Ошибка экрана актёра: ' + e.message);
   }
 }
-
-let linkLost = false;
 
 function openEvents() {
   const events = new EventSource('/api/actor-display/events');
@@ -135,6 +162,13 @@ function openEvents() {
       list.prepend(el('li', { text }));
       while (list.children.length > 30) list.lastElementChild.remove();
       announce('Новый донат: ' + text);
+    } else if (msg.type === 'chat') {
+      appendChatMessage(msg.author || 'Гость', msg.text || '');
+      // Вслух только в доступном режиме: зрячему непрерывное чтение чата
+      // мешало бы, а незрячему без него чат бесполезен. Вежливой областью,
+      // а не настойчивой: сообщения идут потоком и не должны перебивать
+      // тревоги об эфире.
+      if (accessible) say(msg.spoken || `${msg.author}: ${msg.text}`);
     } else if (msg.type === 'donationalerts_status' || msg.type === 'resync_required') {
       refreshDisplay();
     } else if (msg.type === 'alert' && msg.urgent) {

@@ -67,6 +67,11 @@ struct AppState {
     /// Нужны проверке готовности: включённый микрофон и звучащий микрофон —
     /// разные вещи, а отошедший кабель OBS показывает как исправный вход.
     levels: Arc<RwLock<HashMap<String, f64>>>,
+    /// Канал Twitch, к чату которого подключён клиент.
+    ///
+    /// Отдельным кэшем, потому что имя канала узнаётся сетевым запросом, а
+    /// клиенту чата оно нужно синхронно перед каждой попыткой подключения.
+    chat_channel: Arc<std::sync::RwLock<Option<String>>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -256,9 +261,20 @@ async fn main() -> Result<()> {
         oauth_state: Arc::new(RwLock::new(None)),
         login_guards: Arc::new(Mutex::new(HashMap::new())),
         levels: Arc::new(RwLock::new(HashMap::new())),
+        chat_channel: Arc::new(std::sync::RwLock::new(None)),
     };
 
     forward_obs_events(obs.clone(), events.clone(), state.levels.clone());
+    watch_chat_channel(state.clone());
+    {
+        // Клиент читает чат анонимно, поэтому работает и до OAuth. Имя канала
+        // берём из кэша: сеть здесь дёргать нельзя, вызов синхронный.
+        let channel = state.chat_channel.clone();
+        twitch_chat::spawn(
+            Arc::new(move || channel.read().ok().and_then(|c| c.clone())),
+            events.clone(),
+        );
+    }
     watch_obs_status(obs.clone(), events.clone());
     watch_stream_health(obs.clone(), events.clone());
     if cfg.donationalerts.enabled && cfg.donationalerts.oauth_enabled {
@@ -304,6 +320,8 @@ async fn main() -> Result<()> {
         .route("/api/obs/input-kinds", get(obs_input_kinds))
         .route("/api/obs/sources", get(obs_sources).post(obs_source_create))
         .route("/api/obs/source/properties", post(obs_source_properties))
+        .route("/api/obs/source/remove", post(obs_source_remove))
+        .route("/api/obs/scene/remove", post(obs_scene_remove))
         .route(
             "/api/obs/source/settings",
             get(obs_source_settings).post(obs_source_settings_set),
@@ -513,6 +531,29 @@ fn watch_obs_status(obs: ObsHandle, events: broadcast::Sender<Value>) {
 /// Живёт в агенте, а не в панели, намеренно: панель может быть закрыта, а
 /// авария случиться. Здесь она хотя бы попадёт в лог, и владелец увидит её
 /// в журнале, когда откроет панель.
+/// Держит в кэше имя канала, к чату которого подключаться.
+///
+/// Владелец может подключить Twitch уже после запуска агента, а имя канала
+/// узнаётся сетевым запросом. Опрашиваем редко: канал меняется разве что при
+/// смене аккаунта.
+fn watch_chat_channel(st: AppState) {
+    tokio::spawn(async move {
+        loop {
+            let login = twitch_channel_login(&st).await.unwrap_or_default();
+            if let Ok(mut cache) = st.chat_channel.write() {
+                if *cache != login {
+                    match &login {
+                        Some(name) => info!("Twitch-чат: канал {name}"),
+                        None => info!("Twitch-чат: канал неизвестен, Twitch не подключён"),
+                    }
+                }
+                *cache = login;
+            }
+            tokio::time::sleep(Duration::from_secs(60)).await;
+        }
+    });
+}
+
 fn watch_stream_health(obs: ObsHandle, events: broadcast::Sender<Value>) {
     tokio::spawn(async move {
         let mut watch = HealthWatch::new();
@@ -667,6 +708,8 @@ async fn actor_display_state(
     Ok(Json(json!({
         "runtime": {
             "mode": if st.cfg.runtime_mode == RuntimeMode::Local { "local" } else { "remote" },
+            // Экран актёра зачитывает чат вслух только в доступном режиме.
+            "accessible": st.cfg.interface_mode == InterfaceMode::Accessible,
         },
         "twitch": {
             "connected": twitch_login.is_some(),
@@ -692,7 +735,14 @@ async fn actor_display_events(
         };
         let allowed = matches!(
             value.get("type").and_then(Value::as_str),
-            Some("donation" | "donationalerts_status" | "obs_status" | "alert" | "resync_required")
+            Some(
+                "donation"
+                    | "donationalerts_status"
+                    | "obs_status"
+                    | "alert"
+                    | "resync_required"
+                    | "chat"
+            )
         );
         allowed.then(|| Event::default().json_data(&value).ok().map(Ok))?
     });
@@ -1282,6 +1332,45 @@ async fn existing_input_kind(obs: &ObsHandle, input_name: &str) -> Result<Option
         .find(|input| input.get("inputName").and_then(Value::as_str) == Some(input_name))
         .and_then(|input| input.get("inputKind").and_then(Value::as_str))
         .map(str::to_string))
+}
+
+/// Удаляет источник целиком, из всех сцен.
+///
+/// Создавать источники панель умеет, а убирать — нет, и ошибочно созданный
+/// приходилось удалять в самом OBS. Для удалённого оператора это значит
+/// просить актёра, то есть ровно то, чего проект избегает.
+///
+/// Через общий raw endpoint это делать нельзя: он намеренно ограничен чтением,
+/// чтобы компрометация сессии не давала доступ ко всему протоколу OBS.
+async fn obs_source_remove(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> ApiResult<Value> {
+    require_auth(&st, &headers).await?;
+    let name = required_trimmed(&body, "sourceName", "Название источника обязательно")
+        .map_err(|e| bad(&e))?;
+    st.obs
+        .request("RemoveInput", json!({"inputName": name}))
+        .await
+        .map(|_| Json(json!({"ok": true, "removed": name})))
+        .map_err(|e| err("Не удалось удалить источник", e))
+}
+
+/// Удаляет сцену со всем содержимым.
+async fn obs_scene_remove(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> ApiResult<Value> {
+    require_auth(&st, &headers).await?;
+    let name =
+        required_trimmed(&body, "sceneName", "Название сцены обязательно").map_err(|e| bad(&e))?;
+    st.obs
+        .request("RemoveScene", json!({"sceneName": name}))
+        .await
+        .map(|_| Json(json!({"ok": true, "removed": name})))
+        .map_err(|e| err("Не удалось удалить сцену", e))
 }
 
 async fn obs_source_create(

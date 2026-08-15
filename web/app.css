@@ -495,14 +495,28 @@ li {
   margin: 0 0 0.75rem;
   font-size: 1.4rem;
 }
-.chat-box,
-.chat-frame {
+.chat-box {
   width: 100%;
   height: min(74vh, 52rem);
+  overflow-y: auto;
 }
-.chat-frame {
-  border: 0;
-  background: #18181b;
+
+/* Свой список сообщений вместо чужого iframe: его читает экранный диктор
+   и его же можно озвучивать по мере поступления. */
+.chat-list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.chat-list li {
+  padding: 0.4rem 0.5rem;
+  border-bottom: 1px solid rgba(148, 163, 184, 0.25);
+  font-size: 1.15rem;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+.chat-author {
+  font-weight: 700;
 }
 .display-state {
   margin-bottom: 0.75rem;
@@ -570,8 +584,7 @@ select:disabled {
   .display-main {
     grid-template-columns: 1fr;
   }
-  .chat-box,
-  .chat-frame {
+  .chat-box {
     height: 32rem;
   }
 }

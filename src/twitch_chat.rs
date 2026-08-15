@@ -271,6 +271,22 @@ mod tests {
     }
 
     #[test]
+    fn real_twitch_line_with_many_tags_is_parsed() {
+        // Строка снята с живого Twitch: тегов около двадцати, display-name
+        // стоит в середине, значения содержат запятые, слэши и решётки.
+        // Наивный разбор «первый тег» или «split по запятой» здесь ломается.
+        let line = "@badge-info=subscriber/16;badges=subscriber/12,zevent25/1;\
+                    color=#2AA335;display-name=Cpydwmul;emotes=emotesv2_d8:7-15;\
+                    first-msg=0;flags=;id=85c;mod=0;returning-chatter=0;\
+                    room-id=22484632;subscriber=1;tmi-sent-ts=1755230000000;turbo=0;\
+                    user-id=123;user-type= \
+                    :cpydwmul!cpydwmul@cpydwmul.tmi.twitch.tv PRIVMSG #forsen :привет чат";
+        let m = message(line);
+        assert_eq!(m.author, "Cpydwmul");
+        assert_eq!(m.text, "привет чат");
+    }
+
+    #[test]
     fn ping_is_recognised_and_carries_its_token() {
         // Не ответить на PING — значит быть отключённым через пару минут.
         assert_eq!(
