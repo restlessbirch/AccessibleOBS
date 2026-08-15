@@ -2,6 +2,12 @@
 // в Windows у актёра мигало бы чёрное окно. В отладке консоль оставляем.
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
+use accessible_obs::{
+    donationalerts::{self, DonationFeed},
+    health::{self, HealthWatch},
+    obs::{BatchItem, ObsHandle, ObsStatus, db_to_mul, mul_to_db, response_data},
+    *,
+};
 use anyhow::{Result, anyhow};
 use axum::{
     Json, Router,
@@ -12,12 +18,6 @@ use axum::{
         sse::{Event, KeepAlive, Sse},
     },
     routing::{get, post},
-};
-use remote_stream_control::{
-    donationalerts::{self, DonationFeed},
-    health::{self, HealthWatch},
-    obs::{BatchItem, ObsHandle, ObsStatus, db_to_mul, mul_to_db, response_data},
-    *,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -443,7 +443,7 @@ async fn serve(app: Router, cfg: &HostConfig) -> Result<()> {
         match tokio::net::TcpListener::bind(addr).await {
             Ok(listener) => {
                 info!("Host Agent слушает http://{}", addr);
-                println!("Remote Stream Control Host Agent: http://{addr}");
+                println!("Accessible OBS Host Agent: http://{addr}");
                 if cfg.runtime_mode == RuntimeMode::Local
                     && addr.ip().is_loopback()
                     && !no_open_arg_present()
@@ -1385,7 +1385,7 @@ async fn obs_request(
     if !raw_obs_allowed(rt) {
         return Err((
             StatusCode::FORBIDDEN,
-            Json(json!({"error": {"message": "Эта OBS-команда не разрешена через raw endpoint. Используйте специализированную API-ручку Remote Stream Control."}})),
+            Json(json!({"error": {"message": "Эта OBS-команда не разрешена через raw endpoint. Используйте специализированную API-ручку Accessible OBS."}})),
         )
             .into_response());
     }

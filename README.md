@@ -1,222 +1,230 @@
-# Remote Stream Control
+# Accessible OBS
 
-Remote Stream Control is an accessible Windows control panel for OBS Studio.
-It is built for two real workflows:
+An accessible web panel and remote control for OBS Studio on Windows.
 
-- a remote operator controls OBS on an actor's computer through Tailscale;
-- a blind streamer controls OBS locally with a keyboard and screen reader.
+Русская версия: [README.ru.md](README.ru.md)
 
-The release package has one obvious entry point: `RemoteStreamControl.exe`.
-The source tree stays normal Rust/HTML/PowerShell code, not a checked-in
-single binary.
+> **Interface language.** The panel, the launcher and all messages are currently
+> in Russian. The code and documentation are in English. If you need an English
+> interface, open an issue — the strings are in one place and translating them
+> is straightforward.
 
-## What It Does
+## The problem
 
-- Installs or downloads OBS Studio and Tailscale during first setup.
-- Enables obs-websocket locally and keeps the OBS port closed to the network.
-- Runs a background host agent on the actor computer.
-- Opens a browser control panel for the operator.
-- Starts and stops stream, recording, replay buffer, virtual camera and Studio Mode.
-- Switches scenes, edits sources, toggles visibility and changes OBS input settings.
-- Shows a preview frame, OBS stats, stream health and a readiness check.
-- Configures Twitch and DonationAlerts from the web panel.
-- Adds DonationAlerts overlay/audio to OBS and shows recent donations in the panel.
-- Opens a dedicated actor display for a second monitor with chat and donations.
-- Provides a local accessible mode without Tailscale or pairing code.
+OBS Studio is not usable with a screen reader. Its window is a rendering
+surface: much of what matters on screen has no accessibility tree, so a blind
+streamer cannot tell whether the microphone is live, whether the scene is
+black, or whether the stream is actually reaching viewers.
 
-## Quick Start
+The usual answer is "ask a sighted friend to sit next to you". That does not
+scale to a live stream, and it does not work at all when the friend is in
+another city.
 
-Download or build the release zip, extract it to a permanent folder, then run:
+Accessible OBS replaces the OBS window with something a screen reader can
+read, and lets it run on a different computer than the person operating it.
 
-```text
-RemoteStreamControl.exe
+## Who it is for
+
+**A blind streamer on their own computer.** Local mode gives a keyboard-driven,
+screen-reader-friendly panel for OBS running on the same machine. No network
+setup, no pairing code.
+
+**An operator running someone else's stream.** Remote mode puts the panel on
+the operator's computer and OBS on the streamer's, connected over Tailscale.
+The person in front of the camera does nothing after the one-time setup:
+Tailscale, OBS and the agent all start themselves at logon.
+
+## How it fits together
+
+The streamer's computer runs the game, OBS Studio and a small background agent.
+The agent talks to OBS locally over obs-websocket and exposes a web panel.
+
+The operator's computer runs only a browser with a screen reader. It reaches
+the agent through Tailscale — an encrypted private network between the two
+machines, with nothing published to the public internet.
+
+```
+        Streamer's computer
+   ┌─────────────────────────┐
+   │  Game                   │
+   │  OBS Studio             │
+   │  Accessible OBS agent   │
+   └────────────┬────────────┘
+                │
+                │  Tailscale
+                │
+   ┌────────────▼────────────┐
+   │  Remote operator        │
+   │  Browser + screen reader│
+   └─────────────────────────┘
 ```
 
-The launcher opens an accessible mini menu in the browser and creates a desktop
-shortcut. The menu has three primary actions:
+## Two interface modes
 
-- `Actor`: prepare this computer for streaming, install dependencies, start the
-  host agent and show the pairing code.
-- `Operator`: open the remote control panel for the actor computer.
-- `Local accessible mode`: open the panel on this computer only, bound to
-  `127.0.0.1`, without Tailscale and without a pairing code.
+The mode is chosen on the launcher's start page and changes what the panel
+shows and what it says out loud.
 
-Legacy batch wrappers are still present for advanced/manual use:
+**Accessible mode**, the default. Chat, donations and stream alerts are
+announced through live regions, so a screen reader speaks them as they arrive.
+The second-monitor projector is hidden, because an OBS projector window is a
+rendering surface with no accessibility tree — it would be a button that opens
+something a blind operator can neither read nor find again to close.
 
-```text
-START_FRIEND.bat   actor setup
-START_ME.bat       operator panel
-START_LOCAL.bat    local accessible mode
-```
+**Standard mode**, for a sighted operator. Chat and donations can be projected
+onto a second monitor through OBS. Nothing is read aloud.
 
-## Remote Mode
+## Quick start
 
-Remote mode is for two computers.
+Download or build the release zip.
 
-1. Put the actor computer and operator computer in the same Tailscale tailnet.
-2. On the actor computer, run `RemoteStreamControl.exe` and choose actor setup.
-3. Give the pairing code shown on the actor computer to the operator.
-4. On the operator computer, run `RemoteStreamControl.exe` and choose operator.
-5. Enter the pairing code in the web panel.
+Extract it to a permanent folder.
 
-The actor does not need to keep using OBS directly after setup. Tailscale, OBS
-and the host agent are started automatically on login.
+Run `AccessibleOBS.exe`.
 
-## Local Accessible Mode
+The launcher opens a small accessible menu in the browser and creates a desktop
+shortcut. Choose one of:
 
-Local mode is for one computer. It is intended for a blind streamer who wants a
-screen-reader-friendly OBS control surface.
+`Actor` — prepare this computer for streaming. Installs OBS and Tailscale if
+missing, enables obs-websocket, registers the agent to start at logon and shows
+the pairing code.
 
-Run `RemoteStreamControl.exe`, choose local accessible mode, and use the browser
-panel that opens at:
+`Operator` — open the remote control panel and enter the pairing code.
 
-```text
-http://127.0.0.1:8787/
-```
+`Local accessible mode` — open the panel for OBS on this same computer, bound
+to `127.0.0.1`, with no Tailscale and no pairing code.
 
-In local mode the agent listens only on loopback and bypasses pairing. Remote
-mode and local mode cannot both own the same port at the same time.
+## What the panel does
 
-## Actor Second Screen
+Starts and stops the stream, recording, replay buffer, virtual camera and
+Studio Mode.
 
-The operator panel has an `Actor display` section. It can open, on the actor
-computer, a view-only page for a second monitor:
+Switches scenes, adds and removes sources, toggles visibility and edits OBS
+input settings.
 
-```text
-http://127.0.0.1:8787/display.html?panels=both
-```
+Shows microphone and audio levels, so the operator can tell a live microphone
+from a muted one, and a muted one from an unplugged one.
 
-Available variants are:
+Reads Twitch chat as an ordinary list of page elements, not an embedded widget,
+so a screen reader announces new messages instead of hiding them in a frame.
 
-- chat and donations;
-- chat only;
-- donations only.
+Shows recent donations, and sets up DonationAlerts inside OBS so alerts are
+both visible and audible on the stream.
 
-The display page uses the existing DonationAlerts realtime feed and embeds
-Twitch chat when Twitch is connected. It does not expose the DonationAlerts
-widget URL. Local display APIs are loopback-only; non-loopback access still
-requires the normal authenticated panel session.
+Manages the Twitch channel title, category, language and stream markers.
 
-Browser placement on a particular physical monitor is still controlled by
-Windows and the browser. The page includes a fullscreen button for the actor.
+Grabs a preview frame on demand, so the operator can check for a black screen
+without a permanent video feed eating the streamer's bandwidth.
 
-## Readiness Check
+Runs a readiness check before going live.
 
-`Preflight` checks whether the stream is actually ready instead of only checking
-that OBS answers:
+Writes browser-side errors into the same log file as the agent's own, and
+offers a diagnostics summary for troubleshooting.
 
-- OBS connection and stream key;
-- current program scene content;
-- nested scenes and groups, with bounded recursive expansion;
-- whether visual sources are active/showing via `GetSourceActive`;
-- hidden or inactive sources that would produce a black screen;
-- microphone assignment, mute state and live level;
-- risky system audio capture that could broadcast a screen reader;
-- disk space while recording;
-- Twitch and DonationAlerts overlay state.
+## Readiness check
 
-Unknown state is reported as unknown or warning, not as a false green.
+The check answers "can this actually go on air", not "does OBS respond":
 
-## Twitch
+OBS connection and configured stream key.
 
-Twitch is configured from the web panel. Save a Twitch Client ID, connect with
-Device Code OAuth, then the panel can manage title, category, language and
-stream markers.
+Whether the current program scene has anything in it, following nested scenes
+and groups.
 
-Required scope:
+Whether visual sources are genuinely active, via `GetSourceActive`.
 
-```text
-channel:manage:broadcast
-```
+Microphone assignment, mute state and live audio level.
 
-## DonationAlerts
+System-audio capture that would broadcast the operator's own screen reader to
+viewers.
 
-There are two separate DonationAlerts features.
+Free disk space while recording.
 
-For alerts in the stream, paste the official Alerts Widget URL into the panel.
-Remote Stream Control creates or repairs:
+Twitch connection and the state of the donation overlay.
 
-- `RSC_OVERLAYS` scene;
-- `RSC_DonationAlerts` browser source;
-- overlay placement in user scenes;
-- browser-source audio routing into OBS.
+An unknown result is reported as unknown, never as a green light. A check that
+could not run is not a check that passed.
 
-For the donation list in the panel and actor display, configure DonationAlerts
-OAuth in the web panel and connect the account. The widget URL is treated as a
-secret and is stored through Windows DPAPI.
+## Second screen for the streamer
 
-## Security Model
+The panel can open a view-only page on the streamer's computer showing chat and
+donations, with variants for chat only or donations only.
 
-- obs-websocket stays on `127.0.0.1`; the network talks only to the host agent.
-- Remote access uses Tailscale and a pairing-code session.
-- Local mode is loopback-only.
-- Secrets are stored under `config\secrets\*.dpapi` using Windows DPAPI.
-- Raw OBS RPC is allowlisted.
-- Origin/Host checks protect local mode from browser drive-by requests.
+In standard mode the panel can place that page on a chosen physical monitor
+through an OBS projector, so nobody has to drag a window across screens.
+
+The page never exposes the DonationAlerts widget URL, which is a secret. Its
+API is reachable without a panel session only from the local machine, and only
+with a trusted request origin.
+
+## Twitch and DonationAlerts
+
+Twitch is configured from the panel: save a Client ID, connect with Device Code
+OAuth, and the panel can manage the channel. The required scope is
+`channel:manage:broadcast`.
+
+Chat is read anonymously and needs no token at all, so it works before OAuth.
+
+For alerts on the stream, paste the official DonationAlerts Alerts Widget URL
+into the panel. Accessible OBS creates and repairs the overlay scene, the
+browser source, its placement above other sources in every scene, and the audio
+routing that makes alerts audible to viewers. It then re-reads OBS to confirm,
+rather than reporting success because the commands were sent.
+
+For the donation list in the panel, connect DonationAlerts OAuth.
+
+## Security
+
+obs-websocket stays bound to `127.0.0.1`; only the agent talks to the network.
+
+Remote access runs over Tailscale with a pairing-code session.
+
+Local mode listens on loopback only.
+
+Secrets are stored with Windows DPAPI under `config\secrets\*.dpapi` and never
+appear in API responses or logs.
+
+The raw OBS RPC endpoint is restricted to an allowlist of read-only requests.
+
+Origin and Host are checked so a page on another site cannot drive the panel
+through the operator's own browser.
 
 Read [SECURITY.md](SECURITY.md) before using this for a real stream.
 
-## Release Package Contents
+## Building
 
-The release zip contains the runtime files needed by a Windows user:
+Requirements: Windows 10 or 11, a Rust toolchain matching `rust-version` in
+`Cargo.toml`, PowerShell, and OBS Studio for live validation.
 
-```text
-RemoteStreamControl.exe
-START_*.bat
-bin\
-web\
-config\
-third_party\
-README.md
-LICENSE
-SECURITY.md
-THIRD_PARTY_NOTICES.txt
-```
-
-If pinned installers are available, the package also includes official OBS and
-Tailscale installers under `third_party\installers\`. Their SHA256 values are
-verified from `third_party\installers.json` before packaging.
-
-Build the package with:
+Build the release package:
 
 ```powershell
-scripts\package_release.ps1
+BUILD.bat
 ```
 
-## Development
-
-Requirements:
-
-- Windows 10 or 11;
-- Rust toolchain compatible with `rust-version` in `Cargo.toml`;
-- PowerShell;
-- Node.js for JavaScript syntax checks;
-- OBS Studio for live local validation.
-
-Useful checks:
+Checks used in CI:
 
 ```powershell
 cargo fmt --all -- --check
-node --check web\app.js
-node --check web\display.js
-cargo check
-cargo test --all
 cargo clippy --all-targets -- -D warnings
+cargo test --all
 scripts\scan_secrets.ps1
-scripts\smoke_test.ps1 -Port 18787
-scripts\smoke_test.ps1 -Port 18788 -Local
-scripts\package_release.ps1
 ```
 
-## Known Limits
+## Known limits
 
-- A true single-file self-extracting setup executable is not implemented yet.
-  The current release is a zip with one obvious launcher executable inside.
-- Live Twitch and DonationAlerts validation requires real accounts.
-- Choosing the exact physical monitor for the actor display is still left to
-  Windows/browser behavior.
-- There is no per-operator permission model; an authenticated operator controls
-  the full OBS panel.
+The release is a zip with one obvious launcher inside, not a single
+self-extracting installer.
+
+Two-machine operation, installation from scratch, autostart across a reboot,
+and Twitch and DonationAlerts with live accounts have not been verified
+end to end. Everything else described here has been tested against a running
+OBS Studio.
+
+There is no per-operator permission model: an authenticated operator controls
+the whole panel.
+
+OBS scene and source objects created by the program still carry an `RSC_`
+prefix from an earlier name. Renaming them needs a migration step, or existing
+setups would be left with orphaned scenes.
 
 ## License
 

@@ -6,8 +6,8 @@
 //! настоящий WebSocket-сервер, говорящий на протоколе obs-websocket 5.x,
 //! и клиент работает с ним как с OBS.
 
+use accessible_obs::obs::{BatchItem, ObsHandle, response_data};
 use futures_util::{SinkExt, StreamExt};
-use remote_stream_control::obs::{BatchItem, ObsHandle, response_data};
 use serde_json::{Value, json};
 use std::{
     sync::{
@@ -336,7 +336,7 @@ async fn wrong_password_is_explained_not_just_logged() {
 
     let message = message.expect("ошибка авторизации должна попасть в статус");
     assert!(message.contains("пароль"), "{message}");
-    assert!(message.contains("RemoteStreamControl.exe"), "{message}");
+    assert!(message.contains("AccessibleOBS.exe"), "{message}");
     assert!(!obs.is_connected().await);
 }
 

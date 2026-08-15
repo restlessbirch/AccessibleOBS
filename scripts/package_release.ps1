@@ -9,7 +9,7 @@ $Dist = Join-Path $Root "dist"
 $Bin = Join-Path $Root "bin"
 $Installers = Join-Path $Root "third_party\installers"
 $StageRoot = Join-Path $Dist "stage"
-$Stage = Join-Path $StageRoot "RemoteStreamControl"
+$Stage = Join-Path $StageRoot "AccessibleOBS"
 
 New-Item -ItemType Directory -Force -Path $Dist, $Bin, $Installers | Out-Null
 
@@ -94,6 +94,10 @@ $items = @(
   "START_ME.bat",
   "START_LOCAL.bat",
   "README.md",
+  # Интерфейс программы русский, и её пользователи читают по-русски. Оставить
+  # в архиве только английское описание значило бы, что распаковавший его
+  # человек не найдёт инструкции на своём языке.
+  "README.ru.md",
   "SECURITY.md",
   "LICENSE",
   "THIRD_PARTY_NOTICES.txt"
@@ -109,7 +113,7 @@ foreach ($item in $items) {
 # запущенный агент держит свой файл, и Windows не даёт его перезаписать.
 # Проверено на живой сборке — в bin оставался агент суточной давности, и
 # архив собрался бы со старым кодом, ничем этого не показав.
-Copy-Item -LiteralPath (Join-Path $Root "target\release\bootstrap.exe") -Destination (Join-Path $Stage "RemoteStreamControl.exe") -Force
+Copy-Item -LiteralPath (Join-Path $Root "target\release\bootstrap.exe") -Destination (Join-Path $Stage "AccessibleOBS.exe") -Force
 foreach ($exe in @("bootstrap.exe", "host-agent.exe")) {
   Copy-Item -LiteralPath (Join-Path $Root "target\release\$exe") -Destination (Join-Path $Stage "bin\$exe") -Force
 }
@@ -142,9 +146,9 @@ if ($forbiddenPackageFiles) {
   throw "Refusing to package secrets or private key material."
 }
 
-$zip = Join-Path $Dist "RemoteStreamControl_ready_$Version.zip"
+$zip = Join-Path $Dist "AccessibleOBS_ready_$Version.zip"
 if (Test-Path -LiteralPath $zip) { Remove-Item -LiteralPath $zip -Force }
-Compress-Archive -Path (Join-Path $StageRoot "RemoteStreamControl") -DestinationPath $zip -Force
+Compress-Archive -Path (Join-Path $StageRoot "AccessibleOBS") -DestinationPath $zip -Force
 
 Get-FileHash -Algorithm SHA256 -LiteralPath $zip | Format-List
 Write-Host "Created $zip"

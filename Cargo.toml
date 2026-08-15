@@ -1,12 +1,12 @@
 [package]
-name = "remote_stream_control"
+name = "accessible_obs"
 version = "1.1.0"
 edition = "2024"
 rust-version = "1.88"
 authors = ["restlessbirch"]
 license = "MIT"
-description = "Accessible OBS control panel for remote Tailscale and local loopback use"
-repository = "https://github.com/restlessbirch/RemoteStreamControl"
+description = "Accessible web panel and remote control for OBS Studio, over Tailscale or on the same machine"
+repository = "https://github.com/restlessbirch/AccessibleOBS"
 
 [dependencies]
 anyhow = "1"

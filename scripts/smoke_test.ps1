@@ -6,7 +6,7 @@ param(
 $ErrorActionPreference = "Stop"
 $Root = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 $TempRoot = Join-Path $env:TEMP ("rsc-smoke-" + [guid]::NewGuid().ToString("N"))
-$App = Join-Path $TempRoot "RemoteStreamControl"
+$App = Join-Path $TempRoot "AccessibleOBS"
 
 New-Item -ItemType Directory -Force -Path $App | Out-Null
 Copy-Item -LiteralPath (Join-Path $Root "bin") -Destination $App -Recurse -Force
@@ -61,7 +61,7 @@ try {
   do {
     try {
       $ping = Invoke-RestMethod -Uri "http://127.0.0.1:$Port/api/public/ping" -TimeoutSec 1
-      if ($ping.ok -eq $true -and $ping.app -eq "Remote Stream Control") {
+      if ($ping.ok -eq $true -and $ping.app -eq "Accessible OBS") {
         $display = Invoke-WebRequest -UseBasicParsing -Uri "http://127.0.0.1:$Port/display.html" -TimeoutSec 1
         if ($display.Content -notmatch "display.js") {
           throw "actor display page did not load"

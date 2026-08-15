@@ -3,6 +3,34 @@
 version = 4
 
 [[package]]
+name = "accessible_obs"
+version = "1.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "base64",
+ "futures-util",
+ "open",
+ "rand 0.9.5",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2",
+ "subtle",
+ "tokio",
+ "tokio-stream",
+ "tokio-tungstenite",
+ "tower-http",
+ "tracing",
+ "tracing-appender",
+ "tracing-subscriber",
+ "urlencoding",
+ "uuid",
+ "which",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "aho-corasick"
 version = "1.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -891,34 +919,6 @@ name = "regex-syntax"
 version = "0.8.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
-
-[[package]]
-name = "remote_stream_control"
-version = "1.1.0"
-dependencies = [
- "anyhow",
- "axum",
- "base64",
- "futures-util",
- "open",
- "rand 0.9.5",
- "reqwest",
- "serde",
- "serde_json",
- "sha2",
- "subtle",
- "tokio",
- "tokio-stream",
- "tokio-tungstenite",
- "tower-http",
- "tracing",
- "tracing-appender",
- "tracing-subscriber",
- "urlencoding",
- "uuid",
- "which",
- "windows-sys 0.61.2",
-]
 
 [[package]]
 name = "reqwest"

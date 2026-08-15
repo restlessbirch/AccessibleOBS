@@ -74,7 +74,7 @@ pub(crate) async fn is_auth(st: &AppState, headers: &HeaderMap) -> bool {
         // Пароля нет, поэтому доверие держится на происхождении запроса.
         return origin_is_trusted(headers);
     }
-    let Some(presented) = cookie(headers, "rsc_session") else {
+    let Some(presented) = cookie(headers, "aobs_session") else {
         return false;
     };
     let now = now_unix();
@@ -101,7 +101,7 @@ pub(crate) async fn require_auth(st: &AppState, headers: &HeaderMap) -> Result<(
     } else {
         Err((
             StatusCode::UNAUTHORIZED,
-            Json(json!({"error": {"message": "Требуется pairing-код Remote Stream Control."}})),
+            Json(json!({"error": {"message": "Требуется pairing-код Accessible OBS."}})),
         )
             .into_response())
     }
@@ -188,7 +188,7 @@ pub(crate) async fn auth_login(
     resp.headers_mut().insert(
         "set-cookie",
         HeaderValue::from_str(&format!(
-            "rsc_session={}; Path=/; HttpOnly; SameSite=Lax",
+            "aobs_session={}; Path=/; HttpOnly; SameSite=Lax",
             session.token
         ))
         .expect("токен из base64 всегда валиден для заголовка"),
@@ -208,7 +208,7 @@ pub(crate) async fn auth_logout(State(st): State<AppState>, headers: HeaderMap) 
     let mut resp = Json(json!({"ok": true})).into_response();
     resp.headers_mut().insert(
         "set-cookie",
-        HeaderValue::from_static("rsc_session=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0"),
+        HeaderValue::from_static("aobs_session=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0"),
     );
     resp
 }
@@ -232,14 +232,14 @@ mod tests {
 
     #[test]
     fn cookie_parses_target_among_many() {
-        let h = headers_with_cookie("a=1; rsc_session=token-value; b=2");
-        assert_eq!(cookie(&h, "rsc_session").as_deref(), Some("token-value"));
+        let h = headers_with_cookie("a=1; aobs_session=token-value; b=2");
+        assert_eq!(cookie(&h, "aobs_session").as_deref(), Some("token-value"));
     }
 
     #[test]
     fn cookie_absent_returns_none() {
         let h = headers_with_cookie("other=1");
-        assert!(cookie(&h, "rsc_session").is_none());
+        assert!(cookie(&h, "aobs_session").is_none());
     }
 
     #[test]

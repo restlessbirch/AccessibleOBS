@@ -1,11 +1,11 @@
-Remote Stream Control — technical notes
+Accessible OBS — technical notes
 ======================================
 
 Бинарники
 ---------
 bin\bootstrap.exe — первичная настройка, консольное приложение.
   --launcher          доступное мини-меню запуска; это режим по умолчанию
-                      для RemoteStreamControl.exe в релизном архиве.
+                      для AccessibleOBS.exe в релизном архиве.
   --host              Tailscale + OBS + пароль WebSocket + host-agent +
                       регистрация автозапуска + вывод pairing-кода.
   --controller        Tailscale + поиск агента в tailnet + открытие браузера.
@@ -55,7 +55,7 @@ GET /api/events — Server-Sent Events, требует авторизации.
 
 /api/obs/request оставлен только как узкий compatibility endpoint для read-only запросов,
 которые ещё использует frontend: GetStreamStatus и GetRecordStatus. Остальные OBS-команды
-должны идти через специализированные API-ручки Remote Stream Control.
+должны идти через специализированные API-ручки Accessible OBS.
 
 Экран актёра для второго монитора использует отдельные view-only ручки:
   GET  /api/actor-display/state
@@ -190,7 +190,7 @@ Client ID и scopes сохраняются из web-панели; публичн
 
 Автозапуск
 ----------
-Ярлык «Remote Stream Control.lnk» в папке автозагрузки пользователя
+Ярлык «Accessible OBS.lnk» в папке автозагрузки пользователя
 (%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup), создаётся через
 WScript.Shell. Выбран ярлык, а не ключ реестра Run: он виден пользователю,
 удаляется вручную и не требует прав администратора.
@@ -212,7 +212,7 @@ WScript.Shell. Выбран ярлык, а не ключ реестра Run: о�
 
 Приёмочный тест на компьютере актёра
 ------------------------------------
-1. Запустить RemoteStreamControl.exe, выбрать режим актёра, дождаться pairing-кода.
+1. Запустить AccessibleOBS.exe, выбрать режим актёра, дождаться pairing-кода.
 2. Перезагрузить компьютер и убедиться, что панель доступна без запуска BAT.
 3. Открыть панель у владельца, ввести код.
 4. Переключить сцену.
@@ -237,13 +237,13 @@ runtime_mode продолжают загружаться. CLI-флаг host-agen
 переключает текущий запуск в Local Mode и не переписывает host.json.
 
 Remote Mode:
-- RemoteStreamControl.exe --launcher остаётся основным входом;
+- AccessibleOBS.exe --launcher остаётся основным входом;
 - START_FRIEND.bat сохранён как совместимый wrapper для --host;
 - listen_mode=tailscale_only по-прежнему поднимает 127.0.0.1 и Tailscale IP;
 - pairing, session cookie и Tailscale остаются обязательной моделью доступа.
 
 Local Mode:
-- RemoteStreamControl.exe --local запускает локальную панель;
+- AccessibleOBS.exe --local запускает локальную панель;
 - START_LOCAL.bat сохранён как совместимый wrapper;
 - HTTP listener поднимается только на 127.0.0.1:web_port;
 - Tailscale IP не запрашивается и не слушается;

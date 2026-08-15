@@ -1,8 +1,8 @@
-Remote Stream Control is copyright (c) 2026 restlessbirch and is licensed
+Accessible OBS is copyright (c) 2026 restlessbirch and is licensed
 under the MIT License. See LICENSE.
 
 Bundled installers, when present in release zip files, are not part of the
-Remote Stream Control source license:
+Accessible OBS source license:
 
 - Tailscale installer
   Source: https://tailscale.com/download/windows

@@ -7,6 +7,7 @@
 //!
 //! `--controller` (компьютер владельца): находит агента в tailnet и открывает панель.
 
+use accessible_obs::*;
 use anyhow::{Context, Result, anyhow};
 use axum::{
     Router,
@@ -14,7 +15,6 @@ use axum::{
     response::{Html, IntoResponse},
     routing::{get, post},
 };
-use remote_stream_control::*;
 use serde_json::Value;
 use std::{
     fs,
@@ -46,20 +46,20 @@ async fn main() -> Result<()> {
         "--local" => local_flow().await,
         "--remove-autostart" => {
             unregister_autostart()?;
-            println!("Автозапуск Remote Stream Control удалён.");
+            println!("Автозапуск Accessible OBS удалён.");
             pause_if_console();
             Ok(())
         }
         _ => {
             println!(
-                "Remote Stream Control bootstrap\n\n\
+                "Accessible OBS bootstrap\n\n\
                  Использование:\n  \
-                 RemoteStreamControl.exe                   открыть доступное меню запуска\n  \
-                 RemoteStreamControl.exe --launcher        открыть доступное меню запуска\n  \
-                 RemoteStreamControl.exe --host              компьютер актёра/стримера\n  \
-                 RemoteStreamControl.exe --controller        компьютер владельца\n  \
-                 RemoteStreamControl.exe --local             локальный доступный режим\n  \
-                 RemoteStreamControl.exe --remove-autostart  убрать агент из автозагрузки"
+                 AccessibleOBS.exe                   открыть доступное меню запуска\n  \
+                 AccessibleOBS.exe --launcher        открыть доступное меню запуска\n  \
+                 AccessibleOBS.exe --host              компьютер актёра/стримера\n  \
+                 AccessibleOBS.exe --controller        компьютер владельца\n  \
+                 AccessibleOBS.exe --local             локальный доступный режим\n  \
+                 AccessibleOBS.exe --remove-autostart  убрать агент из автозагрузки"
             );
             Ok(())
         }
@@ -69,7 +69,7 @@ async fn main() -> Result<()> {
 async fn launcher_flow() -> Result<()> {
     let shortcut = register_launcher_shortcut()?;
     println!(
-        "Remote Stream Control launcher\n\n\
+        "Accessible OBS launcher\n\n\
          Desktop shortcut: {}\n\
          Opening accessible launcher...",
         shortcut.display()
@@ -117,7 +117,7 @@ fn launcher_url() -> String {
 }
 
 fn launcher_exe() -> PathBuf {
-    let root_exe = app_root().join("RemoteStreamControl.exe");
+    let root_exe = app_root().join("AccessibleOBS.exe");
     if root_exe.exists() {
         root_exe
     } else {
@@ -300,7 +300,7 @@ const LAUNCHER_HTML: &str = r#"<!doctype html>
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Remote Stream Control</title>
+  <title>Accessible OBS</title>
   <style>
 :root { color-scheme: light dark; }
 body {
@@ -343,7 +343,7 @@ button:focus-visible {
 </head>
 <body>
   <main>
-    <h1>Remote Stream Control</h1>
+    <h1>Accessible OBS</h1>
     <p>Выберите, как использовать этот компьютер.</p>
 
     <h2>Режим интерфейса</h2>
@@ -400,7 +400,7 @@ button:focus-visible {
 </html>"#;
 
 async fn host_flow() -> Result<()> {
-    println!("Remote Stream Control — настройка компьютера актёра\n");
+    println!("Accessible OBS — настройка компьютера актёра\n");
     let mut cfg = load_host_config()?;
     ensure_tailscale().await?;
     ensure_tailscale_up(cfg.enable_tailscale_unattended_after_login).await?;
@@ -477,7 +477,7 @@ async fn host_flow() -> Result<()> {
 }
 
 async fn local_flow() -> Result<()> {
-    println!("Remote Stream Control — локальный доступный режим\n");
+    println!("Accessible OBS — локальный доступный режим\n");
     let cfg = load_host_config()?;
     ensure_obs_installed(&cfg).await?;
     let obs_password = runtime_or_existing_obs_password(&cfg)?;
@@ -515,10 +515,10 @@ async fn local_flow() -> Result<()> {
     ensure_local_host_agent_started().await?;
     wait_for_local_web(cfg.web_port, 20).await?;
     create_launcher_shortcut(
-        "Remote Stream Control - Local.lnk",
+        "Accessible OBS - Local.lnk",
         &launcher_exe(),
         "--local",
-        "Remote Stream Control local accessible mode",
+        "Accessible OBS local accessible mode",
     )
     .ok();
     println!("Открываю локальную панель: {url}");
@@ -527,7 +527,7 @@ async fn local_flow() -> Result<()> {
 }
 
 async fn controller_flow() -> Result<()> {
-    println!("Remote Stream Control — запуск панели владельца\n");
+    println!("Accessible OBS — запуск панели владельца\n");
     let cfg = load_controller_config()?;
     ensure_tailscale().await?;
     ensure_tailscale_up(true).await?;
@@ -716,7 +716,7 @@ async fn ensure_obs_installed(cfg: &HostConfig) -> Result<()> {
         let url = latest_obs_installer_url().await?;
         println!("Скачиваю OBS: {url}");
         let bytes = reqwest::Client::builder()
-            .user_agent("RemoteStreamControl/0.2")
+            .user_agent("AccessibleOBS/0.2")
             .build()?
             .get(url)
             .send()
@@ -767,7 +767,7 @@ fn runtime_or_existing_obs_password(cfg: &HostConfig) -> Result<String> {
 
 async fn latest_obs_installer_url() -> Result<String> {
     let v: serde_json::Value = reqwest::Client::builder()
-        .user_agent("RemoteStreamControl/0.2")
+        .user_agent("AccessibleOBS/0.2")
         .build()?
         .get("https://api.github.com/repos/obsproject/obs-studio/releases/latest")
         .send()
@@ -912,10 +912,10 @@ fn pause_if_console() {
 
 fn register_launcher_shortcut() -> Result<PathBuf> {
     create_launcher_shortcut(
-        "Remote Stream Control.lnk",
+        "Accessible OBS.lnk",
         &launcher_exe(),
         "",
-        "Remote Stream Control accessible launcher",
+        "Accessible OBS accessible launcher",
     )
 }
 

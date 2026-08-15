@@ -332,7 +332,7 @@ async fn session(
     if let Some(auth) = hello.pointer("/d/authentication") {
         if password.is_empty() {
             bail!(
-                "OBS WebSocket требует пароль, а он не задан. Запустите RemoteStreamControl.exe в режиме актёра — он создаст и сохранит пароль."
+                "OBS WebSocket требует пароль, а он не задан. Запустите AccessibleOBS.exe в режиме актёра — он создаст и сохранит пароль."
             );
         }
         let challenge = auth.get("challenge").and_then(Value::as_str).unwrap_or("");
@@ -647,7 +647,7 @@ fn close_error(frame: Option<CloseFrame>) -> anyhow::Error {
     };
     match u16::from(frame.code) {
         4009 => anyhow!(
-            "OBS отклонил пароль WebSocket. Запустите RemoteStreamControl.exe в режиме актёра — он пересоздаст пароль и настроит OBS."
+            "OBS отклонил пароль WebSocket. Запустите AccessibleOBS.exe в режиме актёра — он пересоздаст пароль и настроит OBS."
         ),
         4008 => anyhow!("OBS требует авторизацию, а пароль не был отправлен"),
         code => anyhow!("OBS закрыл соединение (код {code}): {}", frame.reason),
@@ -943,10 +943,7 @@ mod tests {
         // поэтому в тексте обязана быть конкретная инструкция.
         let msg = close_error(Some(close_frame(4009, "Authentication failed"))).to_string();
         assert!(msg.contains("пароль"), "названа причина: {msg}");
-        assert!(
-            msg.contains("RemoteStreamControl.exe"),
-            "названо решение: {msg}"
-        );
+        assert!(msg.contains("AccessibleOBS.exe"), "названо решение: {msg}");
     }
 
     #[test]

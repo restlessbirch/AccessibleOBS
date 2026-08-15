@@ -32,7 +32,7 @@ window.addEventListener('unhandledrejection', (e) => {
 });
 
 /*
- * Панель Remote Stream Control.
+ * Панель Accessible OBS.
  *
  * Два принципа, от которых лучше не отступать при правках:
  *

@@ -23,7 +23,7 @@ use std::{
 };
 use tokio::time::timeout;
 
-pub const APP_NAME: &str = "Remote Stream Control";
+pub const APP_NAME: &str = "Accessible OBS";
 pub const OVERLAY_SCENE: &str = "RSC_OVERLAYS";
 pub const DA_INPUT: &str = "RSC_DonationAlerts";
 
@@ -611,7 +611,7 @@ pub fn start_obs_if_needed(configured_path: &str) -> Result<bool> {
         tracing::warn!("Прошлый сеанс OBS завершился аварийно; окно безопасного режима подавлено");
     }
     let obs = find_obs(configured_path).ok_or_else(|| {
-        anyhow!("OBS Studio не найден. Установите OBS с https://obsproject.com/ или запустите RemoteStreamControl.exe в режиме актёра.")
+        anyhow!("OBS Studio не найден. Установите OBS с https://obsproject.com/ или запустите AccessibleOBS.exe в режиме актёра.")
     })?;
     let mut cmd = Command::new(&obs);
     if let Some(parent) = obs.parent() {
@@ -637,11 +637,47 @@ pub fn startup_dir() -> Option<PathBuf> {
 }
 
 pub fn autostart_shortcut() -> Option<PathBuf> {
-    Some(startup_dir()?.join("Remote Stream Control.lnk"))
+    Some(startup_dir()?.join("Accessible OBS.lnk"))
 }
 
+/// Имена ярлыков автозагрузки от прежних версий программы.
+///
+/// Программа называлась иначе, и ярлык в «Автозагрузке» носил то имя. Само по
+/// себе переименование его не трогает: агент искал бы ярлык с новым именем, не
+/// находил, создавал свой — и при входе в Windows поднимались бы два агента.
+/// Второму не достался бы порт, он бы молча лёг, а человек получил бы
+/// работающую программу, которая при этом пишет в лог ошибку занятого адреса.
+const LEGACY_AUTOSTART_SHORTCUTS: &[&str] = &["Remote Stream Control.lnk"];
+
+fn legacy_autostart_shortcuts() -> Vec<PathBuf> {
+    let Some(dir) = startup_dir() else {
+        return Vec::new();
+    };
+    LEGACY_AUTOSTART_SHORTCUTS
+        .iter()
+        .map(|name| dir.join(name))
+        .filter(|p| p.exists())
+        .collect()
+}
+
+/// Убирает ярлыки автозагрузки от прежних имён программы.
+fn remove_legacy_autostart() {
+    for old in legacy_autostart_shortcuts() {
+        match fs::remove_file(&old) {
+            Ok(()) => tracing::info!(
+                "Убран ярлык автозапуска от прежней версии: {}",
+                old.display()
+            ),
+            Err(e) => tracing::warn!("Не удалось убрать {}: {e}", old.display()),
+        }
+    }
+}
+
+/// Настроен ли автозапуск. Ярлык от прежнего имени тоже считается: он
+/// действительно запускает агент, и врать человеку, что автозапуска нет,
+/// нельзя.
 pub fn autostart_registered() -> bool {
-    autostart_shortcut().is_some_and(|p| p.exists())
+    autostart_shortcut().is_some_and(|p| p.exists()) || !legacy_autostart_shortcuts().is_empty()
 }
 
 /// Прописывает host-agent в автозагрузку текущего пользователя.
@@ -662,7 +698,7 @@ pub fn register_autostart() -> Result<PathBuf> {
         "$s = (New-Object -ComObject WScript.Shell).CreateShortcut('{}'); \
          $s.TargetPath = '{}'; \
          $s.WorkingDirectory = '{}'; \
-         $s.Description = 'Remote Stream Control host agent'; \
+         $s.Description = 'Accessible OBS host agent'; \
          $s.Save()",
         ps_quote(&shortcut.to_string_lossy()),
         ps_quote(&target.to_string_lossy()),
@@ -678,6 +714,9 @@ pub fn register_autostart() -> Result<PathBuf> {
             String::from_utf8_lossy(&out.stderr).trim()
         );
     }
+    // Только после того, как новый ярлык точно создан: иначе при отказе
+    // человек остался бы вовсе без автозапуска.
+    remove_legacy_autostart();
     Ok(shortcut)
 }
 #[cfg(not(windows))]
@@ -685,12 +724,17 @@ pub fn register_autostart() -> Result<PathBuf> {
     bail!("автозапуск поддерживается только на Windows")
 }
 
+/// Убирает автозапуск — и нынешний ярлык, и оставшиеся от прежних имён.
+///
+/// Иначе «убрать автозапуск» на начальной странице отвечало бы успехом, а агент
+/// продолжал бы подниматься при входе в Windows со старого ярлыка.
 pub fn unregister_autostart() -> Result<()> {
     if let Some(p) = autostart_shortcut()
         && p.exists()
     {
         fs::remove_file(p)?;
     }
+    remove_legacy_autostart();
     Ok(())
 }
 

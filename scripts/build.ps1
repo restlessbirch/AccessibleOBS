@@ -14,7 +14,7 @@
 # Параметры перечислены явно, а не собраны в «всё остальное».
 # Пересылка массивом здесь не работает: элементы уходят позиционно, и
 # package_release.ps1 получает строку "-Version" как номер версии, после чего
-# спокойно собирает архив с именем RemoteStreamControl_ready_-Version.zip.
+# спокойно собирает архив с именем AccessibleOBS_ready_-Version.zip.
 # Значение по умолчанию намеренно не дублируем — оно одно, в package_release.ps1.
 param(
   [string]$Version,
@@ -24,7 +24,7 @@ param(
 $ErrorActionPreference = "Stop"
 $Root = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 
-Write-Host "Remote Stream Control — сборка релиза"
+Write-Host "Accessible OBS — сборка релиза"
 Write-Host ""
 
 if (-not (Get-Command cargo -ErrorAction SilentlyContinue)) {
@@ -59,6 +59,6 @@ if ($code -ne 0) {
 
 Write-Host ""
 Write-Host "Готово. Архив лежит в папке dist."
-Write-Host "Его целиком отправляют актёру: внутри RemoteStreamControl.exe,"
+Write-Host "Его целиком отправляют актёру: внутри AccessibleOBS.exe,"
 Write-Host "панель и официальные установщики Tailscale и OBS."
 exit 0
