@@ -14,7 +14,10 @@ jobs:
     # пути OBS. Сборка на Linux ничего полезного не проверила бы.
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      # v5, а не v4: GitHub объявил Node 20 устаревшим и уже принудительно
+      # исполняет действия на Node 24, предупреждая об этом в каждом прогоне.
+      # Пока это предупреждение, но однажды станет отказом.
+      - uses: actions/checkout@v5
 
       - name: Secret scan
         run: .\scripts\scan_secrets.ps1
@@ -26,7 +29,7 @@ jobs:
           components: rustfmt, clippy
 
       - name: Cache cargo
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             ~/.cargo/registry
