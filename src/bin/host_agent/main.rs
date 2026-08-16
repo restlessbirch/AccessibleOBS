@@ -19,6 +19,7 @@ use axum::{
     },
     routing::{get, post},
 };
+use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
@@ -1221,6 +1222,10 @@ async fn preflight(State(st): State<AppState>, headers: HeaderMap) -> ApiResult<
         })
         .collect();
 
+    // Имя сцены нужно и снимку, и запросу кадра, а в снимок оно уходит по
+    // значению — поэтому берём копию заранее.
+    let frame_peak = program_frame_peak(&st, current_scene.as_deref()).await;
+
     let snapshot = preflight::Snapshot {
         obs_connected: true,
         obs_version: obs_status.obs_version.clone(),
@@ -1246,6 +1251,7 @@ async fn preflight(State(st): State<AppState>, headers: HeaderMap) -> ApiResult<
         donation_overlay: donation_overlay_state(&st).await,
         twitch_connected: load_secret("twitch_tokens").ok().flatten().is_some(),
         camera: load_source_roles().camera,
+        program_frame_peak: frame_peak,
     };
 
     let checks = preflight::evaluate(&snapshot);
@@ -1253,6 +1259,41 @@ async fn preflight(State(st): State<AppState>, headers: HeaderMap) -> ApiResult<
         "summary": preflight::summary(&checks),
         "checks": checks,
     })))
+}
+
+/// Яркость самого светлого пикселя того, что сейчас идёт в эфир.
+///
+/// Кадр берём крошечный и несжатым BMP: нам нужно одно число, а не картинка.
+/// Мелкий размер заодно делает проверку дешёвой — её вызывают перед каждым
+/// эфиром, и она не должна нагружать машину актёра.
+///
+/// Любая неудача — None, то есть «проверить не удалось». Выдавать её за
+/// исправную картинку нельзя: ровно из таких молчаливых допущений и
+/// складывается ложный зелёный.
+async fn program_frame_peak(st: &AppState, scene: Option<&str>) -> Option<u8> {
+    let scene = scene?;
+    let shot = st
+        .obs
+        .request(
+            "GetSourceScreenshot",
+            json!({
+                "sourceName": scene,
+                "imageFormat": "bmp",
+                "imageWidth": 64,
+                "imageHeight": 36,
+            }),
+        )
+        .await
+        .map_err(|e| warn!("Кадр для проверки готовности не получен: {e:#}"))
+        .ok()?;
+    let data = shot.get("imageData").and_then(Value::as_str)?;
+    // OBS отдаёт data-URI вида `data:image/bmp;base64,....`
+    let base64 = data.rsplit_once(',').map_or(data, |(_, tail)| tail);
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(base64)
+        .map_err(|e| warn!("Кадр проверки готовности не разобран: {e}"))
+        .ok()?;
+    preflight::bmp_peak_luma(&bytes)
 }
 
 async fn collect_preflight_scene_sources(

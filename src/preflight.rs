@@ -237,6 +237,16 @@ pub struct Snapshot {
     /// Источник, назначенный камерой. None — роль не назначена, и проверять
     /// нечего: не у каждого эфира есть камера.
     pub camera: Option<String>,
+    /// Яркость самого светлого пикселя готового кадра, 0..255.
+    ///
+    /// None — кадр получить не удалось.
+    ///
+    /// Без этого проверка верила OBS на слово. Живой случай: захват монитора
+    /// отдавал сплошную черноту, `GetSourceActive` при этом отвечал «активен»,
+    /// и проверка бодро сообщала «активных источников с картинкой: 2 из 2».
+    /// Оператор ушёл бы в эфир с чёрным экраном, узнав об этом от зрителей.
+    /// Поэтому смотрим на сам кадр, а не на мнение OBS о нём.
+    pub program_frame_peak: Option<u8>,
 }
 
 /// Ниже этого уровня считаем, что звука нет.
@@ -274,6 +284,7 @@ pub fn evaluate(snapshot: &Snapshot) -> Vec<Check> {
     });
 
     checks.push(scene_content_check(&snapshot.sources));
+    checks.push(program_frame_check(snapshot.program_frame_peak));
     if let Some(camera) = &snapshot.camera {
         checks.push(camera_check(camera, &snapshot.sources));
     }
@@ -307,6 +318,79 @@ pub fn evaluate(snapshot: &Snapshot) -> Vec<Check> {
     });
 
     checks
+}
+
+/// Ниже этой яркости кадр считаем чёрным.
+///
+/// Не ноль: кодировщик и масштабирование дают единицы яркости на пустом месте,
+/// а сравнение с нулём объявляло бы исправной картинку, где еле теплится шум.
+const BLACK_FRAME_PEAK: u8 = 8;
+
+/// Есть ли в эфире хоть что-нибудь видимое.
+///
+/// Смотрит на готовый кадр целиком, а не на признак «источник активен».
+/// Именно расхождение между ними и создаёт худший вид отказа: OBS уверен, что
+/// всё работает, зрители видят черноту, а оператор узнаёт об этом последним.
+fn program_frame_check(peak: Option<u8>) -> Check {
+    match peak {
+        None => Check::warn(
+            "Картинка в эфире",
+            "Не удалось получить кадр из OBS",
+            "Проверьте связь с OBS и повторите проверку.",
+        ),
+        Some(peak) if peak < BLACK_FRAME_PEAK => Check::critical(
+            "Картинка в эфире",
+            "Кадр полностью чёрный, хотя OBS считает источники активными",
+            "Чаще всего это захват экрана или игры, который не отдаёт картинку. \
+             У актёра: откройте свойства источника и смените способ захвата. \
+             На ноутбуках с двумя видеокартами помогает запуск OBS на той же \
+             карте, что рисует рабочий стол.",
+        ),
+        Some(_) => Check::ok("Картинка в эфире", "Кадр не пустой"),
+    }
+}
+
+/// Яркость самого светлого пикселя несжатого BMP.
+///
+/// BMP выбран намеренно: он разбирается тридцатью строками без единой
+/// зависимости, тогда как JPEG или PNG потребовали бы тащить в проект целый
+/// декодировщик изображений ради одного числа. Кадр запрашивается крошечным,
+/// так что размер значения не имеет.
+///
+/// Возвращает None, если это не разборный BMP: неизвестное лучше выдумки.
+pub fn bmp_peak_luma(bytes: &[u8]) -> Option<u8> {
+    let le32 = |at: usize| -> Option<u32> {
+        Some(u32::from_le_bytes(bytes.get(at..at + 4)?.try_into().ok()?))
+    };
+    if bytes.get(0..2)? != b"BM" {
+        return None;
+    }
+    let data_start = le32(10)? as usize;
+    let width = le32(18)? as i32;
+    // Высота отрицательна, когда строки идут сверху вниз. Для поиска максимума
+    // порядок строк безразличен, важен только модуль.
+    let height = (le32(22)? as i32).unsigned_abs() as usize;
+    let bits = u16::from_le_bytes(bytes.get(28..30)?.try_into().ok()?);
+    if width <= 0 || height == 0 || (bits != 24 && bits != 32) {
+        return None;
+    }
+    let width = width as usize;
+    let bytes_per_pixel = (bits / 8) as usize;
+    // Строки BMP выровнены по четыре байта.
+    let row_size = (width * bytes_per_pixel).div_ceil(4) * 4;
+
+    let mut peak = 0u8;
+    for row in 0..height {
+        let row_at = data_start.checked_add(row.checked_mul(row_size)?)?;
+        for col in 0..width {
+            let at = row_at + col * bytes_per_pixel;
+            let px = bytes.get(at..at + 3)?;
+            // BMP хранит цвет как синий, зелёный, красный.
+            let luma = (px[0] as u32 * 29 + px[1] as u32 * 150 + px[2] as u32 * 77) >> 8;
+            peak = peak.max(luma as u8);
+        }
+    }
+    Some(peak)
 }
 
 /// Видна ли камера в текущей сцене.
@@ -696,6 +780,8 @@ mod tests {
             }),
             twitch_connected: true,
             camera: None,
+            // Исправный эфир — это кадр, в котором что-то есть.
+            program_frame_peak: Some(200),
         }
     }
 
@@ -1140,5 +1226,83 @@ mod tests {
         let mut s = healthy();
         s.twitch_connected = false;
         assert!(summary(&evaluate(&s)).starts_with("Можно начинать"));
+    }
+}
+
+#[cfg(test)]
+mod frame_tests {
+    use super::*;
+
+    /// Собирает 24-битный BMP из заданных пикселей (синий, зелёный, красный).
+    fn bmp(width: usize, height: usize, pixels: &[(u8, u8, u8)]) -> Vec<u8> {
+        let row = (width * 3).div_ceil(4) * 4;
+        let start = 54usize;
+        let mut out = vec![0u8; start + row * height];
+        out[0..2].copy_from_slice(b"BM");
+        out[10..14].copy_from_slice(&(start as u32).to_le_bytes());
+        out[18..22].copy_from_slice(&(width as u32).to_le_bytes());
+        out[22..26].copy_from_slice(&(height as u32).to_le_bytes());
+        out[28..30].copy_from_slice(&24u16.to_le_bytes());
+        for (i, (b, g, r)) in pixels.iter().enumerate() {
+            let at = start + (i / width) * row + (i % width) * 3;
+            out[at] = *b;
+            out[at + 1] = *g;
+            out[at + 2] = *r;
+        }
+        out
+    }
+
+    #[test]
+    fn fully_black_frame_is_detected() {
+        let frame = bmp(2, 2, &[(0, 0, 0); 4]);
+        assert_eq!(bmp_peak_luma(&frame), Some(0));
+        assert!(matches!(
+            program_frame_check(bmp_peak_luma(&frame)).severity,
+            Severity::Critical
+        ));
+    }
+
+    #[test]
+    fn one_bright_pixel_saves_the_frame() {
+        // Тёмная сцена с единственным светлым пятном — это рабочий эфир,
+        // а не чёрный экран. Средняя яркость здесь обманула бы, максимум нет.
+        let mut px = vec![(0u8, 0u8, 0u8); 15];
+        px.push((255, 255, 255));
+        let frame = bmp(4, 4, &px);
+        assert_eq!(bmp_peak_luma(&frame), Some(255));
+        assert!(matches!(
+            program_frame_check(bmp_peak_luma(&frame)).severity,
+            Severity::Ok
+        ));
+    }
+
+    #[test]
+    fn faint_noise_still_counts_as_black() {
+        // Кодировщик даёт единицы яркости на пустом месте; сравнение с нулём
+        // объявило бы такой кадр исправным.
+        let frame = bmp(2, 2, &[(2, 2, 2); 4]);
+        let peak = bmp_peak_luma(&frame).expect("кадр разобран");
+        assert!(peak < BLACK_FRAME_PEAK, "яркость {peak}");
+    }
+
+    #[test]
+    fn colour_channels_are_weighted_like_brightness() {
+        // Зелёный ярче синего при той же величине: иначе зелёная заставка
+        // сошла бы за чёрный экран.
+        let green = bmp(1, 1, &[(0, 200, 0)]);
+        let blue = bmp(1, 1, &[(200, 0, 0)]);
+        assert!(bmp_peak_luma(&green) > bmp_peak_luma(&blue));
+    }
+
+    #[test]
+    fn garbage_is_reported_as_unknown_not_as_black() {
+        // Не BMP — это «проверить не удалось», а не «кадр чёрный».
+        for bad in [&b""[..], b"not a bitmap", &[0u8; 100][..]] {
+            assert_eq!(bmp_peak_luma(bad), None, "вход: {bad:?}");
+        }
+        assert!(matches!(
+            program_frame_check(None).severity,
+            Severity::Warning
+        ));
     }
 }
