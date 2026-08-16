@@ -61,6 +61,13 @@ struct AppState {
     session: Arc<RwLock<Option<StoredSession>>>,
     /// Одноразовый state для OAuth DonationAlerts (защита от подмены кода).
     oauth_state: Arc<RwLock<Option<String>>>,
+    /// Чем закончилась последняя попытка подключить DonationAlerts.
+    ///
+    /// Исход приходит на отдельную страницу обратного вызова, которую владелец
+    /// может и не увидеть — особенно незрячий, для которого посторонняя вкладка
+    /// браузера просто не существует. Держим его здесь, чтобы панель показала
+    /// причину отказа рядом с кнопкой подключения.
+    donationalerts_oauth_note: Arc<RwLock<Option<String>>>,
     login_guards: Arc<Mutex<HashMap<IpAddr, LoginGuard>>>,
     /// Последние измеренные уровни звука по источникам, dB.
     ///
@@ -281,6 +288,7 @@ async fn main() -> Result<()> {
         events: events.clone(),
         session: Arc::new(RwLock::new(load_session_secret()?)),
         oauth_state: Arc::new(RwLock::new(None)),
+        donationalerts_oauth_note: Arc::new(RwLock::new(None)),
         login_guards: Arc::new(Mutex::new(HashMap::new())),
         levels: Arc::new(RwLock::new(HashMap::new())),
         twitch_identity: Arc::new(RwLock::new(None)),

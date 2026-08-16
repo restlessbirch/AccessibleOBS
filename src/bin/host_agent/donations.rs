@@ -109,6 +109,9 @@ pub(crate) async fn donationalerts_status_value(st: &AppState) -> Value {
         });
     json!({
         "enabled": c.enabled,
+        // Исход последней попытки подключения. Без него панель могла сообщить
+        // только «OAuth не пройден», не сказав почему.
+        "oauth_last_result": st.donationalerts_oauth_note.read().await.clone(),
         "widget_url_configured": load_secret("donationalerts_widget_url").ok().flatten().is_some(),
         "oauth_configured": !c.client_id.is_empty() && !c.client_secret.is_empty(),
         "tokens_stored": load_secret("donationalerts_tokens").ok().flatten().is_some(),
@@ -790,23 +793,121 @@ pub(crate) async fn da_oauth_start(
     Ok(Json(json!({"authorize_url": url})))
 }
 
+/// Запоминает исход подключения и объявляет его панели.
+///
+/// Прежде любая неудача возвращалась строчкой в постороннюю вкладку браузера и
+/// нигде больше не появлялась: ни в логе, ни в панели. Для незрячего владельца
+/// это означало «нажал подключить — и ничего», причём без единой зацепки, что
+/// пошло не так. Теперь исход виден в трёх местах: в логе, в состоянии
+/// DonationAlerts и вслух через поток событий.
+async fn finish_oauth(st: &AppState, ok: bool, note: String) -> Response {
+    if ok {
+        info!("DonationAlerts OAuth: {note}");
+    } else {
+        warn!("DonationAlerts OAuth: {note}");
+    }
+    *st.donationalerts_oauth_note.write().await = Some(note.clone());
+    let _ = st.events.send(json!({
+        "type": "donationalerts_status",
+        "oauth_ok": ok,
+        "message": note.clone(),
+    }));
+    let title = if ok {
+        "DonationAlerts подключён"
+    } else {
+        "DonationAlerts: подключиться не удалось"
+    };
+    Html(format!(
+        "<!doctype html><html lang=\"ru\"><head><meta charset=\"utf-8\">\
+         <title>{title}</title></head><body><h1>{title}</h1>\
+         <p role=\"status\">{}</p>\
+         <p>Эту вкладку можно закрыть: то же сообщение показано в панели.</p>\
+         </body></html>",
+        html_escape_text(&note)
+    ))
+    .into_response()
+}
+
+fn html_escape_text(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+/// Короткая выжимка из ответа token endpoint для человека.
+///
+/// Тело берём целиком только при неудаче: при успехе там лежит access_token,
+/// которому не место ни в логе, ни на странице.
+fn token_error_detail(body: &str) -> String {
+    let parsed = serde_json::from_str::<Value>(body).unwrap_or(Value::Null);
+    for key in ["message", "error_description", "error"] {
+        if let Some(text) = parsed.get(key).and_then(Value::as_str)
+            && !text.trim().is_empty()
+        {
+            return text.trim().to_string();
+        }
+    }
+    let trimmed = body.trim();
+    if trimmed.is_empty() {
+        "пустой ответ".to_string()
+    } else {
+        trimmed.chars().take(300).collect()
+    }
+}
+
 pub(crate) async fn da_oauth_callback(
     State(st): State<AppState>,
     Query(q): Query<HashMap<String, String>>,
 ) -> Response {
+    // DonationAlerts сообщает об отказе не кодом, а параметрами error*.
+    // Прежде мы этого не замечали и жаловались на отсутствие code, пряча
+    // настоящую причину — например, неподходящий redirect_uri.
+    if let Some(error) = q.get("error") {
+        let detail = q
+            .get("error_description")
+            .map(String::as_str)
+            .unwrap_or(error.as_str());
+        return finish_oauth(
+            &st,
+            false,
+            format!("DonationAlerts отказал: {detail}. Проверьте, что Redirect URI в настройках приложения DonationAlerts совпадает с указанным в панели буква в букву."),
+        )
+        .await;
+    }
+
     let Some(code) = q.get("code") else {
-        return Html("DonationAlerts: в ответе нет authorization code.").into_response();
+        return finish_oauth(
+            &st,
+            false,
+            "В ответе нет authorization code. Начните подключение заново из панели.".to_string(),
+        )
+        .await;
     };
+
     // Проверка state: без неё кто угодно в tailnet мог бы подсунуть чужой код.
     let expected = st.oauth_state.write().await.take();
     match (expected, q.get("state")) {
         (Some(expected), Some(got)) if secret_eq(&expected, got) => {}
-        _ => {
-            warn!("DonationAlerts OAuth: неверный state, код отклонён");
-            return Html(
-                "DonationAlerts: проверка state не пройдена. Начните подключение заново из панели.",
+        (None, _) => {
+            return finish_oauth(
+                &st,
+                false,
+                "Ответ пришёл, но подключение не начиналось или уже было завершено. \
+                 Нажмите «Подключить DonationAlerts» и пройдите вход заново."
+                    .to_string(),
             )
-            .into_response();
+            .await;
+        }
+        _ => {
+            return finish_oauth(
+                &st,
+                false,
+                "Проверка state не пройдена: ответ не относится к начатому подключению. \
+                 Начните заново из панели."
+                    .to_string(),
+            )
+            .await;
         }
     }
 
@@ -818,26 +919,110 @@ pub(crate) async fn da_oauth_callback(
         ("redirect_uri", c.redirect_uri.as_str()),
         ("code", code.as_str()),
     ];
-    match st
+    let response = match st
         .http
         .post("https://www.donationalerts.com/oauth/token")
         .form(&form)
         .send()
         .await
     {
-        Ok(r) => match r.json::<Value>().await {
-            Ok(v) if v.get("access_token").is_some() => {
-                if save_secret("donationalerts_tokens", &v.to_string()).is_ok() {
-                    Html("DonationAlerts подключён. Можно закрыть эту вкладку.").into_response()
-                } else {
-                    Html("DonationAlerts: токен получен, но сохранить не удалось.").into_response()
-                }
-            }
-            Ok(_) => Html("DonationAlerts: token endpoint не вернул access_token.").into_response(),
-            Err(_) => {
-                Html("DonationAlerts: не удалось прочитать ответ token endpoint.").into_response()
-            }
-        },
-        Err(_) => Html("DonationAlerts: token endpoint недоступен.").into_response(),
+        Ok(r) => r,
+        Err(e) => {
+            return finish_oauth(
+                &st,
+                false,
+                format!("Сервер токенов DonationAlerts недоступен: {e}"),
+            )
+            .await;
+        }
+    };
+
+    let status = response.status();
+    let body = response.text().await.unwrap_or_default();
+    let parsed = serde_json::from_str::<Value>(&body).unwrap_or(Value::Null);
+
+    if parsed.get("access_token").is_none() {
+        // Именно здесь пряталась причина: DonationAlerts объясняет отказ в теле
+        // ответа, а прежний код это тело выбрасывал.
+        return finish_oauth(
+            &st,
+            false,
+            format!(
+                "DonationAlerts вернул {} и не выдал токен: {}",
+                status.as_u16(),
+                token_error_detail(&body)
+            ),
+        )
+        .await;
+    }
+
+    match save_secret("donationalerts_tokens", &parsed.to_string()) {
+        Ok(()) => {
+            finish_oauth(
+                &st,
+                true,
+                "Подключение выполнено, токен сохранён.".to_string(),
+            )
+            .await
+        }
+        Err(e) => {
+            finish_oauth(
+                &st,
+                false,
+                format!("Токен получен, но сохранить не удалось: {e}"),
+            )
+            .await
+        }
+    }
+}
+
+#[cfg(test)]
+mod oauth_tests {
+    use super::*;
+
+    #[test]
+    fn error_message_is_taken_from_the_response() {
+        // Ровно то, что прячет обычный отказ DonationAlerts.
+        assert_eq!(
+            token_error_detail(
+                r#"{"error":"invalid_client","message":"Client authentication failed"}"#
+            ),
+            "Client authentication failed"
+        );
+        assert_eq!(
+            token_error_detail(r#"{"error_description":"Redirect URI mismatch"}"#),
+            "Redirect URI mismatch"
+        );
+        // Когда описания нет, годится и краткий код ошибки.
+        assert_eq!(
+            token_error_detail(r#"{"error":"invalid_grant"}"#),
+            "invalid_grant"
+        );
+    }
+
+    #[test]
+    fn non_json_and_empty_bodies_still_say_something() {
+        // Прокси или страница-заглушка вместо JSON не должны оставлять
+        // владельца с пустым сообщением.
+        assert_eq!(token_error_detail("  "), "пустой ответ");
+        assert_eq!(
+            token_error_detail("<html>502 Bad Gateway</html>"),
+            "<html>502 Bad Gateway</html>"
+        );
+    }
+
+    #[test]
+    fn long_bodies_are_cut_to_stay_readable() {
+        let detail = token_error_detail(&"x".repeat(5000));
+        assert_eq!(detail.chars().count(), 300);
+    }
+
+    #[test]
+    fn markup_in_the_message_cannot_reach_the_page_as_markup() {
+        // Текст ответа приходит из сети и попадает на страницу обратного вызова.
+        assert_eq!(
+            html_escape_text("<script>alert(1)</script>"),
+            "&lt;script&gt;alert(1)&lt;/script&gt;"
+        );
     }
 }

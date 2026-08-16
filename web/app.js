@@ -352,6 +352,13 @@ function handleEvent(msg) {
       addDonation(msg.donation, true);
       break;
     case 'donationalerts_status':
+      // Исход подключения приходит сюда с самой страницы обратного вызова.
+      // Объявляем настойчиво: незрячий владелец до этого узнавал об отказе
+      // только по тому, что ничего не произошло.
+      if (msg.message) {
+        announce(msg.message);
+        journal('DonationAlerts: ' + msg.message, msg.oauth_ok ? 'ok' : 'bad');
+      }
       schedule('da', refreshDa);
       break;
   }
@@ -1728,6 +1735,10 @@ async function refreshDa() {
       'Лента донатов': da.realtime?.connected
         ? 'подключена'
         : (da.tokens_stored ? (da.realtime?.error || 'подключаюсь…') : 'OAuth не пройден'),
+      // Причина отказа приходит на отдельную страницу обратного вызова, которую
+      // владелец может не увидеть вовсе. Без неё панель говорила «OAuth не
+      // пройден» и умолкала, не подсказав, что именно исправлять.
+      ...(da.oauth_last_result ? { 'Последняя попытка подключения': da.oauth_last_result } : {}),
     });
     updateActionButtons();
     return da;
