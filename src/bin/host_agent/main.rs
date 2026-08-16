@@ -354,6 +354,7 @@ async fn main() -> Result<()> {
         .route("/api/obs/input-kinds", get(obs_input_kinds))
         .route("/api/obs/sources", get(obs_sources).post(obs_source_create))
         .route("/api/obs/source/properties", post(obs_source_properties))
+        .route("/api/obs/source/property-items", get(obs_property_items))
         .route("/api/obs/source/remove", post(obs_source_remove))
         .route("/api/obs/scene/remove", post(obs_scene_remove))
         .route(
@@ -1689,6 +1690,112 @@ async fn obs_source_properties(
             }))
         })
         .map_err(|e| err("OBS не смог открыть окно свойств источника", e))
+}
+
+/// Свойства источника, значения которых OBS выдаёт готовым списком.
+///
+/// Перечень закрытый и по видам входов: спрашивать OBS обо всех подряд ключах
+/// бессмысленно, списковых свойств среди них единицы.
+///
+/// Ради этого списка всё и затевалось. Выбрать монитор, камеру или окно можно
+/// только из того, что предлагает система, а угадать эти значения руками
+/// нельзя: идентификатор монитора выглядит как `\\.\DISPLAY1`, а устройства —
+/// как строка из фигурных скобок. Живой случай: захват монитора отдавал
+/// черноту ровно потому, что монитор в нём не был выбран, а выбрать его из
+/// панели было нечем.
+const LIST_PROPERTIES: &[(&str, &[&str])] = &[
+    ("monitor_capture", &["monitor_id", "monitor"]),
+    ("window_capture", &["window"]),
+    ("game_capture", &["window", "capture_mode"]),
+    (
+        "dshow_input",
+        &["video_device_id", "audio_device_id", "res_type"],
+    ),
+    ("wasapi_input_capture", &["device_id"]),
+    ("wasapi_output_capture", &["device_id"]),
+    ("wasapi_process_output_capture", &["window"]),
+];
+
+/// Перечень допустимых значений для свойств выбранного источника.
+///
+/// Ответ склеиваем сами, а не отдаём сырой OBS: панель не должна знать, какие
+/// свойства у какого вида входа спрашивать.
+async fn obs_property_items(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<HashMap<String, String>>,
+) -> ApiResult<Value> {
+    require_auth(&st, &headers).await?;
+    let source = q
+        .get("source")
+        .map(String::as_str)
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .ok_or_else(|| bad("source обязателен"))?;
+
+    let kind = existing_input_kind(&st.obs, source)
+        .await
+        .map_err(|e| err("Не удалось определить вид источника", e))?
+        .unwrap_or_default();
+    let wanted = LIST_PROPERTIES
+        .iter()
+        .find(|(k, _)| *k == kind)
+        .map(|(_, props)| *props)
+        .unwrap_or(&[]);
+
+    let mut out = serde_json::Map::new();
+    for property in wanted {
+        // Свойство может отсутствовать в этой сборке OBS — тогда просто
+        // пропускаем его, а не выдаём ошибку на весь запрос.
+        let Ok(value) = st
+            .obs
+            .request(
+                "GetInputPropertiesListPropertyItems",
+                json!({"inputName": source, "propertyName": property}),
+            )
+            .await
+        else {
+            continue;
+        };
+        // Список читает экранный диктор, поэтому чистим его здесь, а не в
+        // панели: OBS отдаёт как есть, и в захвате окон это два десятка
+        // одинаковых строк подряд плюс пустая. Проговаривать «Spotify Widget»
+        // семнадцать раз — значит сделать список бесполезным.
+        let mut seen = HashSet::new();
+        let items: Vec<Value> = value
+            .get("propertyItems")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter(|item| item.get("itemEnabled").and_then(Value::as_bool) != Some(false))
+            .filter_map(|item| {
+                let name = item
+                    .get("itemName")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .trim();
+                let value = item.get("itemValue").cloned().unwrap_or(Value::Null);
+                let key = value.as_str().unwrap_or("").to_string();
+                // Пункт без имени и без значения выбрать нельзя, а диктор
+                // прочитает его как пустоту и собьёт человека.
+                if name.is_empty() && key.is_empty() {
+                    return None;
+                }
+                if !seen.insert(format!("{name}\u{0}{key}")) {
+                    return None;
+                }
+                Some(json!({ "name": name, "value": value }))
+            })
+            .collect();
+        if !items.is_empty() {
+            out.insert((*property).to_string(), Value::Array(items));
+        }
+    }
+
+    Ok(Json(json!({
+        "inputKind": kind,
+        "properties": Value::Object(out),
+    })))
 }
 
 async fn obs_source_settings(

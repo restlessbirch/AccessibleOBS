@@ -1026,10 +1026,84 @@ function renderSourceSettings(sourceName, inputKind) {
       class: 'hint',
       text: `Реальные настройки OBS для ${inputKindLabel(cached.inputKind || inputKind)}. Поля совпадают с тем, что OBS отдаёт через WebSocket.`,
     }),
+    ...renderPropertyChoosers(sourceName, cached),
     el('label', { htmlFor: textareaId, text: 'inputSettings JSON' }),
     textarea,
     el('button', { type: 'submit', text: 'Сохранить настройки в OBS' }),
   ]);
+}
+
+/// Человеческие названия для свойств, которые OBS отдаёт готовым списком.
+const PROPERTY_LABELS = {
+  monitor_id: 'Монитор',
+  monitor: 'Монитор (номер)',
+  window: 'Окно',
+  capture_mode: 'Режим захвата',
+  video_device_id: 'Камера',
+  audio_device_id: 'Микрофон',
+  device_id: 'Звуковое устройство',
+  res_type: 'Разрешение',
+};
+
+/// Списки выбора для тех свойств, где значение нельзя придумать.
+///
+/// Идентификатор монитора выглядит как `\\.\DISPLAY1`, устройства — как строка
+/// из фигурных скобок. Вписать такое в JSON вслепую невозможно, а без этого
+/// источник молча отдаёт пустоту: захват монитора, которому не выбрали монитор,
+/// показывает чёрный экран и никак об этом не сообщает.
+function renderPropertyChoosers(sourceName, cached) {
+  const options = cached.propertyItems;
+  if (!options) {
+    return [el('p', { class: 'hint', text: 'Загружаю списки выбора из OBS…' })];
+  }
+  const names = Object.keys(options);
+  if (names.length === 0) return [];
+
+  return names.map((property) => {
+    const current = cached.inputSettings?.[property];
+    const id = settingsTextareaId(sourceName + ':' + property);
+    const select = el('select', { id });
+    // Если OBS ещё не знает выбранного значения, показываем это явно, а не
+    // подсовываем молча первый пункт списка.
+    const known = options[property].some((o) => String(o.value) === String(current));
+    if (!known) {
+      select.append(el('option', {
+        value: '',
+        text: current === undefined ? '— не выбрано —' : `— сейчас: ${current} —`,
+        selected: true,
+      }));
+    }
+    for (const option of options[property]) {
+      select.append(el('option', {
+        value: String(option.value),
+        text: option.name,
+        selected: String(option.value) === String(current),
+      }));
+    }
+    select.addEventListener('change', () => {
+      if (select.value === '') return;
+      const chosen = options[property].find((o) => String(o.value) === select.value);
+      applySourceProperty(sourceName, property, chosen ? chosen.value : select.value);
+    });
+    return el('div', { class: 'field' }, [
+      el('label', { htmlFor: id, text: PROPERTY_LABELS[property] || property }),
+      select,
+    ]);
+  });
+}
+
+/// Применяет выбранное значение сразу, не дожидаясь правки JSON.
+async function applySourceProperty(sourceName, property, value) {
+  try {
+    await post('/api/obs/source/settings', {
+      sourceName,
+      inputSettings: { [property]: value },
+    });
+    say(`${PROPERTY_LABELS[property] || property}: выбрано`);
+    await loadSourceSettings(sourceName);
+  } catch (e) {
+    fail(e);
+  }
 }
 
 async function refreshSources() {
@@ -1062,6 +1136,20 @@ async function refreshSources() {
                 ? 'Скрыть настройки в панели'
                 : 'Настройки источника в панели',
               () => toggleSourceSettings(name),
+              'quiet',
+            ),
+            // Родное окно свойств OBS. Функция для него была написана, но
+            // кнопки к ней не существовало, и возможность просто не
+            // существовала для пользователя.
+            //
+            // Окно открывается на компьютере актёра, а не у оператора: это
+            // окно самого OBS, и по сети его не покажешь. Незрячему оператору
+            // оно бесполезно — у окна OBS нет дерева доступности, — зато
+            // выручает, когда рядом есть зрячий и надо выбрать из списка то,
+            // чего в панели нет: монитор, устройство, окно для захвата.
+            button(
+              'Открыть окно свойств в OBS у актёра',
+              () => openSourceProperties(name),
               'quiet',
             ),
             name === lastCreatedSourceName
@@ -1138,9 +1226,17 @@ async function toggleSourceSettings(sourceName) {
 async function loadSourceSettings(sourceName) {
   try {
     const data = await api('/api/obs/source/settings?source=' + encodeURIComponent(sourceName));
+    // Списки выбора запрашиваем отдельно и молча переживаем их отсутствие:
+    // они полезны, но без них настройки всё равно можно править как JSON.
+    let propertyItems = {};
+    try {
+      const items = await api('/api/obs/source/property-items?source=' + encodeURIComponent(sourceName));
+      propertyItems = items.properties || {};
+    } catch { /* оставляем пустым */ }
     sourceSettingsCache.set(settingsCacheKey(sourceName), {
       inputKind: data.inputKind,
       inputSettings: data.inputSettings || {},
+      propertyItems,
     });
     await refreshSources();
   } catch (e) {
