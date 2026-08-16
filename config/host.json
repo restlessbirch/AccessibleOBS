@@ -25,7 +25,6 @@
     "browser_height": "obs_canvas",
     "reroute_audio": true,
     "initial_volume_db": -8.0,
-    "monitoring": "off",
     "oauth_enabled": true,
     "oauth_scopes": ["oauth-user-show", "oauth-donation-subscribe", "oauth-donation-index"],
     "announce_new_donations_to_nvda": false

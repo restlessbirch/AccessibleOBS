@@ -1724,6 +1724,9 @@ async function refreshDa() {
     renderDl($('daStatus'), {
       'Виджет настроен': da.widget_url_configured ? 'да' : 'нет',
       'Звук ведётся в OBS': da.widget_url_configured ? 'да' : 'нет',
+      'Слышите ли донаты вы': da.heard_by_owner === null || da.heard_by_owner === undefined
+        ? 'неизвестно'
+        : (da.heard_by_owner ? 'да' : 'нет, только зрители'),
       'Звук виджета': daWidgetMuted === null
         ? 'неизвестно'
         : (daWidgetMuted ? 'выключен' : 'включён'),

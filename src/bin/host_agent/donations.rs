@@ -107,11 +107,30 @@ pub(crate) async fn donationalerts_status_value(st: &AppState) -> Value {
                 .map(mul_to_db)
                 .map(|db| json!(db))
         });
+    // Слышит ли донаты сам владелец. Спрашиваем OBS, а не берём из настройки:
+    // настройку могли поменять после последнего применения, и тогда панель
+    // сообщала бы желаемое вместо действительного.
+    let heard_by_owner = st
+        .obs
+        .request(
+            "GetInputAudioMonitorType",
+            json!({"inputName": c.input_name}),
+        )
+        .await
+        .ok()
+        .and_then(|v| {
+            v.get("monitorType")
+                .and_then(Value::as_str)
+                .map(|t| t.contains("MONITOR"))
+        });
     json!({
         "enabled": c.enabled,
         // Исход последней попытки подключения. Без него панель могла сообщить
         // только «OAuth не пройден», не сказав почему.
         "oauth_last_result": st.donationalerts_oauth_note.read().await.clone(),
+        // Незрячий владелец не видит алерт на экране, и звук — единственный
+        // способ узнать о донате. Он обязан видеть, включён этот звук или нет.
+        "heard_by_owner": heard_by_owner,
         "widget_url_configured": load_secret("donationalerts_widget_url").ok().flatten().is_some(),
         "oauth_configured": !c.client_id.is_empty() && !c.client_secret.is_empty(),
         "tokens_stored": load_secret("donationalerts_tokens").ok().flatten().is_some(),
@@ -229,6 +248,26 @@ pub(crate) async fn da_widget_volume(
         .await
         .map(Json)
         .map_err(|e| err("Не удалось изменить громкость DonationAlerts", e))
+}
+
+/// Как OBS должен выводить звук алертов, по настройке `monitoring`.
+///
+/// «Слышит актёр» и «слышат зрители» — независимые вещи, и OBS различает три
+/// сочетания. Понимаем и человеческие написания, и сами имена OBS: значение
+/// правят руками в host.json, и спотыкаться об регистр или синоним не должно.
+///
+/// Неизвестное значение трактуем как «слышно всем»: молча оставить незрячего
+/// владельца без звука — худший из возможных исходов опечатки.
+pub(crate) fn monitor_type(setting: &str) -> &'static str {
+    match setting.trim().to_ascii_lowercase().as_str() {
+        // Только в эфир: актёр не слышит ничего.
+        "off" | "none" | "output" | "obs_monitoring_type_none" => "OBS_MONITORING_TYPE_NONE",
+        // Только актёру, мимо эфира. Нужно при отладке звука.
+        "monitor" | "monitor_only" | "obs_monitoring_type_monitor_only" => {
+            "OBS_MONITORING_TYPE_MONITOR_ONLY"
+        }
+        _ => "OBS_MONITORING_TYPE_MONITOR_AND_OUTPUT",
+    }
 }
 
 /// Приводит OBS к состоянию, в котором донаты видны и слышны в эфире:
@@ -356,10 +395,15 @@ pub(crate) async fn reconcile_donationalerts(st: &AppState) -> Result<Value> {
             "SetInputVolume",
             json!({"inputName": cfg.input_name, "inputVolumeMul": db_to_mul(cfg.initial_volume_db)}),
         ),
-        // Мониторинг выключаем: иначе актёр слышит алерт в наушниках дважды.
+        // Мониторинг берём из настройки, а не выключаем жёстко.
+        //
+        // Раньше здесь всегда стоял NONE, и поле `monitoring` в host.json
+        // ничего не делало. Хуже того, выбор был неверным для тех, ради кого
+        // программа написана: зрячий стример видит алерт на экране, а незрячий
+        // не видит ничего, и звук — его единственный способ узнать о донате.
         BatchItem::new(
             "SetInputAudioMonitorType",
-            json!({"inputName": cfg.input_name, "monitorType": "OBS_MONITORING_TYPE_NONE"}),
+            json!({"inputName": cfg.input_name, "monitorType": monitor_type(&cfg.monitoring)}),
         ),
     ])
     .await
@@ -1024,5 +1068,45 @@ mod oauth_tests {
             html_escape_text("<script>alert(1)</script>"),
             "&lt;script&gt;alert(1)&lt;/script&gt;"
         );
+    }
+}
+
+#[cfg(test)]
+mod monitoring_tests {
+    use super::*;
+
+    #[test]
+    fn owner_hears_donations_by_default() {
+        // Пустая или незнакомая настройка не должна оставлять незрячего
+        // владельца без звука: это худший исход опечатки.
+        for value in ["", "both", "on", "yes", "чепуха", "MONITOR_AND_OUTPUT"] {
+            assert_eq!(
+                monitor_type(value),
+                "OBS_MONITORING_TYPE_MONITOR_AND_OUTPUT",
+                "значение: {value:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn silence_for_the_owner_must_be_asked_for_explicitly() {
+        for value in ["off", "none", "OFF", " None ", "output"] {
+            assert_eq!(
+                monitor_type(value),
+                "OBS_MONITORING_TYPE_NONE",
+                "значение: {value:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn monitor_only_keeps_alerts_out_of_the_stream() {
+        for value in ["monitor", "monitor_only", "Monitor_Only"] {
+            assert_eq!(
+                monitor_type(value),
+                "OBS_MONITORING_TYPE_MONITOR_ONLY",
+                "значение: {value:?}"
+            );
+        }
     }
 }
