@@ -341,6 +341,7 @@ async fn main() -> Result<()> {
     let app = Router::new()
         .route("/api/public/ping", get(public_ping))
         .route("/api/runtime", get(runtime_info))
+        .route("/api/language", post(set_language))
         .route("/api/client-error", post(client_error))
         .route("/api/diagnostics", get(diagnostics))
         .route("/api/auth/status", get(auth_status))
@@ -783,7 +784,33 @@ async fn runtime_info(State(st): State<AppState>) -> Json<Value> {
         "tailscale_required": !local && st.cfg.listen_mode == "tailscale_only",
         "interface_mode": interface_mode,
         "accessible": interface_mode == InterfaceMode::Accessible,
+        "language": current_language(&st),
     }))
+}
+
+/// Язык панели — с диска, по той же причине, что и режим интерфейса: его
+/// меняют, пока агент уже работает.
+fn current_language(st: &AppState) -> String {
+    load_host_config()
+        .map(|cfg| normalize_language(&cfg.language).to_string())
+        .unwrap_or_else(|_| normalize_language(&st.cfg.language).to_string())
+}
+
+/// Меняет язык панели.
+async fn set_language(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> ApiResult<Value> {
+    require_auth(&st, &headers).await?;
+    let wanted = body
+        .get("language")
+        .and_then(Value::as_str)
+        .ok_or_else(|| bad("language обязателен"))?;
+    let language = normalize_language(wanted).to_string();
+    save_host_config_update(|cfg| cfg.language = language.clone())
+        .map_err(|e| err("Не удалось сохранить язык", e))?;
+    Ok(Json(json!({"ok": true, "language": language})))
 }
 
 /// Живой поток событий: OBS, статус соединения, донаты.
@@ -981,6 +1008,7 @@ async fn actor_display_state(
             "mode": if st.cfg.runtime_mode == RuntimeMode::Local { "local" } else { "remote" },
             // Экран актёра зачитывает чат вслух только в доступном режиме.
             "accessible": current_interface_mode(&st) == InterfaceMode::Accessible,
+            "language": current_language(&st),
         },
         "twitch": {
             "connected": twitch_login.is_some(),

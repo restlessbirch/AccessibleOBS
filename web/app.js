@@ -54,7 +54,9 @@ function el(tag, props = {}, children = []) {
   const node = document.createElement(tag);
   for (const [key, value] of Object.entries(props)) {
     if (value === null || value === undefined) continue;
-    if (key === 'text') node.textContent = String(value);
+    // Перевод здесь, а не в каждом из сотен мест создания узлов. Панель почти
+    // весь свой текст рисует через el(), поэтому одной точки достаточно.
+    if (key === 'text') node.textContent = t(String(value));
     else if (key === 'onClick') node.addEventListener('click', value);
     else if (key in node) node[key] = value;
     else node.setAttribute(key, String(value));
@@ -77,7 +79,7 @@ function stateActionButton(active, activeText, inactiveText, onClick, variant) {
 }
 
 function setStateAction(node, active, activeText, inactiveText, variant) {
-  node.textContent = active ? activeText : inactiveText;
+  node.textContent = t(active ? activeText : inactiveText);
   node.dataset.toggleState = active ? 'active' : 'inactive';
   node.setAttribute('aria-pressed', String(active));
   if (variant) node.dataset.variant = variant;
@@ -124,9 +126,10 @@ function setupCollapsibleSections() {
 /// Поэтому сначала очищаем область, а текст кладём следующим кадром — так
 /// изменений всегда два, и второе диктор объявляет.
 function liveSpeak(node, text) {
+  const spoken = t(text);
   node.textContent = '';
   requestAnimationFrame(() => {
-    node.textContent = text;
+    node.textContent = spoken;
   });
 }
 
@@ -224,6 +227,17 @@ async function loadRuntime() {
 }
 
 function applyRuntimeUi() {
+  // Язык применяем первым: остальная разметка ниже уже должна переводиться.
+  setLanguage(runtime.language || 'ru');
+  translateDom(document.body);
+  const picker = $('uiLanguage');
+  if (picker) {
+    picker.value = currentLanguage();
+    if (!picker.dataset.bound) {
+      picker.dataset.bound = '1';
+      picker.addEventListener('change', () => changeLanguage(picker.value));
+    }
+  }
   document.body.dataset.runtimeMode = runtime.mode;
   document.body.dataset.interfaceMode = isAccessibleMode() ? 'accessible' : 'standard';
 
@@ -236,18 +250,35 @@ function applyRuntimeUi() {
   if (isAccessibleMode()) {
     const note = $('projectorNote');
     if (note) {
-      note.textContent = 'Вывод на второй монитор скрыт: в доступном режиме '
+      note.textContent = t('Вывод на второй монитор скрыт: в доступном режиме '
         + 'чат и донаты зачитываются вслух, а окно проектора OBS экранный '
-        + 'диктор прочитать не может. Переключить режим можно на начальной странице.';
+        + 'диктор прочитать не может. Переключить режим можно на начальной странице.');
       note.hidden = false;
     }
   }
   if (!isLocalRuntime()) return;
 
-  $('appSubtitle').textContent = 'Локальная панель управления OBS, эфиром, записью, Twitch и DonationAlerts на этом компьютере.';
-  $('loginIntro').textContent = 'Локальный режим уже авторизован на этом компьютере. Pairing-код не нужен.';
+  // Через t(): текст ставится прямо в узел, минуя el(), и без этого остался бы
+  // русским при английском интерфейсе.
+  $('appSubtitle').textContent = t('Локальная панель управления OBS, эфиром, записью, Twitch и DonationAlerts на этом компьютере.');
+  $('loginIntro').textContent = t('Локальный режим уже авторизован на этом компьютере. Pairing-код не нужен.');
   $('pairingSecret').required = false;
   $('logout').hidden = true;
+}
+
+/// Переключает язык и перезагружает страницу.
+///
+/// Перезагрузка, а не перерисовка на месте: часть текста уже разошлась по
+/// живым областям и разделам, собранным раньше, и переводить их задним числом
+/// значило бы гоняться за каждым таким местом. Страница лёгкая, а выбор языка
+/// делают редко.
+async function changeLanguage(lang) {
+  try {
+    await post('/api/language', { language: lang });
+    window.location.reload();
+  } catch (e) {
+    fail(e);
+  }
 }
 
 // ---------------------------------------------------------------- вход
@@ -457,7 +488,7 @@ function handleObsEvent(type, data) {
 
 function setState(node, state, text) {
   node.dataset.state = state;
-  node.textContent = text;
+  node.textContent = t(text);
 }
 
 function renderObsState(status) {
@@ -1369,7 +1400,9 @@ function handleLevels(levels) {
   for (const [name, db] of Object.entries(levels || {})) {
     lastLevels.set(name, db);
     const node = levelNodes.get(name);
-    if (node) node.textContent = levelText(db);
+    // Уровень обновляется четыре раза в секунду прямой записью в узел, поэтому
+    // перевод нужен здесь: через el() эта строка не проходит.
+    if (node) node.textContent = t(levelText(db));
   }
 
   // Тишину сторожим только у микрофона.
@@ -1484,7 +1517,9 @@ async function refreshAudio() {
                 ? `В этой сцене: ${sceneEnabled ? 'включён' : 'выключен'}. Громкость: ${db.toFixed(1)} dB.`
                 : `Звук: ${a.muted ? 'выключен' : 'включён'}. Громкость: ${db.toFixed(1)} dB.`,
             }),
-            el('p', { class: 'hint' }, [document.createTextNode('Уровень: '), level]),
+            // Через t(): узел собран напрямую, минуя el({text}), и без этого
+            // подпись осталась бы русской при английском интерфейсе.
+            el('p', { class: 'hint' }, [document.createTextNode(t('Уровень: ')), level]),
             button('Проверить звук', () => announceLevel(name), 'quiet'),
             inScene
               ? stateActionButton(
@@ -2005,9 +2040,9 @@ function twitchRegistrationBody() {
 function updateTwitchConnectButton() {
   const fieldClientId = $('twitchClientId').value.trim();
   const hasClientId = Boolean(fieldClientId || savedTwitchClientId);
-  $('twitchStart').textContent = fieldClientId && fieldClientId !== savedTwitchClientId
+  $('twitchStart').textContent = t(fieldClientId && fieldClientId !== savedTwitchClientId
     ? 'Подключить Twitch (сохранит Client ID)'
-    : 'Подключить Twitch';
+    : 'Подключить Twitch');
   $('twitchStart').dataset.toggleState = hasClientId ? 'active' : 'unknown';
 }
 

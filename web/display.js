@@ -37,7 +37,7 @@ function el(tag, props = {}, children = []) {
   const node = document.createElement(tag);
   for (const [key, value] of Object.entries(props)) {
     if (value === null || value === undefined) continue;
-    if (key === 'text') node.textContent = String(value);
+    if (key === 'text') node.textContent = t(String(value));
     else if (key === 'onClick') node.addEventListener('click', value);
     else if (key in node) node[key] = value;
     else node.setAttribute(key, String(value));
@@ -53,11 +53,11 @@ function replace(container, nodes) {
 }
 
 function say(text) {
-  $('live').textContent = text;
+  $('live').textContent = t(text);
 }
 
 function announce(text) {
-  $('alerts').textContent = text;
+  $('alerts').textContent = t(text);
 }
 
 async function api(path) {
@@ -157,19 +157,25 @@ function renderDonations(donations) {
 }
 
 function renderDonationState(da) {
-  const realtime = da?.realtime?.connected ? 'лента подключена' : 'лента не подключена';
-  const widget = da?.widget_url_configured ? 'виджет настроен' : 'виджет не настроен';
+  // Переводим части, а не готовую строку: сочетаний четыре, и держать их все
+  // в словаре значило бы дублировать одно и то же четырежды.
+  const realtime = t(da?.realtime?.connected ? 'лента подключена' : 'лента не подключена');
+  const widget = t(da?.widget_url_configured ? 'виджет настроен' : 'виджет не настроен');
   $('donationState').textContent = `${widget}; ${realtime}`;
 }
 
 async function refreshDisplay() {
   try {
     const state = await api('/api/actor-display/state');
+    // Язык приходит от агента: у экрана актёра нет своей настройки, и
+    // расходиться с панелью он не должен.
+    setLanguage(state.runtime?.language || 'ru');
+    translateDom(document.body);
     accessible = state.runtime?.accessible !== false;
     renderChat(state.twitch || {});
     renderDonationState(state.donationalerts || {});
     renderDonations(state.donations || []);
-    $('displayStatus').textContent = 'Экран актёра активен.';
+    $('displayStatus').textContent = t('Экран актёра активен.');
     say('Экран актёра обновлён');
   } catch (e) {
     $('displayStatus').textContent = e.message;
@@ -207,7 +213,7 @@ function openEvents() {
     }
   };
   events.onopen = () => {
-    $('displayStatus').textContent = 'Экран актёра активен.';
+    $('displayStatus').textContent = t('Экран актёра активен.');
     if (linkLost) {
       linkLost = false;
       // За время обрыва могли прийти донаты, о которых мы не узнали.

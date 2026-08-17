@@ -94,6 +94,7 @@ $items = @(
   "START_ME.bat",
   "START_LOCAL.bat",
   "README.md",
+  "README.ru.md",
   "SECURITY.md",
   "LICENSE",
   "THIRD_PARTY_NOTICES.txt"

@@ -60,12 +60,36 @@ fn default_interface_mode() -> InterfaceMode {
     InterfaceMode::Accessible
 }
 
+/// По умолчанию русский: интерфейс писался на нём, и переведено пока не всё.
+/// Незнакомая строка остаётся русской, так что для русского выбор без потерь.
+fn default_language() -> String {
+    "ru".into()
+}
+
+/// Приводит язык к одному из поддерживаемых.
+///
+/// Незнакомое значение — русский, а не отказ: язык правят руками в host.json,
+/// и опечатка не должна оставлять человека без интерфейса.
+pub fn normalize_language(value: &str) -> &'static str {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "en" | "english" => "en",
+        _ => "ru",
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HostConfig {
     #[serde(default = "default_runtime_mode")]
     pub runtime_mode: RuntimeMode,
     #[serde(default = "default_interface_mode")]
     pub interface_mode: InterfaceMode,
+    /// Язык веб-панели: "ru" или "en".
+    ///
+    /// Хранится у агента, а не в браузере, потому что панель открывают с
+    /// разных машин и вкладок, а экран актёра — вообще отдельная страница.
+    /// Выбор, живущий в localStorage, разъезжался бы между ними.
+    #[serde(default = "default_language")]
+    pub language: String,
     #[serde(default)]
     pub obs_path: String,
     #[serde(default = "default_obs_host")]
@@ -291,6 +315,7 @@ impl Default for HostConfig {
         Self {
             runtime_mode: default_runtime_mode(),
             interface_mode: default_interface_mode(),
+            language: default_language(),
             obs_path: String::new(),
             obs_websocket_host: default_obs_host(),
             obs_websocket_port: 4455,

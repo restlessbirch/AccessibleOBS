@@ -1,5 +1,7 @@
 {
   "runtime_mode": "remote",
+  "interface_mode": "accessible",
+  "language": "ru",
   "obs_path": "",
   "obs_websocket_host": "127.0.0.1",
   "obs_websocket_port": 4455,
@@ -11,7 +13,9 @@
   "twitch": {
     "enabled": true,
     "client_id": "",
-    "scopes": ["channel:manage:broadcast"]
+    "scopes": [
+      "channel:manage:broadcast"
+    ]
   },
   "donationalerts": {
     "enabled": true,
@@ -25,8 +29,13 @@
     "browser_height": "obs_canvas",
     "reroute_audio": true,
     "initial_volume_db": -8.0,
+    "monitoring": "both",
     "oauth_enabled": true,
-    "oauth_scopes": ["oauth-user-show", "oauth-donation-subscribe", "oauth-donation-index"],
+    "oauth_scopes": [
+      "oauth-user-show",
+      "oauth-donation-subscribe",
+      "oauth-donation-index"
+    ],
     "announce_new_donations_to_nvda": false
   }
 }

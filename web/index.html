@@ -33,6 +33,13 @@
     <div id="panel" hidden>
       <section class="card">
         <h2 id="panelStart" tabindex="-1">Состояние</h2>
+        <div class="field">
+          <label for="uiLanguage">Язык панели</label>
+          <select id="uiLanguage">
+            <option value="ru">Русский</option>
+            <option value="en">Английский</option>
+          </select>
+        </div>
         <div class="toolbar">
           <div>
             <span class="state" id="freshness" data-state="warn">Данные ещё не загружены</span>
@@ -342,6 +349,7 @@
     </div>
   </main>
 
+  <script src="i18n.js"></script>
   <script src="app.js"></script>
 </body>
 </html>
