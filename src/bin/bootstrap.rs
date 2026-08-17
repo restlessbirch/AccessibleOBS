@@ -10,8 +10,9 @@
 use accessible_obs::*;
 use anyhow::{Context, Result, anyhow};
 use axum::{
-    Router,
+    Form, Router,
     extract::State,
+    http::HeaderMap,
     response::{Html, IntoResponse},
     routing::{get, post},
 };
@@ -88,6 +89,9 @@ async fn launcher_flow() -> Result<()> {
 
     let state = LauncherState {
         exe: Arc::new(launcher_exe()),
+        // Новый на каждый запуск: страница, оставшаяся в чужой вкладке с
+        // прошлого раза, действовать уже не сможет.
+        nonce: Arc::new(random_secret_b64(24)),
     };
     let app = Router::new()
         .route("/", get(launcher_page))
@@ -110,6 +114,47 @@ async fn launcher_flow() -> Result<()> {
 #[derive(Clone)]
 struct LauncherState {
     exe: Arc<PathBuf>,
+    /// Одноразовый пароль страницы, выдаваемый только ей самой.
+    ///
+    /// Начальная страница умеет запускать программы и снимать автозапуск, и до сих пор
+    /// принимала POST от кого угодно. Чужой открытой вкладке даже не нужно
+    /// читать ответ: обычной html-формы хватает, чтобы отправить запрос на
+    /// localhost, пока страница запущена. Проверки Origin мало — она не спасёт,
+    /// если страницу встроят фреймом, поэтому вместе с ней требуем значение,
+    /// которое чужой странице взять неоткуда.
+    nonce: Arc<String>,
+}
+
+/// Поля, приходящие с любой формы начальной страницы.
+#[derive(serde::Deserialize)]
+struct LauncherForm {
+    nonce: String,
+}
+
+/// Пускать ли действие: и происхождение своё, и пароль страницы совпал.
+fn launcher_allowed(st: &LauncherState, headers: &HeaderMap, form: &LauncherForm) -> bool {
+    let origin = headers.get("origin").and_then(|v| v.to_str().ok());
+    let host = headers.get("host").and_then(|v| v.to_str().ok());
+    let from_us = match origin {
+        Some(origin) => loopback_request_ok(Some(origin), None),
+        None => loopback_request_ok(None, host),
+    };
+    from_us && secret_eq(&form.nonce, &st.nonce)
+}
+
+/// Сравнение за постоянное время: обычное сравнение выходит на первом
+/// различии и позволяет подбирать значение по времени ответа.
+fn secret_eq(a: &str, b: &str) -> bool {
+    use subtle::ConstantTimeEq;
+    a.as_bytes().ct_eq(b.as_bytes()).into()
+}
+
+fn launcher_refused() -> Html<String> {
+    Html(result_page(
+        "Действие отклонено",
+        "Запрос пришёл не со страницы запуска. Откройте её заново и повторите.",
+        Some(&launcher_url()),
+    ))
 }
 
 fn launcher_url() -> String {
@@ -125,7 +170,7 @@ fn launcher_exe() -> PathBuf {
     }
 }
 
-async fn launcher_page() -> Html<String> {
+async fn launcher_page(State(st): State<LauncherState>) -> Html<String> {
     // Показываем текущий выбор прямо на странице: незрячий иначе не поймёт,
     // в каком режиме окажется, пока не запустит панель.
     let mode = load_host_config()
@@ -135,14 +180,32 @@ async fn launcher_page() -> Html<String> {
         InterfaceMode::Accessible => "доступный, для незрячего",
         InterfaceMode::Standard => "обычный, для зрячего",
     };
-    Html(LAUNCHER_HTML.replace("{MODE}", label))
+    Html(
+        LAUNCHER_HTML
+            .replace("{MODE}", label)
+            .replace("{NONCE}", &html_escape(&st.nonce)),
+    )
 }
 
-async fn launcher_mode_accessible() -> impl IntoResponse {
+async fn launcher_mode_accessible(
+    State(st): State<LauncherState>,
+    headers: HeaderMap,
+    Form(form): Form<LauncherForm>,
+) -> impl IntoResponse {
+    if !launcher_allowed(&st, &headers, &form) {
+        return launcher_refused();
+    }
     set_interface_mode(InterfaceMode::Accessible)
 }
 
-async fn launcher_mode_standard() -> impl IntoResponse {
+async fn launcher_mode_standard(
+    State(st): State<LauncherState>,
+    headers: HeaderMap,
+    Form(form): Form<LauncherForm>,
+) -> impl IntoResponse {
+    if !launcher_allowed(&st, &headers, &form) {
+        return launcher_refused();
+    }
     set_interface_mode(InterfaceMode::Standard)
 }
 
@@ -174,19 +237,47 @@ fn set_interface_mode(mode: InterfaceMode) -> Html<String> {
     }
 }
 
-async fn launcher_actor(State(st): State<LauncherState>) -> impl IntoResponse {
+async fn launcher_actor(
+    State(st): State<LauncherState>,
+    headers: HeaderMap,
+    Form(form): Form<LauncherForm>,
+) -> impl IntoResponse {
+    if !launcher_allowed(&st, &headers, &form) {
+        return launcher_refused();
+    }
     spawn_launcher_command(&st.exe, "--host", "Actor setup")
 }
 
-async fn launcher_operator(State(st): State<LauncherState>) -> impl IntoResponse {
+async fn launcher_operator(
+    State(st): State<LauncherState>,
+    headers: HeaderMap,
+    Form(form): Form<LauncherForm>,
+) -> impl IntoResponse {
+    if !launcher_allowed(&st, &headers, &form) {
+        return launcher_refused();
+    }
     spawn_launcher_command(&st.exe, "--controller", "Operator panel")
 }
 
-async fn launcher_local(State(st): State<LauncherState>) -> impl IntoResponse {
+async fn launcher_local(
+    State(st): State<LauncherState>,
+    headers: HeaderMap,
+    Form(form): Form<LauncherForm>,
+) -> impl IntoResponse {
+    if !launcher_allowed(&st, &headers, &form) {
+        return launcher_refused();
+    }
     spawn_launcher_command(&st.exe, "--local", "Local accessible mode")
 }
 
-async fn launcher_remove_autostart() -> impl IntoResponse {
+async fn launcher_remove_autostart(
+    State(st): State<LauncherState>,
+    headers: HeaderMap,
+    Form(form): Form<LauncherForm>,
+) -> impl IntoResponse {
+    if !launcher_allowed(&st, &headers, &form) {
+        return launcher_refused();
+    }
     match unregister_autostart() {
         Ok(()) => Html(result_page(
             "Autostart removed",
@@ -353,6 +444,7 @@ button:focus-visible {
     </p>
 
     <form method="post" action="/interface-mode/accessible">
+      <input type="hidden" name="nonce" value="{NONCE}">
       <button type="submit">
         Доступный: для незрячего
         <span class="hint">Чат, донаты и тревоги зачитываются вслух. Вывод на второй монитор скрыт: окно проектора OBS экранный диктор прочитать не может в принципе.</span>
@@ -360,6 +452,7 @@ button:focus-visible {
     </form>
 
     <form method="post" action="/interface-mode/standard">
+      <input type="hidden" name="nonce" value="{NONCE}">
       <button type="submit">
         Обычный: для зрячего
         <span class="hint">Доступен вывод чата и донатов на второй монитор через проектор OBS. Вслух ничего не зачитывается.</span>
@@ -369,6 +462,7 @@ button:focus-visible {
     <h2>Что запустить</h2>
 
     <form method="post" action="/actor">
+      <input type="hidden" name="nonce" value="{NONCE}">
       <button type="submit">
         Актёр: настроить компьютер для стрима
         <span class="hint">Установит или скачает OBS и Tailscale, включит агент, покажет pairing-код.</span>
@@ -376,6 +470,7 @@ button:focus-visible {
     </form>
 
     <form method="post" action="/operator">
+      <input type="hidden" name="nonce" value="{NONCE}">
       <button type="submit">
         Оператор: открыть панель управления
         <span class="hint">Откроет удалённую панель через Tailscale и попросит pairing-код.</span>
@@ -383,6 +478,7 @@ button:focus-visible {
     </form>
 
     <form method="post" action="/local">
+      <input type="hidden" name="nonce" value="{NONCE}">
       <button type="submit">
         Локальный доступный режим
         <span class="hint">Для незрячего стримера на этом же компьютере, без Tailscale и pairing-кода.</span>
@@ -390,6 +486,7 @@ button:focus-visible {
     </form>
 
     <form method="post" action="/remove-autostart">
+      <input type="hidden" name="nonce" value="{NONCE}">
       <button type="submit">
         Убрать автозапуск удалённого агента
         <span class="hint">Полезно, если локальный режим конфликтует с remote-режимом на порту 8787.</span>
@@ -544,11 +641,20 @@ async fn controller_flow() -> Result<()> {
             .send()
             .await
         {
-            Ok(r) if r.status().is_success() => {
-                println!("OK");
-                chosen = Some(url.clone());
-                break;
-            }
+            // Успешного кода мало. На порту 8787 может отвечать что угодно
+            // чужое: ошибка в имени машины, устаревшая запись DNS, соседний
+            // сервис. Человека нельзя вести в чужую панель, поэтому спрашиваем
+            // отклик и убеждаемся, что это именно наш агент.
+            Ok(r) if r.status().is_success() => match r.json::<Value>().await {
+                Ok(v) if v.get("app").and_then(Value::as_str) == Some(APP_NAME) => {
+                    let mode = v.get("mode").and_then(Value::as_str).unwrap_or("");
+                    println!("OK, режим {mode}");
+                    chosen = Some(url.clone());
+                    break;
+                }
+                Ok(_) => println!("отвечает чужая программа, пропускаю"),
+                Err(_) => println!("отклик не разобран, пропускаю"),
+            },
             _ => println!("нет ответа"),
         }
     }
@@ -609,17 +715,8 @@ async fn ensure_tailscale() -> Result<()> {
         return Ok(());
     }
     println!("Tailscale не найден. Устанавливаю официальный MSI...");
-    // Имя файла в архиве содержит версию, потому что версии теперь
-    // зафиксированы манифестом. Искать точное имя нельзя — оно меняется
-    // при каждом обновлении зависимости.
-    let msi = match find_installer("tailscale-setup", ".msi") {
-        Some(path) => path,
-        None => {
-            let path = installer_path("tailscale-setup-amd64.msi");
-            download_tailscale(&path).await?;
-            path
-        }
-    };
+    let manifest = load_installer_manifest()?;
+    let msi = pinned_installer(&manifest.tailscale).await?;
     let status = Command::new("msiexec")
         .args([
             "/i",
@@ -638,12 +735,42 @@ async fn ensure_tailscale() -> Result<()> {
     Ok(())
 }
 
-async fn download_tailscale(msi: &Path) -> Result<()> {
-    fs::create_dir_all(msi.parent().context("нет родительской папки")?)?;
-    let url = "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi";
-    let bytes = reqwest::get(url).await?.bytes().await?;
-    fs::write(msi, bytes)?;
-    Ok(())
+/// Отдаёт путь к установщику той версии, что записана в манифесте.
+///
+/// Готовый файл из архива тоже проверяется, а не принимается на веру: с
+/// момента сборки релиза он лежал на диске и мог быть подменён.
+///
+/// Скачиваем строго по ссылке из манифеста. Прежде здесь стоял адрес с
+/// «latest» в имени: он ведёт каждый раз на разный файл, а значит проверить
+/// его нечем в принципе.
+async fn pinned_installer(entry: &InstallerEntry) -> Result<PathBuf> {
+    let path = installers_dir().join(&entry.file);
+    if !path.exists() {
+        println!("Скачиваю {} {}...", entry.file, entry.version);
+        fs::create_dir_all(installers_dir())?;
+        let bytes = reqwest::Client::builder()
+            .user_agent(concat!("AccessibleOBS/", env!("CARGO_PKG_VERSION")))
+            .build()?
+            .get(&entry.url)
+            .send()
+            .await?
+            .error_for_status()?
+            .bytes()
+            .await?;
+        fs::write(&path, bytes)?;
+    }
+    match verify_installer(&path, entry) {
+        Ok(()) => {
+            println!("{}: контрольная сумма совпала", entry.file);
+            Ok(path)
+        }
+        Err(e) => {
+            // Испорченный файл убираем, иначе следующий запуск наткнётся на
+            // него снова и снова будет отказывать.
+            let _ = fs::remove_file(&path);
+            Err(e)
+        }
+    }
 }
 
 async fn ensure_tailscale_up(unattended: bool) -> Result<()> {
@@ -711,25 +838,8 @@ async fn ensure_obs_installed(cfg: &HostConfig) -> Result<()> {
         return Ok(());
     }
     println!("OBS Studio не найден. Скачиваю официальный установщик...");
-    let installer = preferred_obs_installer_path();
-    if !installer.exists() {
-        let url = latest_obs_installer_url().await?;
-        println!("Скачиваю OBS: {url}");
-        let bytes = reqwest::Client::builder()
-            .user_agent("AccessibleOBS/0.2")
-            .build()?
-            .get(url)
-            .send()
-            .await?
-            .bytes()
-            .await?;
-        fs::create_dir_all(
-            installer
-                .parent()
-                .context("нет папки third_party/installers")?,
-        )?;
-        fs::write(&installer, bytes)?;
-    }
+    let manifest = load_installer_manifest()?;
+    let installer = pinned_installer(&manifest.obs).await?;
     println!("Запускаю установку OBS. Если появится окно установщика — нажмите Install/Next.");
     let status = Command::new(&installer).arg("/S").status();
     sleep(Duration::from_secs(5)).await;
@@ -763,36 +873,6 @@ fn runtime_or_existing_obs_password(cfg: &HostConfig) -> Result<String> {
     let password = random_secret_b64(24);
     save_secret("obs_websocket_password", &password)?;
     Ok(password)
-}
-
-async fn latest_obs_installer_url() -> Result<String> {
-    let v: serde_json::Value = reqwest::Client::builder()
-        .user_agent("AccessibleOBS/0.2")
-        .build()?
-        .get("https://api.github.com/repos/obsproject/obs-studio/releases/latest")
-        .send()
-        .await?
-        .json()
-        .await?;
-    v.get("assets")
-        .and_then(|a| a.as_array())
-        .into_iter()
-        .flatten()
-        .find_map(|a| {
-            let name = a.get("name").and_then(|v| v.as_str())?.to_ascii_lowercase();
-            let is_windows_installer = name.contains("windows") && name.ends_with("installer.exe");
-            is_windows_installer.then(|| {
-                a.get("browser_download_url")
-                    .and_then(|v| v.as_str())
-                    .map(str::to_string)
-            })?
-        })
-        .ok_or_else(|| {
-            anyhow!(
-                "Не удалось найти установщик OBS для Windows в последнем релизе. \
-                 Установите OBS вручную с https://obsproject.com/download"
-            )
-        })
 }
 
 async fn wait_for_obs(cfg: &HostConfig, seconds: u64) {
@@ -963,58 +1043,6 @@ fn desktop_dir() -> Option<PathBuf> {
     Some(PathBuf::from(profile).join("Desktop"))
 }
 
-/// Ищет вложенный установщик по началу и концу имени.
-///
-/// Имена содержат версию (`tailscale-setup-1.90.6-amd64.msi`), поскольку
-/// версии зафиксированы в third_party\installers.json. Искать точное имя
-/// значило бы ломать установку при каждом обновлении зависимости.
-fn find_installer(prefix: &str, suffix: &str) -> Option<PathBuf> {
-    let dir = app_root().join("third_party").join("installers");
-    fs::read_dir(dir).ok()?.flatten().find_map(|entry| {
-        let path = entry.path();
-        let name = path.file_name()?.to_str()?.to_ascii_lowercase();
-        (name.starts_with(&prefix.to_ascii_lowercase())
-            && name.ends_with(&suffix.to_ascii_lowercase()))
-        .then_some(path)
-    })
-}
-
-fn installer_path(file_name: &str) -> PathBuf {
-    app_root()
-        .join("third_party")
-        .join("installers")
-        .join(file_name)
-}
-
-/// Ищем установщик, положенный в архив release-скриптом, чтобы не качать заново.
-/// Подходит ли имя файла под установщик OBS для Windows.
-///
-/// Окончание проверяется как «...installer.exe», а не «-windows-installer.exe»:
-/// OBS выпускает файлы вида OBS-Studio-32.2.1-Windows-x64-Installer.exe, и
-/// строгая проверка их не находила — вложенный в архив установщик молча
-/// игнорировался, а на машине актёра начиналась загрузка из интернета.
-fn is_obs_installer(file_name: &str) -> bool {
-    let name = file_name.to_ascii_lowercase();
-    name.starts_with("obs-studio-") && name.contains("windows") && name.ends_with("installer.exe")
-}
-
-fn preferred_obs_installer_path() -> PathBuf {
-    let installers = app_root().join("third_party").join("installers");
-    if let Ok(entries) = fs::read_dir(&installers) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            let matches = path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .is_some_and(is_obs_installer);
-            if matches {
-                return path;
-            }
-        }
-    }
-    installers.join("OBS-Studio-Windows-Installer.exe")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1028,27 +1056,48 @@ mod tests {
         }
     }
 
-    #[test]
-    fn obs_installer_is_recognised_including_x64_names() {
-        // Именно на этом прежняя проверка спотыкалась: OBS давно выпускает
-        // файлы с -x64- в имени, и вложенный в архив установщик молча
-        // игнорировался, а у актёра начиналась загрузка из интернета.
-        assert!(is_obs_installer(
-            "OBS-Studio-32.2.1-Windows-x64-Installer.exe"
-        ));
-        assert!(is_obs_installer("OBS-Studio-30.0.0-Windows-Installer.exe"));
-        assert!(is_obs_installer(
-            "obs-studio-31.1-windows-x64-installer.exe"
-        ));
-    }
+    // Проверки угадывания имени установщика убраны вместе с самим угадыванием:
+    // имя файла теперь берётся из манифеста, где оно записано вместе с версией
+    // и контрольной суммой. Искать установщик по образцу имени больше не нужно,
+    // а тест на несуществующую функцию — мусор.
 
     #[test]
-    fn other_files_are_not_mistaken_for_obs_installer() {
-        assert!(!is_obs_installer("tailscale-setup-1.90.6-amd64.msi"));
-        assert!(!is_obs_installer("OBS-Studio-32.2.1-macOS.dmg"));
-        assert!(!is_obs_installer("README.txt"));
-        // Архив с исходниками — не установщик.
-        assert!(!is_obs_installer("OBS-Studio-32.2.1-Windows.zip"));
+    fn launcher_accepts_only_its_own_page() {
+        // Действия начальной страницы запускают программы и снимают
+        // автозапуск, поэтому чужой POST на localhost проходить не должен.
+        let st = LauncherState {
+            exe: Arc::new(PathBuf::from("x")),
+            nonce: Arc::new("правильный".to_string()),
+        };
+        let mut own = HeaderMap::new();
+        own.insert("origin", "http://127.0.0.1:8786".parse().unwrap());
+
+        assert!(launcher_allowed(
+            &st,
+            &own,
+            &LauncherForm {
+                nonce: "правильный".into()
+            }
+        ));
+        // Своя страница, но пароль не тот — например, страница осталась
+        // открытой с прошлого запуска программы.
+        assert!(!launcher_allowed(
+            &st,
+            &own,
+            &LauncherForm {
+                nonce: "устаревший".into()
+            }
+        ));
+
+        let mut foreign = HeaderMap::new();
+        foreign.insert("origin", "https://evil.example".parse().unwrap());
+        assert!(!launcher_allowed(
+            &st,
+            &foreign,
+            &LauncherForm {
+                nonce: "правильный".into()
+            }
+        ));
     }
 
     #[test]

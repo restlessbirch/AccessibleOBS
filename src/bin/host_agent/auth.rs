@@ -34,39 +34,18 @@ pub(crate) fn secret_eq(a: &str, b: &str) -> bool {
 /// Заодно отсекается перепривязка DNS: браузер обратится по чужому имени,
 /// и Host не совпадёт с петлевым адресом.
 pub(crate) fn origin_is_trusted(headers: &HeaderMap) -> bool {
-    // Локальный режим слушает только петлевой интерфейс, поэтому и доверяем
-    // только ему. Имя localhost допускаем: браузеры часто подставляют его.
-    let host_allowed = |value: &str| {
-        let host = value.rsplit_once(':').map_or(value, |(h, _)| h);
-        let host = host.trim_start_matches('[').trim_end_matches(']');
-        host == "localhost" || host.parse::<IpAddr>().is_ok_and(|ip| ip.is_loopback())
-    };
-
-    // Origin присылают браузеры при запросах, меняющих состояние.
+    // Заголовок есть, но прочитать его не выходит — доверять нечему. Раньше
+    // здесь был провал в следующую ветку, и запрос с нечитаемым Origin
+    // проходил как доверенный.
     if let Some(origin) = headers.get("origin") {
-        // Заголовок есть, но прочитать его не выходит — доверять нечему.
-        // Раньше здесь был провал в следующую ветку, и запрос с нечитаемым
-        // Origin проходил как доверенный.
         let Ok(origin) = origin.to_str() else {
             return false;
         };
-        return match origin
-            .strip_prefix("http://")
-            .or_else(|| origin.strip_prefix("https://"))
-        {
-            Some(rest) => host_allowed(rest),
-            // "null" и прочее нестандартное происхождение доверия не заслуживают.
-            None => false,
-        };
+        return loopback_request_ok(Some(origin), None);
     }
-
-    // Origin нет — проверяем адрес, по которому к нам обратились.
     // Отсутствие Host тоже считаем недоверенным: в HTTP/1.1 он обязателен,
     // и запрос без него приходит не от панели.
-    headers
-        .get("host")
-        .and_then(|v| v.to_str().ok())
-        .is_some_and(host_allowed)
+    loopback_request_ok(None, headers.get("host").and_then(|v| v.to_str().ok()))
 }
 
 pub(crate) async fn is_auth(st: &AppState, headers: &HeaderMap) -> bool {
@@ -85,6 +64,10 @@ pub(crate) async fn is_auth(st: &AppState, headers: &HeaderMap) -> bool {
     if session.expired(now) {
         *guard = None;
         delete_secret("session_token").ok();
+        // Срок кончился — закрываем и долгие потоки событий, открытые по этой
+        // сессии. Иначе панель, подключённая двенадцать часов назад, продолжала
+        // бы получать события просроченной сессией.
+        st.session_generation.fetch_add(1, Ordering::Relaxed);
         return false;
     }
     if secret_eq(&presented, &session.token) {
@@ -181,6 +164,9 @@ pub(crate) async fn auth_login(
         return err("Не удалось сохранить сессию", e);
     }
     *st.session.write().await = Some(session.clone());
+    // Новый вход обесценивает прежнюю сессию, а вместе с ней и открытые по ней
+    // потоки событий.
+    st.session_generation.fetch_add(1, Ordering::Relaxed);
 
     let mut resp = Json(json!({"ok": true})).into_response();
     // Secure не ставим намеренно: связь идёт по http внутри tailnet, где
@@ -205,6 +191,8 @@ pub(crate) async fn auth_logout(State(st): State<AppState>, headers: HeaderMap) 
     }
     *st.session.write().await = None;
     let _ = delete_secret("session_token");
+    // Выход в одной вкладке обязан закрыть поток событий и во всех остальных.
+    st.session_generation.fetch_add(1, Ordering::Relaxed);
     let mut resp = Json(json!({"ok": true})).into_response();
     resp.headers_mut().insert(
         "set-cookie",

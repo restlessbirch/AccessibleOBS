@@ -114,13 +114,29 @@ function setupCollapsibleSections() {
   });
 }
 
+/// Кладёт текст в живую область так, чтобы диктор его точно произнёс.
+///
+/// Простая запись в textContent не годится: если та же фраза уже там,DOM не
+/// меняется, события об изменении нет, и диктор молчит. А повторы здесь —
+/// обычное дело: «Сцена: Игра» дважды подряд, вторая неудачная попытка с той
+/// же ошибкой. Для незрячего оператора это выглядит как проглоченное действие.
+///
+/// Поэтому сначала очищаем область, а текст кладём следующим кадром — так
+/// изменений всегда два, и второе диктор объявляет.
+function liveSpeak(node, text) {
+  node.textContent = '';
+  requestAnimationFrame(() => {
+    node.textContent = text;
+  });
+}
+
 /** Вежливое сообщение: NVDA прочитает, не прерывая текущую фразу. */
 function say(text) {
-  $('live').textContent = text;
+  liveSpeak($('live'), text);
 }
 /** Настойчивое сообщение — для ошибок и донатов. */
 function announce(text) {
-  $('alerts').textContent = text;
+  liveSpeak($('alerts'), text);
 }
 
 function fail(error) {
@@ -240,6 +256,13 @@ function showLogin(show) {
   if (show && isLocalRuntime()) show = false;
   $('login').hidden = !show;
   $('panel').hidden = show;
+  if (!show) {
+    // Фокус остаётся в форме входа, которую мы только что спрятали. Для
+    // зрячего это незаметно, а незрячий оказывается неизвестно где: диктор
+    // читает пустоту, и до панели надо добираться самому.
+    const start = $('panelStart');
+    if (start) start.focus();
+  }
   if (show) {
     closeEvents();
     // Иначе автообновление кадра продолжало бы дёргать API каждые две

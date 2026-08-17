@@ -32,7 +32,7 @@
 
     <div id="panel" hidden>
       <section class="card">
-        <h2>Состояние</h2>
+        <h2 id="panelStart" tabindex="-1">Состояние</h2>
         <div class="toolbar">
           <div>
             <span class="state" id="freshness" data-state="warn">Данные ещё не загружены</span>
@@ -100,10 +100,6 @@
         <h2>Эфир</h2>
         <button id="startStream" type="button">Эфир остановлен — начать эфир</button>
         <button id="stopStream" type="button" data-variant="danger" hidden>Остановить эфир</button>
-        <p class="hint">
-          Потеря кадров означает, что интернета или мощности процессора у актёра
-          не хватает. Переподключение — что эфир рвётся.
-        </p>
         <dl id="streamHealth"></dl>
       </section>
 
@@ -117,9 +113,6 @@
 
       <section class="card">
         <h2>Studio Mode</h2>
-        <p class="hint">
-          Позволяет подготовить сцену на предпросмотре и вывести её в эфир одной командой.
-        </p>
         <p><span class="state" id="studioState" data-state="warn">Проверяю…</span></p>
         <button id="studioOn" type="button">Studio Mode выключен — включить</button>
         <button id="studioOff" type="button" data-variant="quiet" hidden>Выключить</button>
@@ -133,11 +126,6 @@
 
       <section class="card">
         <h2>Кадр эфира</h2>
-        <p class="hint">
-          Снимок текущей сцены с компьютера актёра. Обновляется по кнопке или раз в
-          две секунды, если включить автообновление. Постоянного видеопотока нет
-          намеренно — он занимал бы канал и процессор актёра.
-        </p>
         <button id="grabPreview" type="button">Обновить кадр</button>
         <label class="check">
           <input type="checkbox" id="autoPreview">
@@ -155,9 +143,6 @@
 
       <section class="card">
         <h2>Буфер повтора</h2>
-        <p class="hint">
-          Держит последние секунды эфира в памяти, чтобы сохранить момент задним числом.
-        </p>
         <p><span class="state" id="replayState" data-state="warn">Проверяю…</span></p>
         <button id="replayStart" type="button">Буфер повтора выключен — включить</button>
         <button id="replayStop" type="button" data-variant="quiet" hidden>Выключить</button>
@@ -166,10 +151,7 @@
 
       <section class="card">
         <h2>Профиль, коллекция сцен и переход</h2>
-        <p class="hint">
-          Смена профиля или коллекции сцен перезагружает настройки OBS у актёра.
-          Во время эфира этого лучше не делать.
-        </p>
+        <p class="warn-note">Во время эфира не переключайте: OBS перезагрузит настройки.</p>
         <div class="row">
           <label for="profileSelect">Профиль</label>
           <select id="profileSelect"></select>
@@ -189,11 +171,6 @@
 
       <section class="card">
         <h2>Готовность к эфиру</h2>
-        <p class="hint">
-          Связная проверка перед началом: есть ли что показывать, слышно ли вас,
-          хватит ли места на диске. Отдельно предупреждает, если звук системы
-          может унести в эфир речь экранного диктора.
-        </p>
         <button id="runPreflight" type="button">Проверить готовность</button>
         <p><span class="state" id="preflightSummary" data-state="warn">Проверка не запускалась</span></p>
         <ul id="preflightChecks" class="checks"></ul>
@@ -201,21 +178,13 @@
 
       <section class="card">
         <h2>Журнал эфира</h2>
-        <p class="hint">
-          Что и когда произошло за сеанс. Агент следит за потерей кадров и местом
-          на диске сам, даже когда панель закрыта — тогда события попадают в
-          <code>logs\host.log</code> у актёра.
-        </p>
         <button id="clearJournal" type="button" data-variant="quiet">Очистить журнал</button>
         <ul id="journal" class="journal"></ul>
       </section>
 
       <section class="card">
         <h2>Горячие клавиши</h2>
-        <p class="hint">
-          Работают, когда курсор не в поле ввода. Нужны, чтобы не искать кнопку
-          в длинной странице, когда счёт идёт на секунды.
-        </p>
+        <p class="warn-note">Работают, когда курсор не в поле ввода.</p>
         <dl id="shortcuts"></dl>
         <label class="check">
           <input type="checkbox" id="shortcutsOn" checked>
@@ -238,14 +207,8 @@
 
         <p id="projectorNote" class="notice" hidden></p>
         <div id="projectorBlock">
+          <p class="warn-note">Проектор закрывается только у актёра, клавишей Escape.</p>
         <h3>Вывести на второй монитор актёра</h3>
-        <p class="hint">
-          Через проектор OBS: окно открывается сразу во весь выбранный экран,
-          и актёру не нужно ничего перетаскивать. Содержимое в эфир не попадёт —
-          для него создаётся отдельная сцена, которую никуда не включают.
-          Закрывается проектор только у актёра, клавишей Escape: закрыть его
-          командой obs-websocket не умеет.
-        </p>
         <div class="row">
           <label for="monitorSelect">Монитор</label>
           <select id="monitorSelect"></select>
@@ -263,11 +226,6 @@
 
       <section class="card">
         <h2>Диагностика</h2>
-        <p class="hint">
-          Собирает версии, состояние и последние строки лога в один текст.
-          Секретов внутри нет — только отметки, настроены они или нет.
-          Пригодится, когда что-то не заводится и нужно показать это со стороны.
-        </p>
         <button id="collectDiagnostics" type="button">Собрать диагностику</button>
         <button id="copyDiagnostics" type="button" data-variant="quiet" hidden>Скопировать</button>
         <p id="diagnosticsStatus" class="notice" hidden></p>
@@ -276,13 +234,6 @@
 
       <section class="card">
         <h2>Роли источников</h2>
-        <p class="hint">
-          OBS знает роли только для своих слотов. Микрофон, добавленный обычным
-          «Захватом входного аудиопотока», ролью не считается — и проверка
-          готовности зря сообщала бы, что микрофон не найден. Укажите здесь один
-          раз, и по этому выбору заработают горячая клавиша заглушения, тревога
-          о тишине и проверка готовности.
-        </p>
         <dl id="rolesStatus"></dl>
         <div class="row">
           <label for="roleMicrophone">Основной микрофон</label>

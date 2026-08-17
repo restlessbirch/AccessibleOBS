@@ -488,6 +488,146 @@ impl DonationVerification {
     }
 }
 
+/// Ниже этой громкости считаем, что источник не звучит.
+///
+/// Ровно нулём не ограничиваемся: ползунок, уведённый в самый низ, даёт не
+/// абсолютный ноль, а исчезающе малую величину, и сравнение с нулём объявило
+/// бы такой источник звучащим.
+const SILENT_VOLUME_MUL: f64 = 0.0001;
+
+/// Дойдёт ли звук доната до зрителей.
+///
+/// Проверяем все четыре условия, а не одно. Прежде смотрели только на mute, и
+/// `ready: true` мог означать что угодно: ползунок громкости в нуле, звук
+/// страницы, идущий мимо микшера OBS, или мониторинг «только мне», при котором
+/// алерт слышит владелец, а зрители — нет. Каждое из этих состояний ломает
+/// донаты полностью и молча, а проверка их не замечала.
+///
+/// Именно ради этого проект перечитывает OBS вместо того, чтобы верить
+/// отправленным командам: команды уходят пакетом, и любая из них может не
+/// выполниться.
+async fn audible_verdict(
+    st: &AppState,
+    cfg: &DonationAlertsConfig,
+    problems: &mut Vec<String>,
+) -> preflight::Verdict {
+    use preflight::Verdict;
+    let name = &cfg.input_name;
+    let mut verdict = Verdict::Ok;
+
+    // Заглушен ли источник.
+    match st
+        .obs
+        .request("GetInputMute", json!({"inputName": name}))
+        .await
+    {
+        Ok(v) => match v.get("inputMuted").and_then(Value::as_bool) {
+            Some(true) => {
+                problems.push(format!("{name} заглушен — донатов не будет слышно"));
+                verdict = Verdict::Broken;
+            }
+            Some(false) => {}
+            None => {
+                problems.push(format!("OBS не сообщил состояние звука {name}"));
+                verdict = verdict.min_known(Verdict::Unknown);
+            }
+        },
+        Err(e) => {
+            problems.push(format!("не удалось проверить звук {name}: {e}"));
+            verdict = verdict.min_known(Verdict::Unknown);
+        }
+    }
+
+    // Не уведён ли ползунок громкости в тишину. Незаглушенный источник с
+    // нулевой громкостью выглядит исправным и молчит.
+    match st
+        .obs
+        .request("GetInputVolume", json!({"inputName": name}))
+        .await
+    {
+        Ok(v) => match v.get("inputVolumeMul").and_then(Value::as_f64) {
+            Some(mul) if mul < SILENT_VOLUME_MUL => {
+                problems.push(format!("громкость {name} выведена в ноль"));
+                verdict = Verdict::Broken;
+            }
+            Some(_) => {}
+            None => {
+                problems.push(format!("OBS не сообщил громкость {name}"));
+                verdict = verdict.min_known(Verdict::Unknown);
+            }
+        },
+        Err(e) => {
+            problems.push(format!("не удалось проверить громкость {name}: {e}"));
+            verdict = verdict.min_known(Verdict::Unknown);
+        }
+    }
+
+    // Уходит ли звук в эфир. При мониторинге «только мне» алерт слышит
+    // владелец, а зрители не слышат ничего — и снаружи это неотличимо от
+    // исправной работы.
+    match st
+        .obs
+        .request("GetInputAudioMonitorType", json!({"inputName": name}))
+        .await
+    {
+        Ok(v) => match v.get("monitorType").and_then(Value::as_str) {
+            Some(t) if t.contains("MONITOR_ONLY") => {
+                problems.push(format!(
+                    "{name} выводится только владельцу: зрители донатов не услышат"
+                ));
+                verdict = Verdict::Broken;
+            }
+            Some(_) => {}
+            None => {
+                problems.push(format!("OBS не сообщил тип мониторинга {name}"));
+                verdict = verdict.min_known(Verdict::Unknown);
+            }
+        },
+        Err(e) => {
+            problems.push(format!("не удалось проверить мониторинг {name}: {e}"));
+            verdict = verdict.min_known(Verdict::Unknown);
+        }
+    }
+
+    // Ведётся ли звук страницы в микшер OBS. Без этого браузер-источник играет
+    // алерт мимо OBS, и в эфир не попадает ничего.
+    match st
+        .obs
+        .request("GetInputSettings", json!({"inputName": name}))
+        .await
+    {
+        Ok(v) => {
+            let settings = v.get("inputSettings");
+            // Отсутствие ключа означает значение по умолчанию, а по умолчанию
+            // обс не ведёт звук страницы в микшер.
+            let reroute = settings
+                .and_then(|s| s.get("reroute_audio"))
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            if !reroute {
+                problems.push(format!(
+                    "у {name} выключено ведение звука в OBS: алерт прозвучит мимо эфира"
+                ));
+                verdict = Verdict::Broken;
+            }
+            let url_set = settings
+                .and_then(|s| s.get("url"))
+                .and_then(Value::as_str)
+                .is_some_and(|u| u.starts_with("https://"));
+            if !url_set {
+                problems.push(format!("у {name} не задана ссылка виджета"));
+                verdict = Verdict::Broken;
+            }
+        }
+        Err(e) => {
+            problems.push(format!("не удалось прочитать настройки {name}: {e}"));
+            verdict = verdict.min_known(Verdict::Unknown);
+        }
+    }
+
+    verdict
+}
+
 pub(crate) async fn verify_donationalerts(
     st: &AppState,
     cfg: &DonationAlertsConfig,
@@ -495,30 +635,7 @@ pub(crate) async fn verify_donationalerts(
     use preflight::Verdict;
     let mut problems = Vec::new();
 
-    let audible = match st
-        .obs
-        .request("GetInputMute", json!({"inputName": cfg.input_name}))
-        .await
-    {
-        Ok(v) => match v.get("inputMuted").and_then(Value::as_bool) {
-            Some(true) => {
-                problems.push(format!(
-                    "{} заглушен — донатов не будет слышно",
-                    cfg.input_name
-                ));
-                Verdict::Broken
-            }
-            Some(false) => Verdict::Ok,
-            None => {
-                problems.push(format!("OBS не сообщил состояние звука {}", cfg.input_name));
-                Verdict::Unknown
-            }
-        },
-        Err(e) => {
-            problems.push(format!("не удалось проверить звук {}: {e}", cfg.input_name));
-            Verdict::Unknown
-        }
-    };
+    let audible = audible_verdict(st, cfg, &mut problems).await;
 
     let in_overlay_scene =
         match ensure_scene_item_present(&st.obs, &cfg.overlay_scene_name, &cfg.input_name).await {

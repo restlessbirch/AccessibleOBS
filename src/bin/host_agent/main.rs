@@ -26,7 +26,10 @@ use std::{
     collections::{HashMap, HashSet, VecDeque},
     convert::Infallible,
     net::{IpAddr, Ipv4Addr, SocketAddr},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use subtle::ConstantTimeEq;
@@ -60,6 +63,11 @@ struct AppState {
     /// Токен сессии держим в памяти: расшифровывать DPAPI-файл на каждый
     /// запрос панели — лишний диск и лишняя криптография.
     session: Arc<RwLock<Option<StoredSession>>>,
+    /// Счётчик смен сессии, по которому закрываются долгие потоки событий.
+    ///
+    /// Растёт при входе, выходе и истечении срока. Поток событий запоминает
+    /// значение при подключении и закрывается, как только оно изменилось.
+    session_generation: Arc<AtomicU64>,
     /// Одноразовый state для OAuth DonationAlerts (защита от подмены кода).
     oauth_state: Arc<RwLock<Option<String>>>,
     /// Чем закончилась последняя попытка подключить DonationAlerts.
@@ -288,6 +296,7 @@ async fn main() -> Result<()> {
         feed: feed.clone(),
         events: events.clone(),
         session: Arc::new(RwLock::new(load_session_secret()?)),
+        session_generation: Arc::new(AtomicU64::new(0)),
         oauth_state: Arc::new(RwLock::new(None)),
         donationalerts_oauth_note: Arc::new(RwLock::new(None)),
         login_guards: Arc::new(Mutex::new(HashMap::new())),
@@ -421,10 +430,44 @@ async fn main() -> Result<()> {
         )
         .route("/api/twitch/marker", post(twitch_marker))
         .fallback_service(ServeDir::new(web_dir()).append_index_html_on_directories(true))
+        .layer(axum::middleware::from_fn(security_headers))
         .layer(TraceLayer::new_for_http())
         .with_state(state);
 
     serve(app, &cfg).await
+}
+
+/// Запрещает встраивать панель в чужую страницу.
+///
+/// Проверка Origin спасает от чужого запроса, но не от чужого фрейма: скрипт
+/// внутри iframe работает от имени самой панели, и его запросы проходят все
+/// проверки как свои. Достаточно наложить прозрачный фрейм поверх безобидной
+/// страницы — и человек нажимает кнопки эфира, не видя их. В локальном режиме,
+/// где pairing-кода нет вовсе, для этого не нужно даже красть сессию.
+///
+/// Ставим оба заголовка: `frame-ancestors` — нынешний способ, `X-Frame-Options`
+/// понимают старые браузеры, которые про CSP ещё не знают.
+///
+/// `frame-src` тоже перекрываем: панель сама ничего не встраивает, а экран
+/// актёра рисует чат своим списком.
+async fn security_headers(
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let mut response = next.run(request).await;
+    let headers = response.headers_mut();
+    headers.insert(
+        "content-security-policy",
+        HeaderValue::from_static("frame-ancestors 'none'; frame-src 'none'"),
+    );
+    headers.insert("x-frame-options", HeaderValue::from_static("DENY"));
+    // Ссылки наружу не должны уносить адрес панели.
+    headers.insert("referrer-policy", HeaderValue::from_static("no-referrer"));
+    headers.insert(
+        "x-content-type-options",
+        HeaderValue::from_static("nosniff"),
+    );
+    response
 }
 
 /// Слушаем и Tailscale-адрес, и localhost.
@@ -695,19 +738,11 @@ async fn client_error(
 async fn diagnostics(State(st): State<AppState>, headers: HeaderMap) -> ApiResult<Value> {
     require_auth(&st, &headers).await?;
     let obs = st.obs.status().await;
-    let log_tail = std::fs::read_to_string(logs_dir().join("host.log"))
-        .map(|text| {
-            let lines: Vec<&str> = text.lines().collect();
-            lines
-                .iter()
-                .rev()
-                .take(200)
-                .rev()
-                .copied()
-                .collect::<Vec<_>>()
-                .join("\n")
-        })
-        .unwrap_or_else(|e| format!("лог недоступен: {e}"));
+    // Чтение с диска уводим с рабочего потока: их всего два, и на них же
+    // висят потоки событий панели.
+    let log_tail = tokio::task::spawn_blocking(|| read_log_tail("host.log", 200))
+        .await
+        .unwrap_or_else(|e| format!("лог прочитать не удалось: {e}"));
 
     Ok(Json(json!({
         "app": {
@@ -752,12 +787,26 @@ async fn runtime_info(State(st): State<AppState>) -> Json<Value> {
 }
 
 /// Живой поток событий: OBS, статус соединения, донаты.
+///
+/// Проверка прав здесь не разовая. Поток живёт часами, а разрешение может
+/// кончиться: истечь по сроку или пропасть при выходе из системы. Прежде
+/// открытый поток переживал и то, и другое — выход в одной вкладке не закрывал
+/// поток в другой, а сессия, просроченная двенадцать часов назад, продолжала
+/// исправно получать события. Поэтому поток закрывается сам, как только токен
+/// перестаёт быть действительным.
 async fn sse_events(
     State(st): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>>>, Response> {
     require_auth(&st, &headers).await?;
-    let stream = BroadcastStream::new(st.events.subscribe()).filter_map(|msg| {
+    let guard = SessionGuard::new(&st, &headers).await;
+    let stream = BroadcastStream::new(st.events.subscribe()).filter_map(move |msg| {
+        // Проверяем на каждом событии: это чтение из памяти, оно ничего не
+        // стоит, а ждать следующего запроса панели нельзя — поток может
+        // молчать часами и всё это время оставаться открытым.
+        if !guard.still_valid() {
+            return None;
+        }
         let value = match msg {
             Ok(value) => value,
             // У каждого клиента своя очередь. Если браузер не успел её
@@ -808,6 +857,40 @@ fn actor_display_url(port: u16, panels: &str) -> String {
 ///
 /// Сама страница экрана проверку проходит: запрос к своему же адресу браузер
 /// шлёт без заголовка Origin, и остаётся Host вида localhost:8787.
+/// Право держать открытым долгий поток событий.
+///
+/// Хранит поколение сессии, действовавшее в момент подключения. Любая смена
+/// сессии — вход, выход, истечение срока — увеличивает поколение, и все потоки,
+/// открытые при прежнем, закрываются сами.
+///
+/// Поколение, а не сам токен: сравнение чисел не требует ни блокировки, ни
+/// расшифровки, и его не жалко делать на каждое событие.
+struct SessionGuard {
+    /// В локальном режиме сессий нет вовсе, и отзывать нечего.
+    generation: Option<(Arc<AtomicU64>, u64)>,
+}
+
+impl SessionGuard {
+    async fn new(st: &AppState, _headers: &HeaderMap) -> Self {
+        if st.cfg.runtime_mode == RuntimeMode::Local {
+            return Self { generation: None };
+        }
+        Self {
+            generation: Some((
+                st.session_generation.clone(),
+                st.session_generation.load(Ordering::Relaxed),
+            )),
+        }
+    }
+
+    fn still_valid(&self) -> bool {
+        match &self.generation {
+            None => true,
+            Some((current, opened_at)) => current.load(Ordering::Relaxed) == *opened_at,
+        }
+    }
+}
+
 fn actor_display_allowed_without_session(peer: IpAddr, headers: &HeaderMap) -> bool {
     peer.is_loopback() && origin_is_trusted(headers)
 }

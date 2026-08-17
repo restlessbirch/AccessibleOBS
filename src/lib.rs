@@ -749,9 +749,31 @@ pub fn unregister_autostart() -> Result<()> {
 /// Пока страж жив, фоновый поток дописывает файл; уронив его, потеряем
 /// записи. Общая для обоих бинарников: различие было только в имени файла,
 /// а копия кода жила своей жизнью.
+/// Сколько суточных файлов лога хранить.
+///
+/// Недели хватает, чтобы разобрать позавчерашний эфир, и при этом папка не
+/// растёт бесконечно.
+const LOG_FILES_KEPT: usize = 7;
+
+/// Сколько байт с конца читать, когда нужен хвост лога.
+///
+/// Двухсот строк для разбора достаточно, а 256 КБ заведомо больше, чем они
+/// занимают.
+const LOG_TAIL_BYTES: u64 = 256 * 1024;
+
 #[must_use = "пока страж жив, пишутся логи; если его уронить, записи пропадут"]
 pub fn init_file_logging(file_name: &str) -> Result<tracing_appender::non_blocking::WorkerGuard> {
-    let file = tracing_appender::rolling::never(logs_dir(), file_name);
+    // Ротация по суткам с ограничением числа файлов.
+    //
+    // Прежде файл был один и рос без предела. Агент прописан в автозагрузке и
+    // работает месяцами; за это время лог дорастал до сотен мегабайт, а
+    // диагностика читала его целиком, чтобы показать последние двести строк.
+    let file = tracing_appender::rolling::Builder::new()
+        .rotation(tracing_appender::rolling::Rotation::DAILY)
+        .filename_prefix(file_name)
+        .max_log_files(LOG_FILES_KEPT)
+        .build(logs_dir())
+        .context("не удалось создать файл лога")?;
     let (writer, guard) = tracing_appender::non_blocking(file);
     tracing_subscriber::fmt()
         .with_writer(writer)
@@ -760,6 +782,166 @@ pub fn init_file_logging(file_name: &str) -> Result<tracing_appender::non_blocki
         .try_init()
         .ok();
     Ok(guard)
+}
+
+/// Запись о стороннем установщике из манифеста.
+#[derive(Debug, Clone, Deserialize)]
+pub struct InstallerEntry {
+    pub file: String,
+    pub version: String,
+    pub url: String,
+    pub sha256: String,
+}
+
+/// Зафиксированные версии стороннего ПО.
+#[derive(Debug, Clone, Deserialize)]
+pub struct InstallerManifest {
+    pub tailscale: InstallerEntry,
+    pub obs: InstallerEntry,
+}
+
+pub fn installers_dir() -> PathBuf {
+    app_root().join("third_party").join("installers")
+}
+
+/// Читает манифест зафиксированных установщиков.
+///
+/// Один и тот же файл читают и сборщик релиза, и первичная настройка. Прежде
+/// он был только у сборщика: тот сверял контрольные суммы, а настройка при
+/// отсутствии готового файла качала «последнюю» версию по неизменяемой ссылке
+/// и запускала её без всякой проверки. Получались два разных уровня доверия к
+/// одному и тому же действию — установке чужой программы на машину актёра.
+pub fn load_installer_manifest() -> Result<InstallerManifest> {
+    let path = app_root().join("third_party").join("installers.json");
+    let text = fs::read_to_string(&path)
+        .with_context(|| format!("манифест установщиков не найден: {}", path.display()))?;
+    Ok(serde_json::from_str(&strip_bom(&text))?)
+}
+
+/// Контрольная сумма файла.
+pub fn sha256_file(path: &Path) -> Result<String> {
+    use sha2::{Digest, Sha256};
+    let mut file = fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    std::io::copy(&mut file, &mut hasher)?;
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+/// Убеждается, что файл — именно тот, что записан в манифесте.
+///
+/// Несовпадение — отказ, а не предупреждение: дальше файл запускается как
+/// программа с правами пользователя.
+pub fn verify_installer(path: &Path, entry: &InstallerEntry) -> Result<()> {
+    let expected = entry.sha256.trim().to_ascii_lowercase();
+    if expected.is_empty() {
+        bail!(
+            "в манифесте нет контрольной суммы для {}; \
+             запускать непроверенный установщик нельзя",
+            entry.file
+        );
+    }
+    let actual = sha256_file(path)?.to_ascii_lowercase();
+    if actual != expected {
+        bail!(
+            "контрольная сумма {} не совпала.\nОжидалась: {expected}\nПолучена:  {actual}\n\
+             Файл повреждён или подменён, запускать его нельзя.",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+/// Последние строки самого свежего файла лога.
+///
+/// Читаем хвост через смещение, а не файл целиком: диагностику вызывают из
+/// обработчика запроса, а рабочих потоков у агента всего два, и втягивать в
+/// память сотни мегабайт ради двухсот строк нельзя.
+///
+/// Начало прочитанного куска может попасть в середину строки и разрезать
+/// многобайтный символ, поэтому декодируем с потерями и первую строку
+/// отбрасываем.
+pub fn read_log_tail(file_name: &str, max_lines: usize) -> String {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let Some(path) = newest_log_file(file_name) else {
+        return "лог ещё не создан".to_string();
+    };
+    let Ok(mut file) = fs::File::open(&path) else {
+        return format!("лог недоступен: {}", path.display());
+    };
+    let size = file.metadata().map(|m| m.len()).unwrap_or(0);
+    let from = size.saturating_sub(LOG_TAIL_BYTES);
+    if file.seek(SeekFrom::Start(from)).is_err() {
+        return "лог не удалось прочитать".to_string();
+    }
+    let mut buf = Vec::new();
+    if file.read_to_end(&mut buf).is_err() {
+        return "лог не удалось прочитать".to_string();
+    }
+
+    let text = String::from_utf8_lossy(&buf);
+    let mut lines: Vec<&str> = text.lines().collect();
+    if from > 0 && !lines.is_empty() {
+        lines.remove(0);
+    }
+    let start = lines.len().saturating_sub(max_lines);
+    lines[start..].join("\n")
+}
+
+/// Самый свежий файл лога с указанным именем.
+///
+/// При суточной ротации к имени добавляется дата, поэтому точного совпадения
+/// имени недостаточно.
+fn newest_log_file(file_name: &str) -> Option<PathBuf> {
+    let mut best: Option<(std::time::SystemTime, PathBuf)> = None;
+    for entry in fs::read_dir(logs_dir()).ok()?.flatten() {
+        let path = entry.path();
+        if !path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.starts_with(file_name))
+        {
+            continue;
+        }
+        let Ok(modified) = entry.metadata().and_then(|m| m.modified()) else {
+            continue;
+        };
+        if best.as_ref().is_none_or(|(best, _)| modified > *best) {
+            best = Some((modified, path));
+        }
+    }
+    best.map(|(_, path)| path)
+}
+
+/// Пришёл ли запрос со своей же петлевой страницы.
+///
+/// Чистая функция на строках, потому что нужна двоим: и панели, и начальной
+/// странице. Держать две копии такой проверки — значит однажды исправить одну
+/// и забыть про другую.
+///
+/// Заголовка Origin браузер при простых запросах не шлёт, поэтому запасной
+/// признак — Host: обращение по чужому имени, ведущему на 127.0.0.1, выдаёт
+/// себя именно им.
+pub fn loopback_request_ok(origin: Option<&str>, host: Option<&str>) -> bool {
+    let host_allowed = |value: &str| {
+        let host = value.rsplit_once(':').map_or(value, |(h, _)| h);
+        let host = host.trim_start_matches('[').trim_end_matches(']');
+        host == "localhost" || host.parse::<IpAddr>().is_ok_and(|ip| ip.is_loopback())
+    };
+
+    if let Some(origin) = origin {
+        return match origin
+            .strip_prefix("http://")
+            .or_else(|| origin.strip_prefix("https://"))
+        {
+            Some(rest) => host_allowed(rest),
+            // «null» и прочее нестандартное происхождение доверия не заслуживают.
+            None => false,
+        };
+    }
+
+    // Ни Origin, ни Host — запрос пришёл не от браузера со страницы.
+    host.is_some_and(host_allowed)
 }
 
 /// Экранирование для одинарных кавычек PowerShell: удвоение апострофа.

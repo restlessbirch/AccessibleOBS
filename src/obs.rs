@@ -244,18 +244,31 @@ async fn supervise(
 ) {
     let mut backoff = RECONNECT_MIN;
     loop {
-        match session(&host, port, &password, &mut rx, &events, &status).await {
+        let outcome = session(&host, port, &password, &mut rx, &events, &status).await;
+        // Успело ли соединение состояться. Читаем до set_disconnected, пока
+        // признак ещё не сброшен.
+        //
+        // Пауза растёт, пока OBS не отвечает, и это правильно. Но копить её
+        // между разными соединениями нельзя: если OBS был закрыт полдня, пауза
+        // дорастала до предела, а потом, после многочасовой исправной работы,
+        // первый же сетевой сбой стоил лишних пятнадцати секунд без управления.
+        // Прежде сброс случался только при штатном закрытии, а обрыв с ошибкой
+        // прежнее значение сохранял.
+        let was_connected = status.read().await.connected;
+        match outcome {
             Ok(Disconnect::HandleDropped) => return,
             Ok(Disconnect::Closed) => {
                 info!("OBS: соединение закрыто, переподключаюсь");
                 set_disconnected(&status, None).await;
-                backoff = RECONNECT_MIN;
             }
             Err(e) => {
                 let msg = friendly_obs_error(&format!("{e:#}"));
                 warn!("OBS: {}", msg);
                 set_disconnected(&status, Some(msg)).await;
             }
+        }
+        if was_connected {
+            backoff = RECONNECT_MIN;
         }
         // Пока ждём переподключения, отвечаем на команды ошибкой сразу,
         // иначе панель висела бы до таймаута на каждой кнопке.
