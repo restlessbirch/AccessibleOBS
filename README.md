@@ -2,8 +2,6 @@
 
 An accessible web panel and remote control for OBS Studio on Windows.
 
-Русская версия: [README.ru.md](README.ru.md)
-
 > **Interface language.** The panel, the launcher and all messages are currently
 > in Russian. The code and documentation are in English. If you need an English
 > interface, open an issue — the strings are in one place and translating them
@@ -214,17 +212,16 @@ scripts\scan_secrets.ps1
 The release is a zip with one obvious launcher inside, not a single
 self-extracting installer.
 
-Two-machine operation, installation from scratch, autostart across a reboot,
-and Twitch and DonationAlerts with live accounts have not been verified
-end to end. Everything else described here has been tested against a running
-OBS Studio.
+Remote operation between two machines, a clean installation, autostart across a
+reboot, and Twitch and DonationAlerts with live accounts are not covered by
+automated testing and need real hardware and accounts.
 
 There is no per-operator permission model: an authenticated operator controls
 the whole panel.
 
-OBS scene and source objects created by the program still carry an `RSC_`
-prefix from an earlier name. Renaming them needs a migration step, or existing
-setups would be left with orphaned scenes.
+OBS scenes and sources created by the program carry an `RSC_` prefix from an
+earlier name of the project. Renaming them requires a migration step, otherwise
+existing setups would be left with orphaned scenes.
 
 ## License
 
