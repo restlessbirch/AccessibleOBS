@@ -340,6 +340,10 @@ const I18N = {
     'Аноним': 'Anonymous',
     'Гость': 'Guest',
     'Перейти к экрану актёра': 'Skip to the actor display',
+    'Сцена в эфире неизвестна': 'Scene on air is unknown',
+    'Просмотр сцены': 'Scene preview',
+    'Показать источники и звук сцены': 'Show sources and audio of a scene',
+    'Вывести эту сцену в эфир': 'Put this scene on air',
     'Экран актёра — Accessible OBS': 'Actor display — Accessible OBS',
     'Код устарел. Нажмите «Подключить Twitch» заново.':
       'The code has expired. Press "Connect Twitch" again.',

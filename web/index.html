@@ -59,6 +59,7 @@
 
       <section class="card">
         <h2>Сцены</h2>
+        <p><span class="state" id="programScene" data-state="warn">Сцена в эфире неизвестна</span></p>
         <button id="refreshScenes" type="button" data-variant="quiet">Обновить сцены</button>
         <form id="createSceneForm">
           <fieldset>
@@ -69,10 +70,10 @@
           </fieldset>
         </form>
         <fieldset>
-          <legend>Переключить текущую сцену</legend>
-          <label for="sceneSelect">Сцена</label>
+          <legend>Просмотр сцены</legend>
+          <label for="sceneSelect">Показать источники и звук сцены</label>
           <select id="sceneSelect"></select>
-          <button id="setScene" type="button">Переключить</button>
+          <button id="setScene" type="button">Вывести эту сцену в эфир</button>
         </fieldset>
         <h3>Все сцены</h3>
         <ul id="sceneList"></ul>

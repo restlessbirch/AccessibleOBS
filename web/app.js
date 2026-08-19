@@ -128,9 +128,12 @@ function setupCollapsibleSections() {
 function liveSpeak(node, text) {
   const spoken = t(text);
   node.textContent = '';
-  requestAnimationFrame(() => {
+  // setTimeout, а не requestAnimationFrame: кадры в фоновой вкладке не идут
+  // вовсе, и объявление просто не появлялось бы. А панель как раз и живёт в
+  // фоне, пока человек занят игрой — молчащая в этот момент панель бесполезна.
+  setTimeout(() => {
     node.textContent = spoken;
-  });
+  }, 50);
 }
 
 /** Вежливое сообщение: NVDA прочитает, не прерывая текущую фразу. */
@@ -421,9 +424,12 @@ function handleEvent(msg) {
 function handleObsEvent(type, data) {
   switch (type) {
     case 'CurrentProgramSceneChanged':
+      // Сцену мог переключить и человек за компьютером актёра.
+      programScene = data.sceneName || programScene;
       currentScene = data.sceneName || currentScene;
-      say('Текущая сцена: ' + currentScene);
-      journal('Сцена: ' + currentScene);
+      renderProgramScene();
+      say('В эфире сцена: ' + programScene);
+      journal('Сцена: ' + programScene);
       schedule('scenes', refreshScenes);
       break;
     case 'SceneListChanged':
@@ -536,7 +542,17 @@ function renderOutputState(node, label, data) {
 
 // ---------------------------------------------------------- обновление
 
+/// Сцена, которую показывает панель: её источники и звук видны в разделах.
+/// Просмотр не равен эфиру — выбрать сцену в списке и вывести её в эфир это
+/// разные действия, и путать их нельзя.
 let currentScene = '';
+/// Сцена, которая идёт в эфир прямо сейчас, по данным OBS.
+///
+/// Держится отдельно от currentScene намеренно. Прежде обе роли играла одна
+/// переменная: выбор в списке менял показанные источники, подпись «текущая»
+/// переезжала следом, и панель выглядела так, будто сцена переключена. В эфире
+/// при этом оставалась прежняя, и заметить это было нечем.
+let programScene = '';
 let sceneNames = [];
 let inputKinds = [];
 let lastCreatedSceneName = '';
@@ -805,6 +821,7 @@ async function refreshScenes() {
     const data = await api('/api/obs/scenes');
     const scenes = data.scenes || [];
     sceneNames = scenes.map((s) => s.sceneName);
+    programScene = data.currentProgramSceneName || programScene;
     if (!currentScene || !sceneNames.includes(currentScene)) {
       currentScene = data.currentProgramSceneName || currentScene;
     }
@@ -816,12 +833,28 @@ async function refreshScenes() {
         selected: s.sceneName === currentScene,
       })));
 
+    // Каждая сцена — кнопка, выводящая её в эфир одним нажатием.
+    //
+    // Прежде здесь был перечень названий, а переключение пряталось за отдельной
+    // кнопкой рядом с выпадающим списком: два действия вместо одного, причём
+    // первое выглядело как переключение, не будучи им.
     replace($('sceneList'), scenes.length
-      ? scenes.map((s) => el('li', {
-          class: s.sceneName === lastCreatedSceneName ? 'just-added' : '',
-          text: s.sceneName + (s.sceneName === currentScene ? ' — текущая' : ''),
-        }))
+      ? scenes.map((s) => {
+          const onAir = s.sceneName === programScene;
+          return el('li', {
+            class: s.sceneName === lastCreatedSceneName ? 'just-added' : '',
+          }, [
+            button(
+              onAir
+                ? s.sceneName + ' — в эфире сейчас'
+                : 'Вывести в эфир: ' + s.sceneName,
+              () => switchProgramScene(s.sceneName),
+              onAir ? null : 'quiet',
+            ),
+          ]);
+        })
       : el('li', { class: 'empty', text: 'сцен нет' }));
+    renderProgramScene();
 
     await refreshSources();
     await refreshAudio();
@@ -834,22 +867,47 @@ async function refreshScenes() {
 
 $('sceneSelect').onchange = async (event) => {
   currentScene = event.target.value;
+  // Проговариваем разницу обязательно. Выбор здесь показывает источники и звук
+  // сцены, но в эфир её не выводит, а выглядит это в точности как переключение.
+  // Незрячий оператор иначе решит, что сцена сменилась, и узнает правду от
+  // зрителей.
+  if (currentScene === programScene) {
+    say('Показана сцена ' + currentScene + ', она сейчас в эфире');
+  } else {
+    say('Показана сцена ' + currentScene
+      + '. В эфире по-прежнему ' + (programScene || 'другая сцена')
+      + '. Чтобы вывести её в эфир, нажмите «Вывести в эфир»');
+  }
   await refreshSources();
   await refreshAudio();
 };
 
-$('setScene').onclick = async () => {
-  const scene = $('sceneSelect').value;
+/// Выводит сцену в эфир и подтверждает это ответом OBS, а не фактом отправки.
+async function switchProgramScene(scene) {
   if (!scene) return;
   try {
     await post('/api/obs/scenes/current', { sceneName: scene });
     currentScene = scene;
-    say('Сцена переключена: ' + scene);
     await refreshScenes();
+    if (programScene === scene) {
+      announce('В эфире сцена: ' + scene);
+    } else {
+      announce('OBS не переключил сцену. В эфире осталась ' + (programScene || 'прежняя'));
+    }
   } catch (e) {
     fail(e);
   }
-};
+}
+
+/// Показывает отдельной строкой, какая сцена идёт в эфир.
+function renderProgramScene() {
+  const node = $('programScene');
+  if (!node) return;
+  setState(node, programScene ? 'ok' : 'warn',
+    programScene ? 'В эфире сцена: ' + programScene : 'Сцена в эфире неизвестна');
+}
+
+$('setScene').onclick = () => switchProgramScene($('sceneSelect').value);
 
 $('createSceneForm').onsubmit = async (event) => {
   event.preventDefault();
