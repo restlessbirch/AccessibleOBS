@@ -62,12 +62,12 @@
         <p><span class="state" id="programScene" data-state="warn">Сцена в эфире неизвестна</span></p>
         <button id="refreshScenes" type="button" data-variant="quiet">Обновить сцены</button>
         <form id="createSceneForm">
-          <fieldset>
-            <legend>Добавить сцену</legend>
+          <details class="editor">
+            <summary>Добавить сцену</summary>
             <label for="newSceneName">Название</label>
             <input id="newSceneName" autocomplete="off">
             <button type="submit">Добавить сцену</button>
-          </fieldset>
+          </details>
         </form>
         <fieldset>
           <legend>Просмотр сцены</legend>
@@ -83,8 +83,8 @@
         <h2>Источники текущей сцены</h2>
         <button id="refreshSources" type="button" data-variant="quiet">Обновить источники</button>
         <form id="createSourceForm">
-          <fieldset>
-            <legend>Добавить источник</legend>
+          <details class="editor">
+            <summary>Добавить источник</summary>
             <label for="newSourceName">Название</label>
             <input id="newSourceName" autocomplete="off">
             <label for="newSourceKind">Тип</label>
@@ -92,7 +92,7 @@
               <option value="">Загружаю типы из OBS…</option>
             </select>
             <button type="submit">Добавить источник</button>
-          </fieldset>
+          </details>
         </form>
         <div id="sources"></div>
       </section>
@@ -259,8 +259,8 @@
         <dl id="daStatus"></dl>
 
         <form id="daConfigForm">
-          <fieldset>
-            <legend>Регистрация DonationAlerts</legend>
+          <details class="editor">
+            <summary>Регистрация DonationAlerts</summary>
             <label for="daClientId">Client ID</label>
             <input id="daClientId" autocomplete="off">
             <label for="daClientSecret">Client secret</label>
@@ -270,7 +270,7 @@
             <label for="daScopes">Scopes</label>
             <input id="daScopes" autocomplete="off">
             <button type="submit">Сохранить регистрацию DonationAlerts</button>
-          </fieldset>
+          </details>
         </form>
 
         <form id="daUrlForm">
@@ -296,13 +296,13 @@
           <button id="daSetVolume" type="button">Применить</button>
         </fieldset>
 
-        <fieldset>
-          <legend>Лента донатов в панели</legend>
+        <details class="editor">
+          <summary>Лента донатов в панели</summary>
           <button id="daOauth" type="button" data-variant="quiet">Подключить DonationAlerts</button>
           <div id="daOauthStatus"></div>
           <p>Нужно только для показа списка донатов здесь. На озвучку в эфире не влияет.</p>
           <label><input id="announceDonations" type="checkbox"> Объявлять новые донаты вслух</label>
-        </fieldset>
+        </details>
 
         <h3>Последние донаты</h3>
         <ul id="donations"></ul>
@@ -312,22 +312,22 @@
         <h2>Twitch</h2>
         <dl id="twitchStatus"></dl>
         <form id="twitchConfigForm">
-          <fieldset>
-            <legend>Регистрация Twitch</legend>
+          <details class="editor">
+            <summary>Регистрация Twitch</summary>
             <label for="twitchClientId">Client ID</label>
             <input id="twitchClientId" autocomplete="off">
             <label for="twitchScopes">Scopes</label>
             <input id="twitchScopes" autocomplete="off">
             <button type="submit">Сохранить регистрацию Twitch</button>
-          </fieldset>
+          </details>
         </form>
         <button id="twitchStart" type="button">Подключить Twitch</button>
         <button id="twitchCheck" type="button" data-variant="quiet">Проверить авторизацию</button>
         <div id="twitchDevice"></div>
 
         <form id="twitchChannelForm">
-          <fieldset>
-            <legend>Параметры канала</legend>
+          <details class="editor">
+            <summary>Параметры канала</summary>
             <label for="streamTitle">Название трансляции</label>
             <input id="streamTitle" name="title">
             <label for="streamGame">ID категории</label>
@@ -335,7 +335,7 @@
             <label for="streamLang">Язык</label>
             <input id="streamLang" name="broadcaster_language" placeholder="ru">
             <button type="submit">Сохранить параметры</button>
-          </fieldset>
+          </details>
         </form>
 
         <form id="markerForm">

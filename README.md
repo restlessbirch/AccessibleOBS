@@ -225,4 +225,10 @@ existing setups would be left with orphaned scenes.
 
 ## License
 
-MIT. Copyright (c) 2026 restlessbirch.
+GNU General Public License, version 2 or later. Copyright (c) 2026 restlessbirch.
+
+See [LICENSE](LICENSE) for the full text.
+
+The project depends on crates published under Apache-2.0, which is incompatible
+with GPL-2.0 taken alone. "Or later" resolves this: a recipient may apply the
+terms of version 3, and GPL-3.0 and Apache-2.0 are compatible.

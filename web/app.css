@@ -598,3 +598,32 @@ select:disabled {
     height: 32rem;
   }
 }
+
+/* Свёрнутый редактор.
+ *
+ * Родной details, а не своя кнопка со скрытым блоком: экранный диктор
+ * объявляет его как кнопку и сразу говорит «свёрнуто» или «развёрнуто», а
+ * клавиатура работает без единой строки скрипта. Самодельная замена всё это
+ * пришлось бы воспроизводить вручную, и обычно её воспроизводят неполно.
+ *
+ * Редакторы настройки открываются раз в жизни, а место в списке занимали
+ * постоянно: диктор зачитывал все их поля по дороге к нужной кнопке. */
+.editor {
+  border: 1px solid var(--line, #444);
+  border-radius: 6px;
+  padding: 8px 12px;
+  margin: 12px 0;
+}
+.editor > summary {
+  cursor: pointer;
+  font-weight: 600;
+  padding: 6px 0;
+  min-height: 32px;
+}
+.editor > summary:focus-visible {
+  outline: 3px solid Highlight;
+  outline-offset: 2px;
+}
+.editor[open] > summary {
+  margin-bottom: 8px;
+}

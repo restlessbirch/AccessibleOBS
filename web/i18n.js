@@ -341,6 +341,8 @@ const I18N = {
     'Гость': 'Guest',
     'Перейти к экрану актёра': 'Skip to the actor display',
     'Сцена в эфире неизвестна': 'Scene on air is unknown',
+    'Лента донатов в панели': 'Donation feed in the panel',
+    'Параметры канала': 'Channel settings',
     'Просмотр сцены': 'Scene preview',
     'Показать источники и звук сцены': 'Show sources and audio of a scene',
     'Вывести эту сцену в эфир': 'Put this scene on air',

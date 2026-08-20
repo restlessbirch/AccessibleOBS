@@ -4,7 +4,7 @@ version = "1.2.0"
 edition = "2024"
 rust-version = "1.88"
 authors = ["restlessbirch"]
-license = "MIT"
+license = "GPL-2.0-or-later"
 description = "Accessible web panel and remote control for OBS Studio, over Tailscale or on the same machine"
 repository = "https://github.com/restlessbirch/AccessibleOBS"
 

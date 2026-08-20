@@ -211,4 +211,10 @@ Twitch с DonationAlerts на живых учётных записях скво�
 
 ## Лицензия
 
-MIT. Copyright (c) 2026 restlessbirch.
+GNU General Public License, версия 2 или новее. Copyright (c) 2026 restlessbirch.
+
+Полный текст — в файле [LICENSE](LICENSE).
+
+Проект зависит от библиотек под Apache-2.0, а она несовместима с GPL-2.0,
+взятой отдельно. Оговорка «или новее» это снимает: получатель вправе применить
+условия версии 3, а GPL-3.0 с Apache-2.0 совместима.
