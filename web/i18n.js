@@ -315,6 +315,15 @@ const I18N = {
     'Сохранить регистрацию Twitch': 'Save Twitch registration',
     'Сохраните Twitch client_id в веб-панели': 'Save the Twitch client_id in the panel',
     'Параметры канала': 'Channel settings',
+    'О программе и лицензии': 'About and licence',
+    'Лицензия': 'Licence',
+    'Исходный код Accessible OBS распространяется под лицензией GNU General Public License версии 2 или, по вашему выбору, любой более поздней версии.':
+      'The source code of Accessible OBS is distributed under the GNU General Public License version 2 or, at your option, any later version.',
+    'Эта собранная программа передаётся вам на условиях GNU General Public License версии 3.':
+      'This compiled program is conveyed to you under the terms of the GNU General Public License version 3.',
+    'Она связана с библиотеками под лицензией Apache 2.0, которая несовместима со второй версией GPL, но совместима с третьей. Оговорка «или любой более поздней» в лицензии исходного кода именно это и позволяет.':
+      'It is linked with libraries under the Apache License 2.0, which is incompatible with GPL version 2 but compatible with version 3. The «or any later version» option in the source licence is exactly what makes this lawful.',
+    'Исходный код доступен бесплатно:': 'The source code is available at no charge:',
     'ID категории': 'Category ID',
     'Сохранить параметры': 'Save settings',
     'Маркер трансляции': 'Stream marker',

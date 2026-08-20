@@ -229,6 +229,13 @@ GNU General Public License, version 2 or later. Copyright (c) 2026 restlessbirch
 
 See [LICENSE](LICENSE) for the full text.
 
-The project depends on crates published under Apache-2.0, which is incompatible
-with GPL-2.0 taken alone. "Or later" resolves this: a recipient may apply the
-terms of version 3, and GPL-3.0 and Apache-2.0 are compatible.
+The source is offered under "GPLv2 or later", so you may take the source alone
+under version 2. **A compiled binary, however, is conveyed under GPLv3**: it is
+linked with libraries published under Apache-2.0, which the FSF states is
+incompatible with GPLv2 but compatible with GPLv3. The "or later" option is
+precisely what makes that combination lawful.
+
+Release archives ship both texts, `LICENSE-GPL-2.0.txt` and
+`LICENSE-GPL-3.0.txt`, together with `THIRD_PARTY_NOTICES.txt`, which names the
+Apache-2.0 components and the licences of the bundled OBS Studio (GPLv2) and
+Tailscale (BSD-3-Clause) installers.

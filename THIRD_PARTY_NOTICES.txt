@@ -1,19 +1,118 @@
-Accessible OBS is copyright (c) 2026 restlessbirch and is licensed
-under the MIT License. See LICENSE.
+Accessible OBS — licensing and third-party notices
+==================================================
 
-Bundled installers, when present in release zip files, are not part of the
-Accessible OBS source license:
+Copyright (c) 2026 restlessbirch
 
-- Tailscale installer
-  Source: https://tailscale.com/download/windows
-  Latest MSI URL used by the package script:
-  https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi
-  Tailscale is provided by Tailscale Inc. under its own license and terms.
 
-- OBS Studio installer
-  Source: https://obsproject.com/download
-  OBS Studio is provided by the OBS Project under its own license and terms.
+1. Licence of this program's own source code
+--------------------------------------------
 
-The release package includes these official installers only to make first-run
-setup easier for the actor. Users should review and accept each third-party
-installer's own license terms during installation.
+GNU General Public License, version 2 or (at your option) any later version.
+
+Full text: LICENSE-GPL-2.0.txt (and LICENSE, which is the same file).
+
+
+2. Licence under which THIS BINARY DISTRIBUTION is conveyed
+-----------------------------------------------------------
+
+    The build you received is conveyed to you under the terms of the
+    GNU General Public License, VERSION 3.
+
+    Full text: LICENSE-GPL-3.0.txt
+
+This is not a contradiction, and it is worth spelling out.
+
+The program's own source is offered under "GPLv2 or later", so you may take
+that source alone under version 2 if you wish. But this executable is a
+combined work: it is linked with libraries published under the Apache License
+2.0. The Free Software Foundation states that Apache-2.0 is "compatible with
+version 3 of the GNU GPL" and "not compatible with GPL version 2, because it
+has some requirements that are not in that GPL version. These include certain
+patent termination and indemnification provisions."
+
+Therefore the only GPL version under which this combination may lawfully be
+conveyed is version 3. The "or later" option in the source licence is exactly
+what makes that lawful.
+
+In short:
+  - the source of Accessible OBS       -> GPLv2 or later, your choice
+  - this compiled binary as a whole    -> GPLv3
+
+The Apache-2.0 components that make this so:
+
+  ring 0.17.14          Apache-2.0 AND ISC   (TLS cryptography, via rustls)
+  sync_wrapper 1.0.2    Apache-2.0           (via axum and tower)
+
+
+3. Where to get the source code
+--------------------------------
+
+Complete corresponding source for this program, including the exact revision
+this build was made from, is available at no charge from:
+
+    https://github.com/restlessbirch/AccessibleOBS
+
+This satisfies GPLv3 section 6(d): the source is offered from the same place
+and by the same means as the object code, at no further cost.
+
+The source of the third-party Rust libraries is published on https://crates.io
+and in each project's own repository.
+
+
+4. Third-party Rust libraries
+------------------------------
+
+This program links roughly 198 crates from the Rust ecosystem. The great
+majority are dual-licensed "MIT OR Apache-2.0" or plain MIT, both of which are
+GPL-compatible.
+
+Licences present in the dependency tree:
+
+  MIT OR Apache-2.0, MIT, Apache-2.0 OR MIT, MIT/Apache-2.0,
+  Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT,
+  Unlicense OR MIT, Apache-2.0 OR ISC OR MIT, MIT OR Apache-2.0 OR Zlib,
+  MIT OR Apache-2.0 OR LGPL-2.1-or-later, ISC, BSD-2-Clause OR Apache-2.0 OR MIT,
+  MIT AND BSD-3-Clause, Apache-2.0 AND ISC, Apache-2.0 OR BSL-1.0,
+  BSD-3-Clause, Apache-2.0, Zlib OR Apache-2.0 OR MIT, Unicode-3.0,
+  CDLA-Permissive-2.0
+
+A full machine-readable list can be regenerated at any time with:
+
+    cargo metadata --format-version 1
+
+
+5. Bundled third-party installers
+----------------------------------
+
+Release archives may contain official installers for two separate programs.
+They are included only so that first-run setup works without an internet
+connection. They are not part of Accessible OBS and are not derived from it;
+their presence in the same archive is mere aggregation on a storage medium,
+which the GPL expressly permits.
+
+Each is redistributed unmodified, exactly as published by its authors, and the
+archive records the SHA-256 of each file in third_party/installers.json.
+
+  OBS Studio
+    Publisher: the OBS Project
+    Licence:   GNU General Public License, version 2
+    Source:    https://obsproject.com/download
+    Code:      https://github.com/obsproject/obs-studio
+
+  Tailscale
+    Publisher: Tailscale Inc. and contributors
+    Licence:   BSD 3-Clause
+    Source:    https://tailscale.com/download/windows
+    Code:      https://github.com/tailscale/tailscale
+
+Review and accept each installer's own terms when you run it.
+
+
+6. Trademarks
+--------------
+
+OBS and OBS Studio are names used by the OBS Project. Twitch is a trademark of
+Twitch Interactive, Inc. DonationAlerts is a trademark of its respective owner.
+Tailscale is a trademark of Tailscale Inc. This project is not affiliated with,
+endorsed by, or sponsored by any of them. The names are used only to say what
+this program works with.
